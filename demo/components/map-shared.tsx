@@ -28,7 +28,11 @@ export interface MapInstance {
   addLayer(layer: ZarrLayer, beforeId?: string): unknown
   setProjection(projection: any): unknown
   resize(): void
-  getBounds(): { toArray(): [number, number][]; getWest(): number; getEast(): number }
+  getBounds(): {
+    toArray(): [number, number][]
+    getWest(): number
+    getEast(): number
+  }
   getZoom(): number
   flyTo(options: { center: [number, number]; zoom: number }): void
   getStyle(): { layers?: Array<{ id: string; type: string }> }
@@ -73,7 +77,7 @@ const mapLibreTheme = {
 export interface MapConfig {
   createMap: (
     container: HTMLDivElement,
-    globeProjection: boolean,
+    globeProjection: boolean
   ) => MapInstance
   setProjection: (map: MapInstance, globeProjection: boolean) => void
   getLayerBeforeId: (map: MapInstance) => string | undefined
@@ -102,12 +106,12 @@ const mapLibreConfig: MapConfig = {
         layers: layers('protomaps', mapLibreTheme, { lang: 'en' }),
       },
       center: [0, 20],
-      zoom: 2.4,
+      zoom: window.innerWidth < 640 ? 1.2 : 2.4,
     }) as MapInstance
   },
   setProjection: (map: MapInstance, globeProjection: boolean) => {
     ;(map as maplibregl.Map).setProjection(
-      globeProjection ? { type: 'globe' } : { type: 'mercator' },
+      globeProjection ? { type: 'globe' } : { type: 'mercator' }
     )
   },
   getLayerBeforeId: () => 'landuse_pedestrian',
@@ -123,7 +127,7 @@ const mapboxConfig: MapConfig = {
       container,
       style: 'mapbox://styles/mapbox/dark-v11',
       center: [0, 20],
-      zoom: 2,
+      zoom: window.innerWidth < 640 ? 1 : 2,
       projection: globeProjection ? 'globe' : 'mercator',
     })
 
@@ -170,7 +174,7 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
 
   const layerConfig: LayerProps = useMemo(
     () => datasetModule.buildLayerProps(datasetState as any),
-    [datasetModule, datasetState],
+    [datasetModule, datasetState]
   )
 
   const isCarbonplan4d = datasetModule.id === 'carbonplan_4d'
@@ -207,6 +211,7 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
 
     const mapConfig = getMapConfig(mapProvider)
     let clickHandler: ((event: any) => void) | null = null
+    let cancelled = false
 
     if (zarrLayerRef.current) {
       try {
@@ -219,34 +224,36 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
 
     const currentLayerConfig = latestLayerConfigRef.current
 
-    const options: ZarrLayerOptions = {
-      id: 'zarr-layer',
-      source: datasetModule.source,
-      variable: currentLayerConfig.variable ?? datasetModule.variable,
-      clim: clim,
-      colormap: colormapArray,
-      opacity: opacity,
-      selector: currentLayerConfig.selector,
-      zarrVersion: datasetModule.zarrVersion,
-      fillValue: datasetModule.fillValue,
-      spatialDimensions: datasetModule.spatialDimensions,
-      bounds: datasetModule.bounds,
-      latIsAscending: datasetModule.latIsAscending,
-      proj4: datasetModule.proj4,
-      onLoadingStateChange: setLoadingState,
-    }
+    const createLayer = async () => {
+      const options: ZarrLayerOptions = {
+        id: 'zarr-layer',
+        source: datasetModule.source,
+        variable: currentLayerConfig.variable ?? datasetModule.variable,
+        clim: clim,
+        colormap: colormapArray,
+        opacity: opacity,
+        selector: currentLayerConfig.selector,
+        zarrVersion: datasetModule.zarrVersion,
+        fillValue: datasetModule.fillValue,
+        spatialDimensions: datasetModule.spatialDimensions,
+        bounds: datasetModule.bounds,
+        latIsAscending: datasetModule.latIsAscending,
+        proj4: datasetModule.proj4,
+        onLoadingStateChange: setLoadingState,
+      }
 
-    if (datasetModule.store) {
-      options.store = datasetModule.store
-    }
-    if (currentLayerConfig.customFrag) {
-      options.customFrag = currentLayerConfig.customFrag
-    }
-    if (currentLayerConfig.uniforms) {
-      options.uniforms = currentLayerConfig.uniforms
-    }
+      if (datasetModule.store) {
+        options.store = await datasetModule.store
+      }
+      if (currentLayerConfig.customFrag) {
+        options.customFrag = currentLayerConfig.customFrag
+      }
+      if (currentLayerConfig.uniforms) {
+        options.uniforms = currentLayerConfig.uniforms
+      }
 
-    try {
+      if (cancelled) return
+
       const layer = new ZarrLayer(options)
       let beforeId: string | undefined
       try {
@@ -296,11 +303,14 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
         })
       }
       prevDatasetIdRef.current = datasetId
-    } catch (error) {
-      console.error('Error creating ZarrLayer:', error)
     }
 
+    createLayer().catch((error) => {
+      console.error('Error creating ZarrLayer:', error)
+    })
+
     return () => {
+      cancelled = true
       if (zarrLayerRef.current) {
         try {
           if (map.getLayer('zarr-layer')) {
@@ -424,11 +434,17 @@ export const Map = () => {
           position: 'absolute',
           top: 0,
           right: 0,
-          bottom: 0,
-          left: sidebarWidth,
+          bottom: ['50vh', '50vh', 0],
+          left: sidebarWidth ?? 0,
         }}
       />
-      <Box sx={{ position: 'absolute', top: '8px', left: sidebarWidth + 10 }}>
+      <Box
+        sx={{
+          position: 'absolute',
+          top: ['56px', '56px', '8px'],
+          left: sidebarWidth ? sidebarWidth + 10 : 2,
+        }}
+      >
         {loadingState.loading && <Spinner size={40} />}
       </Box>
     </>

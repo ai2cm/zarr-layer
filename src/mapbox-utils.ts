@@ -1,14 +1,14 @@
 /**
- * @module mapbox-globe-utils
+ * @module mapbox-utils
  *
- * Utility functions for Mapbox GL JS globe tile rendering (renderToTile API).
- * These are NOT used by MapLibre globe, which uses projectTile() in the shader.
+ * Utility functions for Mapbox GL JS tile rendering (renderToTile API).
+ * These are NOT used by MapLibre, which uses projectTile() in the shader.
  */
 
 import type { TileId } from './zarr-mode'
 
-/** Identity matrix for Mapbox globe tile rendering (no additional transformation) */
-export const MAPBOX_GLOBE_IDENTITY_MATRIX = new Float32Array([
+/** Identity matrix for Mapbox tile rendering (no additional transformation) */
+export const MAPBOX_IDENTITY_MATRIX = new Float32Array([
   1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1,
 ])
 

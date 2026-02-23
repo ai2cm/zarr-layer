@@ -6,19 +6,20 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "@carbonplan/colormaps": "^4.0.0",
     "@carbonplan/components": "^13.1.1",
+    "@carbonplan/icechunk-js": "^0.2.2",
     "@carbonplan/icons": "^2.0.0",
     "@carbonplan/layouts": "5.1.0",
     "@carbonplan/theme": "^8.1.0",
     "@carbonplan/zarr-layer": "file:../",
     "@protomaps/basemaps": "^5.0.1",
-    "icechunk-js": "file:../../icechunk/icechunk-js",
     "mapbox-gl": "^3.6.0",
-    "maplibre-gl": "^5.8.0",
+    "maplibre-gl": "^5.16.0",
     "next": "^14.2.24",
     "pmtiles": "^4.3.0",
     "react": "^18.3.1",

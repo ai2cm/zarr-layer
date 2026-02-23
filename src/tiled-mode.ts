@@ -93,7 +93,7 @@ import {
   TILE_SUBDIVISIONS,
 } from './constants'
 import type { ZarrRenderer } from './zarr-renderer'
-import { renderMapboxTile } from './mapbox-globe-tile-renderer'
+import { renderMapboxTile } from './mapbox-tile-renderer'
 
 export class TiledMode implements ZarrMode {
   isMultiscale: true = true
@@ -115,6 +115,7 @@ export class TiledMode implements ZarrMode {
   private currentLevel: number | null = null
   private selectorVersion: number = 0
   private throttleMs: number
+  private fixedDataScale: number
 
   // Shared state managers
   private throttleState: ThrottleState = createThrottleState()
@@ -126,13 +127,15 @@ export class TiledMode implements ZarrMode {
     variable: string,
     selector: NormalizedSelector,
     invalidate: () => void,
-    throttleMs: number = 100
+    throttleMs: number = 100,
+    fixedDataScale: number = 1
   ) {
     this.zarrStore = store
     this.variable = variable
     this.selector = selector
     this.invalidate = invalidate
     this.throttleMs = throttleMs
+    this.fixedDataScale = fixedDataScale
   }
 
   async initialize(): Promise<void> {
@@ -158,6 +161,7 @@ export class TiledMode implements ZarrMode {
         maxCachedTiles: MAX_CACHED_TILES,
         bandNames,
         crs: this.crs,
+        fixedDataScale: this.fixedDataScale,
       })
 
       this.updateGeometryForProjection(false)
@@ -186,7 +190,7 @@ export class TiledMode implements ZarrMode {
       this.currentLevel = visibleInfo.pyramidLevel
     }
 
-    // Pass bounds to tile cache for CPU resampling (EPSG:4326 only)
+    // Pass bounds to tile cache for fragment shader reprojection (EPSG:4326 only)
     for (const [tileKey, mercBounds] of Object.entries(this.tileBounds)) {
       const fullBounds = toFullBounds(mercBounds)
       if (fullBounds) {
@@ -245,11 +249,14 @@ export class TiledMode implements ZarrMode {
       return
     }
 
-    const useMapboxGlobe = !!context.mapboxGlobe
+    const useMapbox = !!context.mapbox
+    // EPSG:4326 uses fragment shader reprojection (not wgs84 vertex shader)
+    // The fragment shader inverts Mercator Y to get latitude for texture lookup
     const shaderProgram = renderer.getProgram(
       context.shaderData,
       context.customShaderConfig,
-      useMapboxGlobe
+      useMapbox,
+      false // useWgs84 - fragment shader reprojection for EPSG:4326
     )
 
     renderer.gl.useProgram(shaderProgram.program)
@@ -260,7 +267,7 @@ export class TiledMode implements ZarrMode {
       context.uniforms,
       context.customShaderConfig,
       context.projectionData,
-      context.mapboxGlobe,
+      context.mapbox,
       context.matrix,
       false
     )
@@ -280,7 +287,9 @@ export class TiledMode implements ZarrMode {
       Object.keys(this.tileBounds).length > 0 ? this.tileBounds : undefined,
       context.customShaderConfig,
       false,
-      datasetMaxZoom
+      datasetMaxZoom,
+      undefined, // tileTexOverrides
+      this.zarrStore.latIsAscending
     )
   }
 
@@ -348,10 +357,6 @@ export class TiledMode implements ZarrMode {
     return this.zarrStore.levels
   }
 
-  updateClim(clim: [number, number]): void {
-    this.tileCache?.updateClim(clim)
-  }
-
   private emitLoadingState(): void {
     // Update chunksLoading state based on pending chunks and throttle state
     this.loadingManager.chunksLoading =
@@ -381,7 +386,9 @@ export class TiledMode implements ZarrMode {
   }
 
   private updateGeometryForProjection(isGlobe: boolean) {
-    // Globe projections need subdivisions for the sphere curvature.
+    // Subdivisions are only needed for globe projections (sphere curvature)
+    // EPSG:4326 in Mercator view uses fragment shader reprojection (per-pixel)
+    // so no mesh subdivisions are needed
     const targetSubdivisions = isGlobe ? TILE_SUBDIVISIONS : 1
 
     if (this.currentSubdivisions === targetSubdivisions) return

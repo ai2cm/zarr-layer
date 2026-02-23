@@ -4,15 +4,16 @@ import {
   mustGetUniformLocation,
 } from './webgl-utils'
 import {
-  createVertexShaderSource,
+  createVertexShader,
   createFragmentShaderSource,
-  createMapboxGlobeVertexShaderSource,
   type ProjectionData,
   type ShaderData,
+  type VertexShaderInputSpace,
+  type VertexShaderProjection,
 } from './shaders'
 import type {
   CustomShaderConfig,
-  MapboxGlobeParams,
+  MapboxParams,
   ProjectionMode,
 } from './renderer-types'
 
@@ -50,15 +51,23 @@ export interface ShaderProgram {
   globeTransitionLoc?: WebGLUniformLocation | null
   tileRenderLoc?: WebGLUniformLocation | null
   dataScaleLoc: WebGLUniformLocation | null
+  // EPSG:4326 reprojection uniforms
+  reprojectLoc: WebGLUniformLocation | null
+  latBoundsLoc: WebGLUniformLocation | null
+  latIsAscendingLoc: WebGLUniformLocation | null
 }
 
 export function resolveProjectionMode(
-  shaderData?: ShaderData,
-  useMapboxGlobe: boolean = false
+  useMapbox: boolean = false,
+  useWgs84: boolean = false
 ): ProjectionMode {
-  if (useMapboxGlobe) return 'mapbox-globe'
-  if (shaderData?.vertexShaderPrelude) return 'maplibre-globe'
-  return 'mercator'
+  // For Mapbox (proj4 and non-proj4)
+  if (useMapbox && useWgs84) return 'mapbox-wgs84'
+  if (useMapbox) return 'mapbox'
+  // For MapLibre: projectTile() handles both globe and mercator modes
+  // Requires MapLibre 3.0+ which provides vertexShaderPrelude
+  if (useWgs84) return 'wgs84-globe'
+  return 'maplibre-globe'
 }
 
 export function makeShaderVariantKey(options: {
@@ -87,6 +96,28 @@ const toFloat32Array = (
   return new Float32Array(arr)
 }
 
+// Projection mode helpers - modes are combinations of input space + projection target
+const isMapboxMode = (mode: ProjectionMode) =>
+  mode === 'mapbox' || mode === 'mapbox-wgs84'
+const isMaplibreGlobe = (mode: ProjectionMode) =>
+  mode === 'maplibre-globe' || mode === 'wgs84-globe'
+
+/** Map ProjectionMode to vertex shader options */
+function getVertexShaderOptions(projectionMode: ProjectionMode): {
+  inputSpace: VertexShaderInputSpace
+  projection: VertexShaderProjection
+} {
+  const inputSpace: VertexShaderInputSpace = projectionMode.includes('wgs84')
+    ? 'wgs84'
+    : 'mercator'
+
+  const projection: VertexShaderProjection = isMapboxMode(projectionMode)
+    ? 'mapbox-globe'
+    : 'maplibre-globe'
+
+  return { inputSpace, projection }
+}
+
 export function createShaderProgram(
   gl: WebGL2RenderingContext,
   options: {
@@ -110,10 +141,12 @@ export function createShaderProgram(
     options.variantName ||
     makeShaderVariantKey({ projectionMode, shaderData, customShaderConfig })
 
-  const vertexSource =
-    projectionMode === 'mapbox-globe'
-      ? createMapboxGlobeVertexShaderSource()
-      : createVertexShaderSource(shaderData)
+  const { inputSpace, projection } = getVertexShaderOptions(projectionMode)
+  const vertexSource = createVertexShader({
+    inputSpace,
+    projection,
+    shaderData,
+  })
 
   const fragmentSource =
     useCustomShader && config
@@ -157,9 +190,13 @@ export function createShaderProgram(
     }
   }
 
-  const needsGlobeProjection = projectionMode === 'maplibre-globe'
-  const globeUniform = (name: string) =>
-    needsGlobeProjection ? gl.getUniformLocation(program, name) : null
+  // MapLibre globe modes use projectTile uniforms, Mapbox has its own
+  const needsMaplibreGlobe = isMaplibreGlobe(projectionMode)
+  const needsMapbox = isMapboxMode(projectionMode)
+  const maplibreUniform = (name: string) =>
+    needsMaplibreGlobe ? gl.getUniformLocation(program, name) : null
+  const mapboxUniform = (name: string) =>
+    needsMapbox ? gl.getUniformLocation(program, name) : null
 
   const shaderProgram: ShaderProgram = {
     program,
@@ -169,15 +206,15 @@ export function createShaderProgram(
     shiftXLoc: mustGetUniformLocation(gl, program, 'shift_x'),
     shiftYLoc: mustGetUniformLocation(gl, program, 'shift_y'),
     worldXOffsetLoc: mustGetUniformLocation(gl, program, 'u_worldXOffset'),
-    matrixLoc:
-      projectionMode === 'maplibre-globe'
-        ? null
-        : mustGetUniformLocation(gl, program, 'matrix'),
-    projMatrixLoc: globeUniform('u_projection_matrix'),
-    fallbackMatrixLoc: globeUniform('u_projection_fallback_matrix'),
-    tileMercatorCoordsLoc: globeUniform('u_projection_tile_mercator_coords'),
-    clippingPlaneLoc: globeUniform('u_projection_clipping_plane'),
-    projectionTransitionLoc: globeUniform('u_projection_transition'),
+    // MapLibre globe modes use projectTile instead of matrix
+    matrixLoc: needsMaplibreGlobe
+      ? null
+      : mustGetUniformLocation(gl, program, 'matrix'),
+    projMatrixLoc: maplibreUniform('u_projection_matrix'),
+    fallbackMatrixLoc: maplibreUniform('u_projection_fallback_matrix'),
+    tileMercatorCoordsLoc: maplibreUniform('u_projection_tile_mercator_coords'),
+    clippingPlaneLoc: maplibreUniform('u_projection_clipping_plane'),
+    projectionTransitionLoc: maplibreUniform('u_projection_transition'),
 
     opacityLoc: mustGetUniformLocation(gl, program, 'opacity'),
     texScaleLoc: mustGetUniformLocation(gl, program, 'u_texScale'),
@@ -198,19 +235,14 @@ export function createShaderProgram(
     useCustomShader: !!useCustomShader,
     bandTexLocs,
     customUniformLocs,
-    globeToMercMatrixLoc:
-      projectionMode === 'mapbox-globe'
-        ? gl.getUniformLocation(program, 'u_globe_to_merc')
-        : null,
-    globeTransitionLoc:
-      projectionMode === 'mapbox-globe'
-        ? gl.getUniformLocation(program, 'u_globe_transition')
-        : null,
-    tileRenderLoc:
-      projectionMode === 'mapbox-globe'
-        ? gl.getUniformLocation(program, 'u_tile_render')
-        : null,
+    globeToMercMatrixLoc: mapboxUniform('u_globe_to_merc'),
+    globeTransitionLoc: mapboxUniform('u_globe_transition'),
+    tileRenderLoc: mapboxUniform('u_tile_render'),
     dataScaleLoc: gl.getUniformLocation(program, 'u_dataScale'),
+    // EPSG:4326 reprojection uniforms
+    reprojectLoc: gl.getUniformLocation(program, 'u_reproject'),
+    latBoundsLoc: gl.getUniformLocation(program, 'u_latBounds'),
+    latIsAscendingLoc: gl.getUniformLocation(program, 'u_latIsAscending'),
   }
 
   gl.deleteShader(vertexShader)
@@ -224,7 +256,7 @@ export function applyProjectionUniforms(
   shaderProgram: ShaderProgram,
   matrix: number[] | Float32Array | Float64Array,
   projectionData?: ProjectionData,
-  mapboxGlobe?: MapboxGlobeParams,
+  mapbox?: MapboxParams,
   isGlobeTileRender?: boolean
 ) {
   const setMatrix4 = (
@@ -253,7 +285,9 @@ export function applyProjectionUniforms(
   }
 
   switch (shaderProgram.projectionMode) {
-    case 'maplibre-globe': {
+    case 'maplibre-globe':
+    case 'wgs84-globe': {
+      // Both modes use MapLibre's projectTile uniforms
       if (!projectionData) return
 
       setMatrix4(shaderProgram.projMatrixLoc, projectionData.mainMatrix)
@@ -269,13 +303,15 @@ export function applyProjectionUniforms(
       )
       break
     }
-    case 'mapbox-globe': {
+    case 'mapbox':
+    case 'mapbox-wgs84': {
+      // mapbox is always present for Mapbox (mercator uses identity matrix + transition=1)
       setMatrix4(shaderProgram.matrixLoc, matrix)
       setMatrix4(
         shaderProgram.globeToMercMatrixLoc,
-        mapboxGlobe?.globeToMercatorMatrix
+        mapbox?.globeToMercatorMatrix
       )
-      setFloat(shaderProgram.globeTransitionLoc, mapboxGlobe?.transition ?? 0)
+      setFloat(shaderProgram.globeTransitionLoc, mapbox?.transition ?? 1)
       if (shaderProgram.tileRenderLoc) {
         gl.uniform1i(shaderProgram.tileRenderLoc, isGlobeTileRender ? 1 : 0)
       }

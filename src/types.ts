@@ -8,8 +8,17 @@ export interface RequestParameters extends Omit<RequestInit, 'headers'> {
   headers?: { [key: string]: string }
 }
 
+/**
+ * Options passed to transformRequest
+ */
+export interface TransformRequestOptions {
+  /** HTTP method that will be used for this request */
+  method?: 'GET' | 'HEAD'
+}
+
 export type TransformRequest = (
-  url: string
+  url: string,
+  options?: TransformRequestOptions
 ) => RequestParameters | Promise<RequestParameters>
 
 export type ColormapArray = number[][] | string[]
@@ -97,6 +106,11 @@ export interface ZarrLayerOptions {
    * If not provided, bounds are read from coordinate arrays or default to global.
    */
   bounds?: Bounds
+  /**
+   * CRS identifier for built-in projections (EPSG:4326 or EPSG:3857).
+   * For any other CRS, provide a matching proj4 definition.
+   */
+  crs?: string
   latIsAscending?: boolean | null
   fillValue?: number
   customFrag?: string

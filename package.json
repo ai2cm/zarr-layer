@@ -1,6 +1,6 @@
 {
   "name": "@carbonplan/zarr-layer",
-  "version": "0.2.5",
+  "version": "0.3.1",
   "description": "MapLibre/Mapbox custom layer for rendering Zarr datasets. Inspired by zarr-cesium, zarr-gl, and @carbonplan/maps.",
   "license": "MIT",
   "main": "./dist/index.js",
@@ -54,14 +54,17 @@
     }
   },
   "dependencies": {
+    "@developmentseed/raster-reproject": "^0.1.0",
+    "delaunator": "^5.0.1",
     "proj4": "^2.20.2",
-    "zarrita": "^0.5.4"
+    "zarrita": "^0.6.1"
   },
   "lint-staged": {
-    "*.{js,ts,json,md}": "prettier --write"
+    "*.{js,ts,tsx,json,md}": "prettier --write"
   },
   "devDependencies": {
     "@carbonplan/prettier": "^1.2.0",
+    "@types/delaunator": "^5.0.3",
     "@types/proj4": "^2.5.6",
     "husky": "^9.1.7",
     "lint-staged": "^16.2.7",

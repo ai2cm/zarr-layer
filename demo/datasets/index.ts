@@ -1,9 +1,11 @@
+import antarcticEra5 from './antarctic-era5'
 import carbonplan4d from './carbonplan-4d'
 import hrrr from './hrrr'
 import usgsdem from './usgs-dem'
 import icechunkUsgsDem from './icechunk-usgs-dem'
 
 import hurricane from './hurricane'
+import polar from './polar'
 import sentinel2 from './sentinel-2'
 import { createSimpleDataset } from './simple'
 import { createTimeDataset } from './time'
@@ -14,6 +16,7 @@ export const DATASETS: Dataset<any>[] = [
   carbonplan4d,
   hrrr,
   icechunkUsgsDem,
+  hurricane,
   createTimeDataset({
     id: 'temperature_v3',
     source:
@@ -25,7 +28,6 @@ export const DATASETS: Dataset<any>[] = [
     info: 'Ocean temperature (v3 pyramid, EPSG:3857)',
     sourceInfo: 'v3 pyramid (EPSG:3857)',
   }),
-  hurricane,
   createTimeDataset({
     id: 'tasmax_pyramid_4326',
     source:
@@ -52,10 +54,13 @@ export const DATASETS: Dataset<any>[] = [
     bounds: [-180, -90, 180, 90],
     info: 'Delta FG CO2 (single image, global)',
     sourceInfo: 'v2 single image (global)',
+    latIsAscending: true,
   }),
   usgsdem,
   untiled4326,
   sentinel2,
+  polar,
+  antarcticEra5,
   createSimpleDataset({
     id: 'Burn Probability over CONUS',
     source:
@@ -64,6 +69,7 @@ export const DATASETS: Dataset<any>[] = [
     clim: [0, 0.13],
     colormap: 'fire',
     zarrVersion: 3,
+    // bounds: [-127.7569327296286, 23.058743477241073, -65.94103341193146, 50.81297227993714],
     info: 'Burn Probability over CONUS',
     sourceInfo:
       '30m resolution untiled multiscale dataset created by resampling and reprojecting the "Wildfire Risk to Communities: Spatial datasets of landscape-wide wildfire risk components for the United States (2nd Edition)" dataset.',

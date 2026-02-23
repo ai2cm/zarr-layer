@@ -13,7 +13,7 @@ import {
   normalizeSelector,
 } from './zarr-utils'
 import { ZarrStore } from './zarr-store'
-import { maplibreFragmentShaderSource, type ShaderData } from './shaders'
+import { maplibreFragmentShaderSource } from './shaders'
 import { ColormapState } from './colormap'
 import { ZarrRenderer } from './zarr-renderer'
 import type { CustomShaderConfig } from './renderer-types'
@@ -37,6 +37,7 @@ import {
   resolveProjectionParams,
   isGlobeProjection as checkGlobeProjection,
 } from './map-utils'
+import { MAPBOX_IDENTITY_MATRIX } from './mapbox-utils'
 import type { QueryGeometry, QueryResult } from './query/types'
 import { SPATIAL_DIM_NAMES } from './constants'
 
@@ -50,6 +51,7 @@ export class ZarrLayer {
   private zarrVersion: 2 | 3 | null = null
   private spatialDimensions: SpatialDimensions
   private bounds: Bounds | undefined
+  private crs: string | undefined
   private latIsAscending: boolean | null = null
   private selector: Selector
   private invalidate: () => void
@@ -64,6 +66,9 @@ export class ZarrLayer {
   private _fillValue: number | null = null
   private scaleFactor: number = 1
   private offset: number = 0
+  private fixedDataScale: number
+  // Once true, fixedDataScale is locked (mode has captured it)
+  private dataScaleLocked: boolean = false
 
   private gl: WebGL2RenderingContext | undefined
   private map: MapLike | null = null
@@ -118,15 +123,25 @@ export class ZarrLayer {
   private proj4: string | undefined
   private transformRequest: TransformRequest | undefined
   private customStore: Readable<unknown> | undefined
+  private lastIsGlobe: boolean | null = null
 
   get fillValue(): number | null {
     return this._fillValue
   }
 
-  private isGlobeProjection(shaderData?: ShaderData): boolean {
-    if (shaderData?.vertexShaderPrelude) return true
+  private isGlobeProjection(): boolean {
     const projection = this.map?.getProjection ? this.map.getProjection() : null
     return checkGlobeProjection(projection)
+  }
+
+  /** Check for projection changes and notify mode. Returns current isGlobe state. */
+  private syncProjectionState(): boolean {
+    const isGlobe = this.isGlobeProjection()
+    if (this.lastIsGlobe !== null && this.lastIsGlobe !== isGlobe) {
+      this.mode?.onProjectionChange(isGlobe)
+    }
+    this.lastIsGlobe = isGlobe
+    return isGlobe
   }
 
   constructor({
@@ -142,6 +157,7 @@ export class ZarrLayer {
     zarrVersion,
     spatialDimensions = {},
     bounds,
+    crs,
     latIsAscending = null,
     fillValue,
     customFrag,
@@ -186,6 +202,7 @@ export class ZarrLayer {
     this.zarrVersion = zarrVersion ?? null
     this.spatialDimensions = spatialDimensions
     this.bounds = bounds
+    this.crs = crs
     this.latIsAscending = latIsAscending ?? null
     this.selector = selector
     this.normalizedSelector = normalizeSelector(selector)
@@ -194,6 +211,7 @@ export class ZarrLayer {
     this.invalidate = () => {}
     this.colormap = new ColormapState(colormap)
     this.clim = clim
+    this.fixedDataScale = Math.max(Math.abs(clim[0]), Math.abs(clim[1]), 1)
     this.opacity = opacity
     this.minZoom = minzoom
     this.maxZoom = maxzoom
@@ -243,7 +261,10 @@ export class ZarrLayer {
 
   setClim(clim: [number, number]) {
     this.clim = clim
-    this.mode?.updateClim(clim)
+    // Allow fixedDataScale to update until mode captures it
+    if (!this.dataScaleLocked) {
+      this.fixedDataScale = Math.max(Math.abs(clim[0]), Math.abs(clim[1]), 1)
+    }
     this.invalidate()
   }
 
@@ -283,6 +304,13 @@ export class ZarrLayer {
       }
       this.dimensionValues = {}
       this._fillValue = null
+      // Reset and recompute fixedDataScale from current clim for new mode
+      this.dataScaleLocked = false
+      this.fixedDataScale = Math.max(
+        Math.abs(this.clim[0]),
+        Math.abs(this.clim[1]),
+        1
+      )
       await this.initialize()
       await this.initializeMode()
       this.invalidate()
@@ -373,6 +401,7 @@ export class ZarrLayer {
       await this.initializeMode()
 
       const isGlobe = this.isGlobeProjection()
+      this.lastIsGlobe = isGlobe
       this.mode?.onProjectionChange(isGlobe)
 
       this.mode?.update(this.map, this.gl!)
@@ -430,7 +459,8 @@ export class ZarrLayer {
         this.variable,
         this.normalizedSelector,
         this.invalidate,
-        this.throttleMs
+        this.throttleMs,
+        this.fixedDataScale
       )
     } else {
       // Use UntiledMode for untiled multiscales and single-level datasets
@@ -439,13 +469,16 @@ export class ZarrLayer {
         this.variable,
         this.normalizedSelector,
         this.invalidate,
-        this.throttleMs
+        this.throttleMs,
+        this.fixedDataScale
       )
     }
 
+    // Lock immediately after mode captures the value, before async initialize()
+    this.dataScaleLocked = true
+
     this.mode.setLoadingCallback(this.handleChunkLoadingChange)
     await this.mode.initialize()
-    this.mode.updateClim(this.clim)
 
     if (this.map && this.gl) {
       this.mode.update(this.map, this.gl)
@@ -460,6 +493,7 @@ export class ZarrLayer {
         variable: this.variable,
         spatialDimensions: this.spatialDimensions,
         bounds: this.bounds,
+        crs: this.crs,
         latIsAscending: this.latIsAscending,
         coordinateKeys: Object.keys(this.selector),
         proj4: this.proj4,
@@ -551,6 +585,7 @@ export class ZarrLayer {
     if (this.isRemoved || !this.gl || !this.mode || !this.map) return
     if (!this.isZoomInRange()) return
 
+    this.syncProjectionState()
     this.mode.update(this.map, this.gl)
   }
 
@@ -588,6 +623,17 @@ export class ZarrLayer {
       return
     }
 
+    // Legacy MapLibre (no shaderData): fall back to mapbox-style shader path
+    // using identity globe-to-merc matrix + transition=1 (pure mercator).
+    const legacyMapboxFallback =
+      !projectionParams.mapbox && !projectionParams.shaderData
+        ? {
+            projection: { name: 'mercator' },
+            globeToMercatorMatrix: MAPBOX_IDENTITY_MATRIX,
+            transition: 1,
+          }
+        : undefined
+
     const isGlobe = this.isGlobeProjection()
     const worldOffsets = computeWorldOffsets(this.map, isGlobe)
     const colormapTexture = this.colormap.ensureTexture(this.gl)
@@ -601,13 +647,14 @@ export class ZarrLayer {
         fillValue: this._fillValue,
         scaleFactor: this.scaleFactor,
         offset: this.offset,
+        fixedDataScale: this.fixedDataScale,
       },
       colormapTexture,
       worldOffsets,
       customShaderConfig: this.customShaderConfig || undefined,
       shaderData: projectionParams.shaderData,
       projectionData: projectionParams.projectionData,
-      mapboxGlobe: projectionParams.mapboxGlobe,
+      mapbox: projectionParams.mapbox ?? legacyMapboxFallback,
     }
 
     this.mode.render(this.renderer, context)
@@ -629,6 +676,7 @@ export class ZarrLayer {
       return
     }
 
+    const isGlobe = this.syncProjectionState()
     this.mode.update(this.map, this.gl)
 
     const colormapTexture = this.colormap.ensureTexture(this.gl)
@@ -642,10 +690,12 @@ export class ZarrLayer {
         fillValue: this._fillValue,
         scaleFactor: this.scaleFactor,
         offset: this.offset,
+        fixedDataScale: this.fixedDataScale,
       },
       colormapTexture,
       worldOffsets: [0],
       customShaderConfig: this.customShaderConfig || undefined,
+      isGlobe,
     }
 
     this.tileNeedsRender =

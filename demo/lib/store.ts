@@ -9,7 +9,7 @@ import type {
 } from '@carbonplan/zarr-layer'
 
 interface AppState {
-  sidebarWidth: number
+  sidebarWidth: number | null
   datasetId: string
   opacity: number
   clim: [number, number]
@@ -23,7 +23,7 @@ interface AppState {
   regionResult: QueryResult | null
   mapInstance: MapInstance | null
   zarrLayer: InstanceType<typeof ZarrLayer> | null
-  setSidebarWidth: (width: number) => void
+  setSidebarWidth: (width: number | null) => void
   setDatasetId: (id: string) => void
   setOpacity: (opacity: number) => void
   setClim: (clim: [number, number]) => void
@@ -44,7 +44,7 @@ interface AppState {
 const defaultModule = DATASET_MAP[DEFAULT_DATASET_ID]
 
 export const useAppStore = create<AppState>((set, get) => ({
-  sidebarWidth: 0,
+  sidebarWidth: null,
   datasetId: DEFAULT_DATASET_ID,
   opacity: 1,
   clim: defaultModule.clim,

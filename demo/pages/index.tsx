@@ -33,7 +33,7 @@ export default function Home() {
         }}
       >
         <Sidebar />
-        {sidebarWidth > 0 && <Map key={mapProvider} />}
+        {sidebarWidth !== null && <Map key={mapProvider} />}
       </Box>
     </>
   )

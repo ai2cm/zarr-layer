@@ -1,10 +1,10 @@
-import { IcechunkStore } from 'icechunk-js'
+import { IcechunkStore } from '@carbonplan/icechunk-js'
 import type { Dataset, LayerProps } from './types'
 
 const ICECHUNK_URL =
   'https://carbonplan-share.s3.us-west-2.amazonaws.com/zarr-layer-examples/usgs10m_dem_subset_multiscale_icechunk_14lvl.icechunk'
 
-let _store: IcechunkStore | null = null
+let _storePromise: Promise<IcechunkStore> | null = null
 
 const icechunkUsgsDem: Dataset<Record<string, never>> = {
   id: 'icechunk_usgs_dem',
@@ -19,7 +19,7 @@ const icechunkUsgsDem: Dataset<Record<string, never>> = {
   center: [-117, 45],
   zoom: 5,
   get store() {
-    return (_store ??= new IcechunkStore(ICECHUNK_URL, {
+    return (_storePromise ??= IcechunkStore.open(ICECHUNK_URL, {
       branch: 'main',
       formatVersion: 'v1',
     }))

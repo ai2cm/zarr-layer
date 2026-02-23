@@ -10,7 +10,7 @@ import type {
 } from './types'
 import type {
   CustomShaderConfig,
-  MapboxGlobeParams,
+  MapboxParams,
   RendererUniforms,
 } from './renderer-types'
 import type { ZarrRenderer } from './zarr-renderer'
@@ -25,7 +25,8 @@ export interface RenderContext {
   customShaderConfig?: CustomShaderConfig
   shaderData?: ShaderData
   projectionData?: ProjectionData
-  mapboxGlobe?: MapboxGlobeParams
+  mapbox?: MapboxParams
+  isGlobe?: boolean
 }
 
 export interface TileId {
@@ -41,7 +42,7 @@ export interface TiledRenderState {
   vertexArr: Float32Array
   pixCoordArr: Float32Array
   tileBounds?: Record<string, MercatorBounds>
-  latIsAscending: boolean | null
+  latIsAscending: boolean
 }
 
 export interface RegionRenderState {
@@ -54,13 +55,21 @@ export interface RegionRenderState {
   width: number
   height: number
   channels: number
-  /** Whether latitude increases with array index (needed for globe tile coordinate calculation) */
-  latIsAscending?: boolean
+  /** Data orientation: true = row 0 is south */
+  latIsAscending: boolean
   /** Band textures for multi-band custom shaders */
   bandData?: Map<string, Float32Array>
   bandTextures?: Map<string, WebGLTexture>
   bandTexturesUploaded?: Set<string>
   bandTexturesConfigured?: Set<string>
+  /** Index buffer for adaptive mesh (proj4 datasets) */
+  indexBuffer?: WebGLBuffer
+  /** Number of vertices/indices to draw */
+  vertexCount?: number
+  /** Whether to use indexed mesh rendering (gl.drawElements) */
+  useIndexedMesh?: boolean
+  /** WGS84 bounds for two-stage reprojection */
+  wgs84Bounds?: import('./map-utils').Wgs84Bounds
 }
 
 export interface ZarrMode {
@@ -82,7 +91,6 @@ export interface ZarrMode {
   getMaxLevelIndex(): number
   getLevels(): string[]
   getTiledState?(): TiledRenderState | null
-  updateClim(clim: [number, number]): void
 
   // Query methods (optional)
   queryData?(geometry: QueryGeometry, selector?: Selector): Promise<QueryResult>

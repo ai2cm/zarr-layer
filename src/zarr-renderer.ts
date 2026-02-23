@@ -8,7 +8,7 @@ import {
 import type { ProjectionData, ShaderData } from './shaders'
 import type {
   CustomShaderConfig,
-  MapboxGlobeParams,
+  MapboxParams,
   RendererUniforms,
 } from './renderer-types'
 import { renderTiles } from './tile-renderer'
@@ -31,7 +31,7 @@ export class ZarrRenderer {
     this.gl = ZarrRenderer.resolveGl(gl)
     this.fragmentShaderSource = fragmentShaderSource
     this.customShaderConfig = customShaderConfig || null
-    this.getProgram(undefined, customShaderConfig)
+    // Shaders are created lazily in getProgram() when shaderData is available
   }
 
   updateMultiBandConfig(config: CustomShaderConfig | null) {
@@ -66,9 +66,10 @@ export class ZarrRenderer {
   getProgram(
     shaderData?: ShaderData,
     customShaderConfig?: CustomShaderConfig,
-    useMapboxGlobe: boolean = false
+    useMapbox: boolean = false,
+    useWgs84: boolean = false
   ): ShaderProgram {
-    const projectionMode = resolveProjectionMode(shaderData, useMapboxGlobe)
+    const projectionMode = resolveProjectionMode(useMapbox, useWgs84)
     const config = customShaderConfig || this.customShaderConfig
     const variantName = makeShaderVariantKey({
       projectionMode,
@@ -99,7 +100,7 @@ export class ZarrRenderer {
     uniforms: RendererUniforms,
     customShaderConfig?: CustomShaderConfig,
     projectionData?: ProjectionData,
-    mapboxGlobe?: MapboxGlobeParams,
+    mapbox?: MapboxParams,
     matrix?: number[] | Float32Array | Float64Array,
     isGlobeTileRender: boolean = false
   ): void {
@@ -132,13 +133,7 @@ export class ZarrRenderer {
       gl.uniform1f(shaderProgram.addOffsetLoc, uniforms.offset)
     }
     if (shaderProgram.dataScaleLoc) {
-      // Compute data scale from clim (same formula used in normalizeDataForTexture)
-      const dataScale = Math.max(
-        Math.abs(uniforms.clim[0]),
-        Math.abs(uniforms.clim[1]),
-        1
-      )
-      gl.uniform1f(shaderProgram.dataScaleLoc, dataScale)
+      gl.uniform1f(shaderProgram.dataScaleLoc, uniforms.fixedDataScale)
     }
     gl.uniform2f(shaderProgram.texScaleLoc, 1.0, 1.0)
     gl.uniform2f(shaderProgram.texOffsetLoc, 0.0, 0.0)
@@ -160,7 +155,7 @@ export class ZarrRenderer {
         shaderProgram,
         matrix,
         projectionData,
-        mapboxGlobe,
+        mapbox,
         isGlobeTileRender
       )
     }
@@ -181,7 +176,8 @@ export class ZarrRenderer {
     tileTexOverrides?: Record<
       string,
       { texScale: [number, number]; texOffset: [number, number] }
-    >
+    >,
+    latIsAscending: boolean = true
   ): void {
     renderTiles(
       this.gl,
@@ -196,7 +192,8 @@ export class ZarrRenderer {
       customShaderConfig,
       isGlobeTileRender,
       datasetMaxZoom,
-      tileTexOverrides
+      tileTexOverrides,
+      latIsAscending
     )
   }
 
