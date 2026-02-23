@@ -432,8 +432,8 @@ export const Map = () => {
       <Box
         sx={{
           position: 'absolute',
-          top: '56px',
-          left: (sidebarWidth ?? 0) + 10,
+          top: ['56px', '56px', '8px'],
+          left: sidebarWidth ? sidebarWidth + 10 : 2,
         }}
       >
         {loadingState.loading && <Spinner size={40} />}
