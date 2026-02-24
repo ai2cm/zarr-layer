@@ -2,7 +2,7 @@ import antarcticEra5 from './antarctic-era5'
 import carbonplan4d from './carbonplan-4d'
 import hrrr from './hrrr'
 import usgsdem from './usgs-dem'
-import icechunkUsgsDem from './icechunk-usgs-dem'
+import icechunkAirTemp from './icechunk-air-temp'
 
 import hurricane from './hurricane'
 import polar from './polar'
@@ -15,7 +15,7 @@ import type { Dataset } from './types'
 export const DATASETS: Dataset<any>[] = [
   carbonplan4d,
   hrrr,
-  icechunkUsgsDem,
+  icechunkAirTemp,
   hurricane,
   createTimeDataset({
     id: 'temperature_v3',

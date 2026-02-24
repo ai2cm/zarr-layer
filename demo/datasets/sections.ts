@@ -28,7 +28,7 @@ export const SELECTOR_SECTIONS: SelectorSection[] = [
     ],
   },
   {
-    label: 'Icechunk (experimental)',
-    datasetIds: ['icechunk_usgs_dem'],
+    label: 'Icechunk',
+    datasetIds: ['icechunk_air_temp'],
   },
 ]
