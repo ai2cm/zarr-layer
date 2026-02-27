@@ -1453,6 +1453,11 @@ export class UntiledMode implements ZarrMode {
     const actualW = xEnd - xStart
     const actualH = yEnd - yStart
 
+    // Check if this fetch still owns the region and is still relevant.
+    // After viewport-based cancellation, a replacement fetch may have claimed
+    // the region with a new requestId — the old fetch must not touch its state.
+    const ownsRegion = () => region.requestId === requestId
+
     try {
       // Build base slice args with spatial region bounds
       const baseSliceArgs = [...snapshot.baseSliceArgs]
@@ -1476,27 +1481,26 @@ export class UntiledMode implements ZarrMode {
       const packedData = new Float32Array(pixelCount * numChannels)
       packedData.fill(fillValue ?? 0)
 
-      // Helper to check if this fetch is still relevant
       const isStale = () =>
+        !ownsRegion() ||
         controller.signal.aborted ||
         this.isRemoved ||
         this.currentLevelIndex !== snapshot.index
+      const bailIfStale = () => {
+        if (!isStale()) return false
+        if (ownsRegion()) region.loading = false
+        return true
+      }
 
       if (numChannels === 1) {
         // Single channel - simple fetch
-        if (isStale()) {
-          region.loading = false
-          return
-        }
+        if (bailIfStale()) return
 
         const result = (await zarr.get(snapshot.zarrArray, baseSliceArgs, {
           opts: { signal: controller.signal },
         })) as { data: ArrayLike<number> }
 
-        if (isStale()) {
-          region.loading = false
-          return
-        }
+        if (bailIfStale()) return
 
         const rawData = new Float32Array(result.data as ArrayLike<number>)
         bandArrays.push(rawData)
@@ -1504,10 +1508,7 @@ export class UntiledMode implements ZarrMode {
       } else {
         // Multi-channel - fetch each channel's data
         for (let c = 0; c < numChannels; c++) {
-          if (isStale()) {
-            region.loading = false
-            return
-          }
+          if (bailIfStale()) return
 
           const sliceArgs = [...baseSliceArgs]
           const combo = channelCombinations[c]
@@ -1521,10 +1522,7 @@ export class UntiledMode implements ZarrMode {
             opts: { signal: controller.signal },
           })) as { data: ArrayLike<number> }
 
-          if (isStale()) {
-            region.loading = false
-            return
-          }
+          if (bailIfStale()) return
 
           const bandData = new Float32Array(result.data as ArrayLike<number>)
           bandArrays.push(bandData)
@@ -1538,7 +1536,7 @@ export class UntiledMode implements ZarrMode {
 
       // Only render if this is newer than what's already rendered for this region
       if (fetchSelectorVersion < region.selectorVersion) {
-        region.loading = false
+        if (ownsRegion()) region.loading = false
         return
       }
 
@@ -1661,10 +1659,10 @@ export class UntiledMode implements ZarrMode {
       if (!(err instanceof DOMException && err.name === 'AbortError')) {
         console.error(`[fetchRegion] Error fetching region ${key}:`, err)
       }
-      region.loading = false
+      if (ownsRegion()) region.loading = false
     } finally {
       this.requestCanceller.controllers.delete(requestId)
-      region.requestId = null
+      if (ownsRegion()) region.requestId = null
     }
   }
 
