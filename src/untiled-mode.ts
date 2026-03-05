@@ -1369,8 +1369,11 @@ export class UntiledMode implements ZarrMode {
     const executing: Promise<void>[] = []
 
     for (const { regionX, regionY } of regions) {
-      // Check if level switched - bail out to avoid stale fetches
-      if (this.currentLevelIndex !== snapshot.index) {
+      // Check if level or selector changed - bail out to avoid stale fetches
+      if (
+        this.currentLevelIndex !== snapshot.index ||
+        this.selectorVersion !== snapshot.selectorVersion
+      ) {
         cancelAllRequests(this.requestCanceller)
         this.clearBatchLoadingFlags(regions, snapshot.index)
         break
@@ -2151,6 +2154,15 @@ export class UntiledMode implements ZarrMode {
     }
 
     this.selectorVersion++
+
+    // Abort in-flight fetches still running with the old selector.
+    // The fetch's catch/finally handles state cleanup and re-invalidation.
+    for (const [, region] of this.regionCache) {
+      if (region.loading && region.requestId !== null) {
+        this.requestCanceller.controllers.get(region.requestId)?.abort()
+      }
+    }
+
     await this.buildBaseSliceArgs()
     this.lastViewportHash = ''
     this.invalidate()
