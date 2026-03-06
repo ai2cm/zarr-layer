@@ -1179,6 +1179,20 @@ export class ZarrStore {
       const yMin = coordYMin - (Number.isFinite(dy) ? dy / 2 : 0)
       const yMax = coordYMax + (Number.isFinite(dy) ? dy / 2 : 0)
 
+      // Normalize 0–360° longitude convention to -180–180°.
+      // Only applies when both bounds are > 180 (clearly 0–360° data, not
+      // projected meters) and within the degree range (xMax <= 360).
+      if (
+        xMin > 180 &&
+        xMax > 180 &&
+        xMax <= 360 &&
+        !this.proj4 &&
+        this.crs !== 'EPSG:3857'
+      ) {
+        xMin -= 360
+        xMax -= 360
+      }
+
       // For global datasets, snap bounds to exactly ±180 to avoid antimeridian
       // seams caused by grid alignment not landing on ±180. A truly global grid
       // has extent = N * dx = 360°; use dx/2 tolerance for float32 precision.
