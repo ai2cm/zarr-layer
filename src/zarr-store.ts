@@ -1174,10 +1174,20 @@ export class ZarrStore {
       const dy = Math.abs(y1 - y0)
 
       // Apply half-pixel expansion (coords are pixel centers, we need edge bounds)
-      const xMin = coordXMin - (Number.isFinite(dx) ? dx / 2 : 0)
-      const xMax = coordXMax + (Number.isFinite(dx) ? dx / 2 : 0)
+      let xMin = coordXMin - (Number.isFinite(dx) ? dx / 2 : 0)
+      let xMax = coordXMax + (Number.isFinite(dx) ? dx / 2 : 0)
       const yMin = coordYMin - (Number.isFinite(dy) ? dy / 2 : 0)
       const yMax = coordYMax + (Number.isFinite(dy) ? dy / 2 : 0)
+
+      // For global datasets, snap bounds to exactly ±180 to avoid antimeridian
+      // seams caused by grid alignment not landing on ±180. A truly global grid
+      // has extent = N * dx = 360°; use dx/2 tolerance for float32 precision.
+      // A dataset one cell short has extent = 360 - dx, which fails the check.
+      const lonExtent = xMax - xMin
+      if (Number.isFinite(dx) && Math.abs(lonExtent - 360) < dx / 2) {
+        if (Math.abs(xMin + 180) < dx) xMin = -180
+        if (Math.abs(xMax - 180) < dx) xMax = 180
+      }
 
       if (needsBounds) {
         this.xyLimits = { xMin, xMax, yMin, yMax }
