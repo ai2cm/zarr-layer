@@ -13,9 +13,8 @@ const icechunkAirTemp: Dataset<Record<string, never>> = {
   clim: [185, 322],
   colormap: 'warm',
   zarrVersion: 3,
-  info: 'Air temperature (Icechunk, 2-level multiscale)',
-  sourceInfo:
-    'Air temperature stored in Icechunk format with 14-level multiscale pyramid.',
+  info: 'Air temperature (Icechunk)',
+  sourceInfo: 'Air temperature stored in an Icechunk store',
   center: [-100, 45],
   zoom: 2,
   get store() {
