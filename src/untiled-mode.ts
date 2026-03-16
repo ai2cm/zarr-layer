@@ -209,8 +209,10 @@ export class UntiledMode implements ZarrMode {
   private requestCanceller: RequestCanceller = createRequestCanceller()
   private loadingManager: LoadingManager = createLoadingManager()
 
-  // Dimension values cache
-  private dimensionValues: { [key: string]: Float64Array | number[] } = {}
+  // Dimension values cache (supports numeric and string coordinate arrays)
+  private dimensionValues: {
+    [key: string]: Float64Array | number[] | string[]
+  } = {}
 
   // Region-based loading (for multi-level datasets with chunking/sharding)
   // Single unified cache with LRU eviction - keys include level index (e.g., "2:0,0")
@@ -1625,10 +1627,12 @@ export class UntiledMode implements ZarrMode {
         bandArrays.push(rawData)
         packedData.set(rawData)
       } else {
-        // Multi-channel - fetch each channel's data
-        for (let c = 0; c < numChannels; c++) {
-          if (isStale()) return
+        // Multi-channel - fetch all channels in parallel
+        if (isStale()) return
 
+        // Build slice args for all channels upfront
+        const allSliceArgs: (number | zarr.Slice)[][] = []
+        for (let c = 0; c < numChannels; c++) {
           const sliceArgs = [...baseSliceArgs]
           const combo = channelCombinations[c]
 
@@ -1636,13 +1640,23 @@ export class UntiledMode implements ZarrMode {
           for (let i = 0; i < snapshot.baseMultiValueDims.length; i++) {
             sliceArgs[snapshot.baseMultiValueDims[i].dimIndex] = combo[i]
           }
+          allSliceArgs.push(sliceArgs)
+        }
 
-          const result = (await zarr.get(snapshot.zarrArray, sliceArgs, {
-            opts: { signal: controller.signal },
-          })) as { data: ArrayLike<number> }
+        // Fetch all bands in parallel
+        const results = await Promise.all(
+          allSliceArgs.map((sliceArgs) =>
+            zarr.get(snapshot.zarrArray, sliceArgs, {
+              opts: { signal: controller.signal },
+            })
+          )
+        )
 
-          if (isStale()) return
+        if (isStale()) return
 
+        // Process results in order
+        for (let c = 0; c < numChannels; c++) {
+          const result = results[c] as { data: ArrayLike<number> }
           const bandData = new Float32Array(result.data as ArrayLike<number>)
           bandArrays.push(bandData)
 

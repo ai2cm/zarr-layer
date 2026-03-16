@@ -165,7 +165,9 @@ const result = await layer.queryData(
 
 ## custom shaders and uniforms
 
-Custom fragment shaders let you do math on your data to change how it's displayed. This can be useful for things like log scales, combining bands, or aggregating data over a time window. Note that in order to access different bands/time slices etc., the data need to be in the same chunk. You can pass in `uniforms` to allow user interaction to influence the custom shader code.
+Custom fragment shaders let you do math on your data to change how it's displayed. This can be useful for things like log scales, combining bands, or aggregating data over a time window. In tiled mode, data for all selected bands must be in the same chunk. In untiled mode, bands can span separate chunks — each band is fetched in parallel and combined for rendering. You can pass in `uniforms` to allow user interaction to influence the custom shader code.
+
+Band names are automatically sanitized to valid GLSL identifiers: any characters that aren't letters, digits, or underscores are replaced with underscores, and names starting with a digit are prefixed with an underscore. For example, `s2med_harvest:B02` becomes `s2med_harvest_B02` and `123band` becomes `_123band`.
 
 ```ts
 new ZarrLayer({
@@ -178,6 +180,26 @@ new ZarrLayer({
     fragColor = vec4(c.rgb, opacity);
   `,
   uniforms: { u_weight: 1.0 },
+})
+```
+
+### NDVI example
+
+Here's an example of computing NDVI (Normalized Difference Vegetation Index) using custom shaders:
+
+```ts
+new ZarrLayer({
+  source: 'https://example.com/sentinel2.zarr',
+  variable: 'data',
+  colormap: [/* gradient */],
+  selector: { band: ['B08', 'B04'], time: 0 },
+  clim: [-1, 1],
+  customFrag: `
+    float ndvi = (B08 - B04) / (B08 + B04);
+    float norm = (ndvi - clim.x) / (clim.y - clim.x);
+    vec4 c = texture(colormap, vec2(clamp(norm, 0.0, 1.0), 0.5));
+    fragColor = vec4(c.rgb, opacity);
+  `,
 })
 ```
 
