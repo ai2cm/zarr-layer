@@ -106,12 +106,10 @@ const DatasetBrowser = () => {
                 return (
                   <Box
                     key={id}
-                    onClick={() => setDatasetId(id)}
                     sx={{
                       bg: isActive ? 'hinted' : 'transparent',
                       px: [4, 5, 5, 6],
                       py: isActive ? 2 : '2px',
-                      cursor: 'pointer',
                       transition: 'background-color 0.15s',
                       '@media (hover: hover) and (pointer: fine)': {
                         '&:hover': {
@@ -121,9 +119,11 @@ const DatasetBrowser = () => {
                     }}
                   >
                     <Box
+                      onClick={() => setDatasetId(id)}
                       sx={{
                         color: isActive ? 'primary' : 'secondary',
                         fontSize: [1, 1, 1, 1],
+                        cursor: 'pointer',
                         '@media (hover: hover) and (pointer: fine)': {
                           '&:hover': { color: 'primary' },
                         },
