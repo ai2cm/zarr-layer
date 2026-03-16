@@ -84,7 +84,6 @@ const Controls = ({ state, setState }: ControlsProps<State>) => {
             color: 'secondary',
             whiteSpace: 'pre-wrap',
             display: 'block',
-            mb: 3,
           }}
         >
           {combinedBandsCustomFrag}
@@ -99,7 +98,6 @@ const Controls = ({ state, setState }: ControlsProps<State>) => {
             color: 'secondary',
             whiteSpace: 'pre-wrap',
             display: 'block',
-            mb: 3,
           }}
         >
           {monthRangeAverageFrag.slice(0, 250)}

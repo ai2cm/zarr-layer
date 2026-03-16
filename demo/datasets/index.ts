@@ -59,27 +59,12 @@ export const DATASETS: Dataset<any>[] = [
   sentinel2,
   polar,
   antarcticEra5,
-  createSimpleDataset({
-    id: 'Burn Probability over CONUS',
-    source:
-      'https://carbonplan-share.s3.us-west-2.amazonaws.com/zarr-layer-examples/13-lvl-30m-4326-scott-BP.zarr',
-    variable: 'BP',
-    clim: [0, 0.13],
-    colormap: 'fire',
-    zarrVersion: 3,
-    // bounds: [-127.7569327296286, 23.058743477241073, -65.94103341193146, 50.81297227993714],
-    info: 'Burn Probability over CONUS',
-    sourceInfo:
-      '30m resolution untiled multiscale dataset created by resampling and reprojecting the "Wildfire Risk to Communities: Spatial datasets of landscape-wide wildfire risk components for the United States (2nd Edition)" dataset.',
-    center: [-98, 39],
-    zoom: 4,
-  }),
 ]
 
 export const DATASET_MAP = Object.fromEntries(
   DATASETS.map((d) => [d.id, d])
 ) as Record<string, Dataset<any>>
 
-export const DEFAULT_DATASET_ID = DATASETS[0].id
+export const DEFAULT_DATASET_ID = usgsdem.id
 
 export type { Dataset } from './types'

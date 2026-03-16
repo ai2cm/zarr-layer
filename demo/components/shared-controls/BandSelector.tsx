@@ -23,7 +23,7 @@ export function BandSelector<T extends string>({
   }, {} as Record<T, boolean>)
 
   return (
-    <Row columns={[4, 4, 4, 4]} sx={{ mb: 3, alignItems: 'baseline' }}>
+    <Row columns={[4, 4, 4, 4]} sx={{ alignItems: 'baseline' }}>
       <Column start={1} width={1}>
         <Box sx={subheadingSx}>{label}</Box>
       </Column>

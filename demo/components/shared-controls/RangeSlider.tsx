@@ -48,7 +48,7 @@ export const RangeSlider: React.FC<RangeSliderProps> = ({
   }
 
   return (
-    <Row columns={[4, 4, 4, 4]} sx={{ alignItems: 'baseline', mb: 3 }}>
+    <Row columns={[4, 4, 4, 4]} sx={{ alignItems: 'baseline' }}>
       <Column start={1} width={1}>
         <Box sx={subheadingSx}>{label}</Box>
       </Column>

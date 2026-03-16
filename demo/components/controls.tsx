@@ -1,7 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react'
 import {
   Filter,
-  Select,
   Slider,
   Row,
   Column,
@@ -9,6 +8,7 @@ import {
   Badge,
   Button,
   Input,
+  Select,
   // @ts-expect-error - carbonplan components types not available
 } from '@carbonplan/components'
 // @ts-expect-error - carbonplan colormaps types not available
@@ -16,11 +16,9 @@ import { useThemedColormap } from '@carbonplan/colormaps'
 // @ts-expect-error - carbonplan icons types not available
 import { Info, RotatingArrow } from '@carbonplan/icons'
 import { Box, Divider, Flex, IconButton } from 'theme-ui'
-import { DATASET_MAP } from '../datasets'
 import { useAppStore } from '../lib/store'
-import type { ControlsProps } from '../datasets/types'
-import { SELECTOR_SECTIONS } from '../datasets/sections'
 import { subheadingSx } from './shared-controls'
+import DatasetBrowser from './dataset-browser'
 import type {
   QueryGeometry,
   QueryResult,
@@ -279,16 +277,12 @@ const Controls = () => {
     zoomLevel === null ||
     zoomLevel <= VIEWPORT_QUERY_MIN_ZOOM
 
-  const setDatasetId = useAppStore((state) => state.setDatasetId)
   const setOpacity = useAppStore((state) => state.setOpacity)
   const setClim = useAppStore((state) => state.setClim)
   const setColormap = useAppStore((state) => state.setColormap)
   const setGlobeProjection = useAppStore((state) => state.setGlobeProjection)
   const setTerrainEnabled = useAppStore((state) => state.setTerrainEnabled)
   const setMapProvider = useAppStore((state) => state.setMapProvider)
-  const setActiveDatasetState = useAppStore(
-    (state) => state.setActiveDatasetState
-  )
   const setRegionResult = useAppStore((state) => state.setRegionResult)
   const setPointResult = useAppStore((state) => state.setPointResult)
   const themedColormap = useThemedColormap(colormap)
@@ -307,10 +301,10 @@ const Controls = () => {
     (currentBand === 'tavg_range' || currentBand === 'prec_range')
 
   useEffect(() => {
-    // Clear query results when switching dataset or band to avoid stale display
+    // Clear query results when switching dataset or selector to avoid stale display
     setPointResult(null)
     setRegionResult(null)
-  }, [datasetId, currentBand, setPointResult, setRegionResult])
+  }, [datasetId, datasetState, setPointResult, setRegionResult])
 
   const currentVariable = useMemo(() => {
     const layerConfig = datasetModule.buildLayerProps(datasetState as any)
@@ -385,14 +379,6 @@ const Controls = () => {
     setClim([lo, hi])
   }
 
-  const handleDatasetChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    setDatasetId(e.target.value)
-  }
-
-  const ActiveDatasetControls = datasetModule.Controls as React.FC<
-    ControlsProps<any>
-  >
-
   const handleViewportQuery = async () => {
     if (viewportQueryDisabled) return
     if (!mapInstance || !zarrLayer || !mapInstance.getBounds) return
@@ -436,34 +422,7 @@ const Controls = () => {
     <Box>
       <Box sx={headingSx}>Dataset</Box>
 
-      <Box sx={{ width: '100%', my: 2 }}>
-        <Select
-          value={datasetId}
-          onChange={handleDatasetChange}
-          size='xs'
-          sxSelect={{ width: '100%' }}
-        >
-          {SELECTOR_SECTIONS.map((section) => (
-            <optgroup key={section.label} label={section.label}>
-              {section.datasetIds.map((id) => {
-                const config = DATASET_MAP[id]
-                if (!config) return null
-                return (
-                  <option key={id} value={id}>
-                    {config.info}
-                  </option>
-                )
-              })}
-            </optgroup>
-          ))}
-        </Select>
-        <Box sx={{ color: 'secondary', mt: 1 }}>{datasetModule.sourceInfo}</Box>
-      </Box>
-
-      <ActiveDatasetControls
-        state={datasetState as any}
-        setState={setActiveDatasetState as any}
-      />
+      <DatasetBrowser />
 
       <Divider sx={{ mt: 4, mb: 3 }} />
 
@@ -476,12 +435,32 @@ const Controls = () => {
         </Column>
         <Column start={2} width={3}>
           <Box sx={{ color: 'secondary' }}>
-            <Flex sx={{ justifyContent: 'space-between' }}>
-              <Badge>
-                {pointDisplayValue !== null
-                  ? pointDisplayValue.toFixed(2)
-                  : '---'}
-              </Badge>
+            <Flex
+              sx={{ justifyContent: 'space-between', alignItems: 'center' }}
+            >
+              <Flex sx={{ alignItems: 'center', gap: 2 }}>
+                <Badge>
+                  {pointDisplayValue !== null
+                    ? pointDisplayValue.toFixed(2)
+                    : '---'}
+                </Badge>
+                {pointDisplayValue !== null && (
+                  <Box
+                    as='span'
+                    onClick={() => setPointResult(null)}
+                    sx={{
+                      cursor: 'pointer',
+                      fontSize: 0,
+                      color: 'secondary',
+                      '@media (hover: hover) and (pointer: fine)': {
+                        '&:hover': { color: 'primary' },
+                      },
+                    }}
+                  >
+                    ✕
+                  </Box>
+                )}
+              </Flex>
               <Box>Click map to query</Box>
             </Flex>
           </Box>
@@ -492,12 +471,28 @@ const Controls = () => {
           <Box sx={subheadingSx}>Region</Box>
         </Column>
         <Column start={2} width={3}>
-          <Flex sx={{ justifyContent: 'space-between' }}>
-            <Box sx={{ color: 'secondary' }}>
+          <Flex sx={{ justifyContent: 'space-between', alignItems: 'center' }}>
+            <Flex sx={{ alignItems: 'center', gap: 2, color: 'secondary' }}>
               <Badge>
                 {regionMean !== null ? regionMean.toFixed(2) : '---'}
               </Badge>
-            </Box>
+              {regionMean !== null && (
+                <Box
+                  as='span'
+                  onClick={() => setRegionResult(null)}
+                  sx={{
+                    cursor: 'pointer',
+                    fontSize: 0,
+                    color: 'secondary',
+                    '@media (hover: hover) and (pointer: fine)': {
+                      '&:hover': { color: 'primary' },
+                    },
+                  }}
+                >
+                  ✕
+                </Box>
+              )}
+            </Flex>
             {viewportQueryDisabled ? (
               <Box sx={{ color: 'secondary' }}> Zoom in to query</Box>
             ) : (
