@@ -1,15 +1,19 @@
 export type SelectorSection = {
   label: string
+  description: string
   datasetIds: string[]
 }
 
 export const SELECTOR_SECTIONS: SelectorSection[] = [
   {
-    label: 'Tiled Pyramids',
-    datasetIds: ['carbonplan_4d', 'temperature_v3', 'tasmax_pyramid_4326'],
+    label: 'Multiscale',
+    description:
+      'Multiscale zarr stores. Uses the zarr-conventions/multiscales format. See topozarr for creation.',
+    datasetIds: ['usgsdem', 'sentinel_2_eopf', 'Burn Probability over CONUS'],
   },
   {
-    label: 'Single Image',
+    label: 'Single Resolution',
+    description: 'Single-resolution datasets. Reprojected if needed.',
     datasetIds: [
       'hrrr_weather',
       'hurricane_florence',
@@ -19,11 +23,15 @@ export const SELECTOR_SECTIONS: SelectorSection[] = [
     ],
   },
   {
-    label: 'Untiled Multiscale',
-    datasetIds: ['usgsdem', 'sentinel_2_eopf', 'Burn Probability over CONUS'],
+    label: 'Tiled Pyramids',
+    description:
+      'Stores resampled and rechunked to follow slippy-map tile pyramid conventions (zxy). See ndpyramid for creation',
+    datasetIds: ['carbonplan_4d', 'temperature_v3', 'tasmax_pyramid_4326'],
   },
   {
     label: 'Icechunk',
-    datasetIds: ['icechunk_prec'],
+    description:
+      'Datasets served from Icechunk, a transactional storage engine for zarr that supports virtual datasets via VirtualiZarr. Uses @carbonplan/icechunk-js reader.',
+    datasetIds: ['icechunk_air_temp'],
   },
 ]
