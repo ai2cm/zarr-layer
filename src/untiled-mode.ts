@@ -2081,14 +2081,15 @@ export class UntiledMode implements ZarrMode {
       ? hasMapboxDirectGlobePath && ecefEligible
       : hasMaplibreGlobeTransition && ecefEligible
 
-    // Flush deferred geometry rebuild once transition completes
-    if (
-      this.pendingGeometryRebuild &&
-      !hasMaplibreGlobeTransition &&
-      !hasMapboxGlobe
-    ) {
-      this.pendingGeometryRebuild = false
-      this.rebuildAllGeometry()
+    // Flush deferred geometry rebuild once transition completes.
+    // proj4 uses hybrid mesh which is projection-independent, so skip rebuilds.
+    if (this.pendingGeometryRebuild) {
+      if (useWgs84) {
+        this.pendingGeometryRebuild = false
+      } else if (!hasMaplibreGlobeTransition && !hasMapboxGlobe) {
+        this.pendingGeometryRebuild = false
+        this.rebuildAllGeometry()
+      }
     }
 
     const shaderProgram = renderer.getProgram(
@@ -2237,6 +2238,9 @@ export class UntiledMode implements ZarrMode {
   onProjectionChange(isGlobe: boolean): void {
     if (this.isGlobeProjection === isGlobe) return
     this.isGlobeProjection = isGlobe
+
+    // proj4 uses hybrid mesh which is projection-independent — no rebuild needed.
+    if (this.proj4def) return
 
     if (!isGlobe) {
       // Globe→flat: defer geometry rebuild until projectionTransition reaches 0.
