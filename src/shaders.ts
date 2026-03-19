@@ -170,7 +170,10 @@ const PROJECT_MAPBOX_ECEF = `
   gl_Position = matrix * (u_globe_to_merc * vec4(ecef, 1.0));
   gl_Position.z -= ${MAPBOX_ECEF_DEPTH_BIAS.toExponential(6)} * gl_Position.w;`
 
-/** MapLibre ECEF projection output with globe/flat transition blend */
+/** MapLibre ECEF projection output with globe/flat transition blend.
+ * Unlike projectTile(merc), this path starts from WGS84-derived sphere coords,
+ * which preserves polar coverage for untiled EPSG:4326/proj4 data.
+ */
 const PROJECT_MAPLIBRE_ECEF = `
   vec4 globePos = u_projection_matrix * vec4(ecef, 1.0);
 

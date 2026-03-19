@@ -66,8 +66,10 @@ export function resolveProjectionMode(
   if (useMapbox && useDirectEcef) return 'mapbox-ecef'
   if (useMapbox && useWgs84) return 'mapbox-proj4'
   if (useMapbox) return 'mapbox'
-  // For MapLibre: projectTile() handles both globe and mercator modes
-  // Requires MapLibre 3.0+ which provides vertexShaderPrelude
+  // For MapLibre: projectTile() handles the standard Mercator-driven paths.
+  // The ECEF variant is separate because untiled 4326/proj4 globe rendering
+  // needs vertices built directly on the sphere to avoid Mercator pole clipping.
+  // Requires MapLibre 3.0+ which provides vertexShaderPrelude.
   if (useDirectEcef) return 'maplibre-ecef'
   if (useWgs84) return 'maplibre-proj4'
   return 'maplibre'
