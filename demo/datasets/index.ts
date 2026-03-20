@@ -24,8 +24,8 @@ export const DATASETS: Dataset<any>[] = [
     clim: [0, 50],
     colormap: 'fire',
     zarrVersion: 3,
-    info: 'Ocean temperature (v3 pyramid, EPSG:3857)',
-    sourceInfo: 'v3 pyramid (EPSG:3857)',
+    info: 'Ocean Temperature (EPSG:3857, tiled pyramid)',
+    sourceInfo: 'Zarr v3 tiled pyramid. EPSG:3857, time dimension.',
   }),
   createTimeDataset({
     id: 'tasmax_pyramid_4326',
@@ -35,8 +35,9 @@ export const DATASETS: Dataset<any>[] = [
     clim: [220, 320],
     colormap: 'fire',
     zarrVersion: 2,
-    info: 'tasmax v2 pyramid (EPSG:4326)',
-    sourceInfo: 'v2 pyramid (EPSG:4326)',
+    info: 'CMIP6 tasmax (EPSG:4326, tiled pyramid)',
+    sourceInfo:
+      'NEX-GDDP-CMIP6 tasmax, Zarr v2 tiled pyramid. EPSG:4326, daily time dimension.',
     maxTime: 729,
   }),
   createTimeDataset({
@@ -51,8 +52,9 @@ export const DATASETS: Dataset<any>[] = [
     timeSelectorType: 'index',
     spatialDimensions: { lat: 'nlat', lon: 'nlon' },
     bounds: [-180, -90, 180, 90],
-    info: 'Delta FG CO2 (single image, global)',
-    sourceInfo: 'v2 single image (global)',
+    info: 'Delta FG CO2 (EPSG:4326, single resolution)',
+    sourceInfo:
+      'OAE efficiency delta FG CO2, Zarr v2 single resolution. EPSG:4326, daily time dimension.',
     latIsAscending: true,
   }),
   usgsdem,

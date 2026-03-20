@@ -172,9 +172,9 @@ const carbonplan4d: Dataset<State> = {
   clim: [0, 300],
   colormap: 'cool',
   zarrVersion: 2,
-  info: '4d pyramid, temp/precip by month',
+  info: 'Monthly precip + temp pyramid with custom shaders',
   sourceInfo:
-    'Zarr v2 pyramid. Select different bands for demonstrations of custom fragment shaders and uniform variables.',
+    'Zarr v2 pyramid of temp/precip. EPSG:3857, monthly time with custom shader support demonstrations.',
   spatialDimensions: { lat: 'y', lon: 'x' },
   defaultState: {
     band: 'prec',
