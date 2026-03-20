@@ -54,6 +54,19 @@ type MapboxInternals = {
   }
 }
 
+/** Extract Mapbox's internal expandedFarZ projection matrix and worldSize.
+ *  Falls back per-field: transform may exist without the expanded matrix,
+ *  while painter.transform carries it (or vice versa across Mapbox versions). */
+function getMapboxGlobeInternals(map: MapLike) {
+  const m = map as MapLike & MapboxInternals
+  return {
+    expandedFarZProjMatrix:
+      m.transform?.expandedFarZProjMatrix ??
+      m.painter?.transform?.expandedFarZProjMatrix,
+    worldSize: m.transform?.worldSize ?? m.painter?.transform?.worldSize,
+  }
+}
+
 function scaleMercatorMatrix(
   matrix: number[] | Float32Array | Float64Array,
   scale: number
@@ -166,30 +179,6 @@ export class ZarrLayer {
   private lastIsGlobe: boolean | null = null
   private usingDirectMapboxGlobePath: boolean = false
   private mapboxDirectGlobePathAvailable: boolean = false
-  private expandedFarZSource: Float32Array | Float64Array | number[] | undefined
-  private expandedFarZWorldSize: number | undefined
-  private expandedFarZMercatorMatrix: Float32Array | undefined
-
-  private getExpandedFarZMercatorMatrix(
-    expandedFarZProjMatrix?: Float32Array | Float64Array | number[],
-    worldSize?: number
-  ): Float32Array | undefined {
-    if (!expandedFarZProjMatrix || !worldSize) return undefined
-    if (
-      this.expandedFarZSource === expandedFarZProjMatrix &&
-      this.expandedFarZWorldSize === worldSize
-    ) {
-      return this.expandedFarZMercatorMatrix
-    }
-
-    this.expandedFarZSource = expandedFarZProjMatrix
-    this.expandedFarZWorldSize = worldSize
-    this.expandedFarZMercatorMatrix = scaleMercatorMatrix(
-      expandedFarZProjMatrix,
-      worldSize
-    )
-    return this.expandedFarZMercatorMatrix
-  }
 
   private canUseMapboxDirectGlobePath(): boolean {
     if (this.mapboxDirectGlobePathAvailable) {
@@ -199,31 +188,21 @@ export class ZarrLayer {
       return false
     }
 
-    const mapWithInternals = this.map as typeof this.map & MapboxInternals
-    const worldSize =
-      mapWithInternals.transform?.worldSize ??
-      mapWithInternals.painter?.transform?.worldSize
-    const expandedFarZProjMatrix =
-      mapWithInternals.transform?.expandedFarZProjMatrix ??
-      mapWithInternals.painter?.transform?.expandedFarZProjMatrix
-
-    // Only cache on success — the private matrix may not be populated yet
-    // during early lifecycle events. Failed probes keep retrying until the
-    // matrix appears or the layer is removed.
-    const available = !!this.getExpandedFarZMercatorMatrix(
-      expandedFarZProjMatrix,
-      worldSize
+    // Probe for internal matrix — may not be populated yet during early
+    // lifecycle events. Failed probes keep retrying until it appears.
+    const { expandedFarZProjMatrix, worldSize } = getMapboxGlobeInternals(
+      this.map
     )
-    if (available) {
+    if (expandedFarZProjMatrix && worldSize) {
       this.mapboxDirectGlobePathAvailable = true
+      return true
     }
-    return available
+    return false
   }
 
   private configureMapboxRenderPath(): void {
     if (!this.map || !this.mode) return
 
-    const isMapbox = typeof this.map.getTerrain === 'function'
     const isUntiled = this.mode instanceof UntiledMode
     const resolvedProj4 = this.zarrStore?.proj4 ?? this.proj4
     const resolvedCrs = this.zarrStore?.crs ?? this.crs
@@ -241,9 +220,10 @@ export class ZarrLayer {
     // to the draped path near the 5-6 zoom morph window; that is intentional,
     // and is currently more stable than trying to carry the direct ECEF path
     // through Mapbox's custom-layer transition contract.
+    // canUseMapboxDirectGlobePath() probes for Mapbox-only internals, so it
+    // doubles as the Mapbox discriminator — MapLibre will never pass this gate.
     const shouldUseDirectGlobePath =
       this.renderPoles &&
-      isMapbox &&
       isUntiled &&
       isEcefEligible &&
       !this.map.getTerrain?.() &&
@@ -794,21 +774,19 @@ export class ZarrLayer {
     const colormapTexture = this.colormap.ensureTexture(this.gl)
     let expandedFarZMercatorMatrix: Float32Array | undefined
     if (projectionParams.mapbox?.projection.name === 'globe') {
-      const mapWithInternals = this.map as typeof this.map & MapboxInternals
-      const worldSize =
-        mapWithInternals.transform?.worldSize ??
-        mapWithInternals.painter?.transform?.worldSize
-      const expandedFarZProjMatrix =
-        mapWithInternals.transform?.expandedFarZProjMatrix ??
-        mapWithInternals.painter?.transform?.expandedFarZProjMatrix
       // FRAGILE: Mapbox's internal globe raster pass uses expandedFarZProjMatrix,
-      // while customLayerMatrix() uses the regular far plane. Rebuild the
-      // Mercator-scaled variant here so the direct ECEF path shares the globe
+      // while customLayerMatrix() uses the regular far plane. Scale the
+      // projection matrix by worldSize so the direct ECEF path shares the globe
       // surface's depth behavior.
-      expandedFarZMercatorMatrix = this.getExpandedFarZMercatorMatrix(
-        expandedFarZProjMatrix,
-        worldSize
+      const { expandedFarZProjMatrix, worldSize } = getMapboxGlobeInternals(
+        this.map
       )
+      if (expandedFarZProjMatrix && worldSize) {
+        expandedFarZMercatorMatrix = scaleMercatorMatrix(
+          expandedFarZProjMatrix,
+          worldSize
+        )
+      }
     }
 
     const context: RenderContext = {
