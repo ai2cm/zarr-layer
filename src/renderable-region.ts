@@ -98,11 +98,11 @@ export function renderRegion(
     shiftY = (region.mercatorBounds.y0 + region.mercatorBounds.y1) / 2
   } else {
     // 'wgs84' and 'wgs84-ecef' both use wgs84Bounds for scale/shift
-    const bounds = wgs84Bounds!
-    scaleX = (bounds.lon1 - bounds.lon0) / 2
-    scaleY = (bounds.lat1 - bounds.lat0) / 2
-    shiftX = (bounds.lon0 + bounds.lon1) / 2
-    shiftY = (bounds.lat0 + bounds.lat1) / 2
+    if (!wgs84Bounds) return false
+    scaleX = (wgs84Bounds.lon1 - wgs84Bounds.lon0) / 2
+    scaleY = (wgs84Bounds.lat1 - wgs84Bounds.lat0) / 2
+    shiftX = (wgs84Bounds.lon0 + wgs84Bounds.lon1) / 2
+    shiftY = (wgs84Bounds.lat0 + wgs84Bounds.lat1) / 2
   }
 
   gl.uniform1f(shaderProgram.scaleLoc, 0)
