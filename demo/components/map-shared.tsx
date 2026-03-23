@@ -32,7 +32,7 @@ export interface MapInstance {
     getEast(): number
   }
   getZoom(): number
-  flyTo(options: { center: [number, number]; zoom: number }): void
+  easeTo(options: { center: [number, number]; zoom: number }): void
   getStyle(): { layers?: Array<{ id: string; type: string }> }
   addSource(id: string, source: any): void
   setTerrain(terrain: any): void
@@ -302,9 +302,9 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
       zarrLayerRef.current = layer
       setZarrLayer(layer)
 
-      // Only fly to dataset center when dataset changes (not on variable/band change)
+      // Only ease to dataset center when dataset changes (not on variable/band change)
       if (datasetModule.center && prevDatasetIdRef.current !== datasetId) {
-        map.flyTo({
+        map.easeTo({
           center: datasetModule.center,
           zoom: datasetModule.zoom || 4,
         })

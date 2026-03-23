@@ -16,8 +16,6 @@ const icechunkPrecip: Dataset<Record<string, never>> = {
   info: 'IMERG Precipitation (Virtualized NetCDF Icechunk)',
   sourceInfo:
     'Virtualized NetCDF of NASA IMERG precipitation stored in Icechunk with native multiscales added.',
-  center: [-100, 45],
-  zoom: 2,
   get store() {
     return (_storePromise ??= IcechunkStore.open(ICECHUNK_URL, {
       branch: 'main',
