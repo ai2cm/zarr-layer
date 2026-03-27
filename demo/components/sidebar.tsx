@@ -19,14 +19,15 @@ const SidebarContent = () => (
       @carbonplan/zarr-layer
     </Box>
     <Box sx={{ color: 'secondary', my: 1 }}>
-      Flexible zarr rendering for MapLibre/Mapbox.{' '}
+      Flexible Zarr rendering for MapLibre/Mapbox. View the project on{' '}
       <Link
         href='https://github.com/carbonplan/zarr-layer'
         target='_blank'
-        sx={{ color: 'secondary' }}
+        sx={{ color: 'secondary', '&:hover': { color: 'primary' } }}
       >
         GitHub
       </Link>
+      .
     </Box>
     <Divider sx={{ my: 3 }} />
     <Controls />
