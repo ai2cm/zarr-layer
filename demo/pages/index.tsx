@@ -1,7 +1,7 @@
 import React, { useEffect } from 'react'
 import { useRouter } from 'next/router'
 import { Box, Container } from 'theme-ui'
-import { Header, Meta } from '@carbonplan/components'
+import { Guide, Header, Meta } from '@carbonplan/components'
 import { Map } from '../components/map-shared'
 import Sidebar from '../components/sidebar'
 import { useAppStore } from '../lib/store'
@@ -38,6 +38,7 @@ export default function Home() {
         title={'@carbonplan/zarr-layer demo'}
       />
       <Container>
+        <Guide color='teal' />
         <Box sx={{ position: 'relative', zIndex: 2000 }}>
           <Header />
         </Box>
