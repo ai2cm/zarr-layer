@@ -444,9 +444,7 @@ const Controls = () => {
                       cursor: 'pointer',
                       fontSize: 0,
                       color: 'secondary',
-                      '@media (hover: hover) and (pointer: fine)': {
-                        '&:hover': { color: 'primary' },
-                      },
+                      '&:hover': { color: 'primary' },
                     }}
                   >
                     ✕
@@ -654,9 +652,7 @@ const Controls = () => {
                     height: '16px',
                     p: 0,
                     flexShrink: 0,
-                    '@media (hover: hover) and (pointer: fine)': {
-                      '&:hover > #terrain-info': { stroke: 'primary' },
-                    },
+                    '&:hover > #terrain-info': { stroke: 'primary' },
                   }}
                 >
                   <Info
@@ -675,7 +671,7 @@ const Controls = () => {
           {terrainInfo && (
             <Box
               sx={{
-                fontSize: 0,
+                fontSize: 1,
                 color: 'secondary',
                 mt: 1,
                 mb: 2,
@@ -713,9 +709,7 @@ const Controls = () => {
                     height: '16px',
                     p: 0,
                     flexShrink: 0,
-                    '@media (hover: hover) and (pointer: fine)': {
-                      '&:hover > #render-poles-info': { stroke: 'primary' },
-                    },
+                    '&:hover > #render-poles-info': { stroke: 'primary' },
                   }}
                 >
                   <Info
@@ -734,7 +728,7 @@ const Controls = () => {
           {renderPolesInfo && (
             <Box
               sx={{
-                fontSize: 0,
+                fontSize: 1,
                 color: 'secondary',
                 mt: 1,
                 mb: 2,
@@ -742,7 +736,8 @@ const Controls = () => {
               }}
             >
               Experimental direct ECEF rendering that avoids the visible polar
-              gap from Web Mercator clipping. Incompatible with terrain.
+              gap from Web Mercator clipping. Incompatible with terrain. Toggle
+              impacts Mapbox only: Maplibre renders to the poles by default
             </Box>
           )}
         </>
