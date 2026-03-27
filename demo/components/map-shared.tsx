@@ -12,6 +12,7 @@ import { layers, namedFlavor } from '@protomaps/basemaps'
 import { Protocol } from 'pmtiles'
 import { useAppStore } from '../lib/store'
 import type { LayerProps } from '../datasets/types'
+import MapZoomControls, { useAttributionStyles } from './map-controls'
 
 export type MapProvider = 'maplibre' | 'mapbox'
 
@@ -370,6 +371,7 @@ export const Map = () => {
   const mapInstanceRef = useRef<MapInstance | null>(null)
   const [map, setMap] = useState<MapInstance | null>(null)
   const [isMapLoaded, setIsMapLoaded] = useState(false)
+  const attributionStyles = useAttributionStyles()
 
   const sidebarWidth = useAppStore((state) => state.sidebarWidth)
   const mapProvider = useAppStore((state) => state.mapProvider)
@@ -444,8 +446,10 @@ export const Map = () => {
           right: 0,
           bottom: ['50vh', '50vh', 0],
           left: sidebarWidth ?? 0,
+          ...attributionStyles,
         }}
       />
+      <MapZoomControls />
       <Box
         sx={{
           position: 'absolute',
