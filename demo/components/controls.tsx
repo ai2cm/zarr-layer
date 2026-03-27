@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Filter,
   Slider,
@@ -55,7 +55,7 @@ const colormaps = [
   'sinebow',
 ]
 
-const VIEWPORT_QUERY_MIN_ZOOM = 4
+const VIEWPORT_QUERY_MIN_ZOOM = 6
 
 const headingSx = {
   fontFamily: 'heading',
@@ -281,6 +281,8 @@ const Controls = () => {
   const setRegionResult = useAppStore((state) => state.setRegionResult)
   const setPointResult = useAppStore((state) => state.setPointResult)
   const themedColormap = useThemedColormap(colormap)
+  const [queryInFlight, setQueryInFlight] = useState(false)
+  const queryGenRef = useRef(0)
 
   const layerConfig = useMemo(
     () => datasetModule.buildLayerProps(datasetState),
@@ -297,6 +299,7 @@ const Controls = () => {
 
   useEffect(() => {
     // Clear query results when switching dataset or selector to avoid stale display
+    queryGenRef.current++
     setPointResult(null)
     setRegionResult(null)
   }, [datasetId, datasetState, setPointResult, setRegionResult])
@@ -375,8 +378,10 @@ const Controls = () => {
   }
 
   const handleViewportQuery = async () => {
-    if (viewportQueryDisabled) return
+    if (viewportQueryDisabled || queryInFlight) return
     if (!mapInstance || !zarrLayer || !mapInstance.getBounds) return
+    const gen = queryGenRef.current
+    setQueryInFlight(true)
     try {
       const bounds = mapInstance.getBounds()
       if (!bounds) {
@@ -402,11 +407,13 @@ const Controls = () => {
       }
 
       const result = await zarrLayer.queryData(geometry, querySelector)
-      console.log('Query result:', result)
+      if (gen !== queryGenRef.current) return
       setRegionResult(result)
     } catch (error) {
       console.error('Viewport query failed', error)
-      setRegionResult(null)
+      if (gen === queryGenRef.current) setRegionResult(null)
+    } finally {
+      setQueryInFlight(false)
     }
   }
 
@@ -491,9 +498,10 @@ const Controls = () => {
                 suffix={<RotatingArrow />}
                 size='xs'
                 title='Query viewport'
+                disabled={queryInFlight}
                 sx={{ fontSize: 1 }}
               >
-                Query viewport average
+                {queryInFlight ? 'Querying...' : 'Query viewport average'}
               </Button>
             )}
           </Flex>

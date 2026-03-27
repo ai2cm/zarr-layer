@@ -295,7 +295,7 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
         }
 
         layer.queryData(geometry, querySelector).then((result) => {
-          console.log('queryData result', result)
+          if (cancelled) return
           setPointResult(result)
         })
       }
