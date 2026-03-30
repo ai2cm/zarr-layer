@@ -424,7 +424,7 @@ const Controls = () => {
 
       <DatasetBrowser />
 
-      <SidebarDivider sx={{ mt: -3, mb: 3 }} />
+      <SidebarDivider sx={{ my: 3 }} />
 
       <Row columns={[4, 4, 4, 4]} sx={{ alignItems: 'baseline' }}>
         <Column start={1} width={4}>
@@ -509,7 +509,7 @@ const Controls = () => {
         </Column>
       </Row>
 
-      <SidebarDivider sx={{ mb: 3 }} />
+      <SidebarDivider sx={{ my: 3 }} />
 
       <Row columns={[4, 4, 4, 4]}>
         <Column start={1} width={4}>
@@ -597,7 +597,7 @@ const Controls = () => {
         </Column>
       </Row>
 
-      <SidebarDivider sx={{ mb: 3 }} />
+      <SidebarDivider sx={{ my: 3 }} />
 
       <Box sx={headingSx}>Map</Box>
 

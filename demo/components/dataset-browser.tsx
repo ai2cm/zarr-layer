@@ -66,7 +66,7 @@ const DatasetBrowser = () => {
 
         return (
           <React.Fragment key={section.label}>
-            {i > 0 && <Divider sx={{ mt: -3, mb: 3 }} />}
+            {i > 0 && <Divider sx={{ my: 3 }} />}
             <Box sx={{ mb: 3 }}>
               <Flex sx={{ alignItems: 'center', gap: 2 }}>
                 <Box sx={sectionHeadingSx}>{section.label}</Box>
