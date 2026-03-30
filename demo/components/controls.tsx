@@ -459,7 +459,7 @@ const Controls = () => {
                   </Box>
                 )}
               </Flex>
-              <Box sx={{ fontSize: 1 }}>Click map to query</Box>
+              <Box sx={{ fontSize: 2 }}>Click map to query</Box>
             </Flex>
           </Box>
         </Column>
@@ -490,7 +490,7 @@ const Controls = () => {
               )}
             </Flex>
             {viewportQueryDisabled ? (
-              <Box sx={{ color: 'secondary', fontSize: 1 }}>
+              <Box sx={{ color: 'secondary', fontSize: 2 }}>
                 Zoom in to query
               </Box>
             ) : (
@@ -500,7 +500,7 @@ const Controls = () => {
                 size='xs'
                 title='Query viewport'
                 disabled={queryInFlight}
-                sx={{ fontSize: 1 }}
+                sx={{ fontSize: 2 }}
               >
                 {queryInFlight ? 'Querying...' : 'Query viewport average'}
               </Button>
@@ -555,7 +555,7 @@ const Controls = () => {
               onKeyDown={(e: React.KeyboardEvent) => {
                 if (e.key === 'Enter') commitClimInput(0)
               }}
-              sx={{ width: '55px', flexShrink: 0 }}
+              sx={{ width: '60px', flexShrink: 0 }}
             />
             <Box sx={{ flex: 1 }}>
               <Colorbar width='100%' colormap={themedColormap} horizontal />
@@ -571,7 +571,7 @@ const Controls = () => {
               onKeyDown={(e: React.KeyboardEvent) => {
                 if (e.key === 'Enter') commitClimInput(1)
               }}
-              sx={{ width: '55px', flexShrink: 0 }}
+              sx={{ width: '60px', flexShrink: 0 }}
             />
           </Flex>
         </Column>
