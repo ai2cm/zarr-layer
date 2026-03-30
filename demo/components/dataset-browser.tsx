@@ -84,7 +84,7 @@ const DatasetBrowser = () => {
             {infoExpanded && (
               <Box
                 sx={{
-                  fontSize: 1,
+                  fontSize: 2,
                   color: 'secondary',
                   mt: 1,
                   mb: 2,
@@ -130,8 +130,9 @@ const DatasetBrowser = () => {
                           <Box
                             sx={{
                               color: 'secondary',
-                              fontSize: 1,
-                              px: 1,
+                              fontSize: 2,
+                              fontFamily: 'body',
+                              my: 2,
                             }}
                           >
                             {config.sourceInfo}

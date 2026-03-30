@@ -680,7 +680,7 @@ const Controls = () => {
           {terrainInfo && (
             <Box
               sx={{
-                fontSize: 1,
+                fontSize: 2,
                 color: 'secondary',
                 mt: 1,
                 mb: 2,
@@ -737,7 +737,7 @@ const Controls = () => {
           {renderPolesInfo && (
             <Box
               sx={{
-                fontSize: 1,
+                fontSize: 2,
                 color: 'secondary',
                 mt: 1,
                 mb: 2,
