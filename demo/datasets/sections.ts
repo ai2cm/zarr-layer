@@ -25,7 +25,7 @@ export const SELECTOR_SECTIONS: SelectorSection[] = [
   {
     label: 'Icechunk',
     description:
-      'Datasets served from Icechunk, a transactional storage engine for Zarr that supports virtual datasets via VirtualiZarr. Uses @carbonplan/icechunk-js reader.',
+      'Datasets served from Icechunk, a transactional storage engine for Zarr that supports virtual datasets via VirtualiZarr. Uses icechunk-js reader.',
     datasetIds: ['icechunk_prec'],
   },
   {

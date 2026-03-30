@@ -1,4 +1,4 @@
-import { IcechunkStore } from '@carbonplan/icechunk-js'
+import { IcechunkStore } from 'icechunk-js'
 import type { Dataset, LayerProps } from './types'
 
 const ICECHUNK_URL =
@@ -12,6 +12,7 @@ const icechunkPrecip: Dataset<Record<string, never>> = {
   variable: 'IMERG_PRECTOT',
   clim: [0, 10],
   colormap: 'cool',
+  bounds: [-180, -90, 180, 90],
   zarrVersion: 3,
   info: 'Virtualized NetCDF of IMERG Precipitation (EPSG:4326)',
   sourceInfo:
@@ -28,7 +29,7 @@ const icechunkPrecip: Dataset<Record<string, never>> = {
   defaultState: {},
   Controls: () => null,
   buildLayerProps: (): LayerProps => ({
-    selector: { time: { selected: 0, type: 'index' } },
+    selector: {},
   }),
 }
 
