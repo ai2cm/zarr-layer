@@ -23,4 +23,5 @@ declare module '@carbonplan/icons' {
 declare module '@carbonplan/layouts' {
   import { FC } from 'react'
   export const Sidebar: FC<any>
+  export const SidebarDivider: FC<any>
 }

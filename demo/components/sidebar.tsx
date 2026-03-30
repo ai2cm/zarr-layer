@@ -1,6 +1,6 @@
 import { useRef, useEffect } from 'react'
-import { Box, Divider } from 'theme-ui'
-import { Sidebar } from '@carbonplan/layouts'
+import { Box } from 'theme-ui'
+import { Sidebar, SidebarDivider } from '@carbonplan/layouts'
 import { Link } from '@carbonplan/components'
 import Controls from './controls'
 import { useAppStore } from '../lib/store'
@@ -29,7 +29,7 @@ const SidebarContent = () => (
       </Link>
       .
     </Box>
-    <Divider sx={{ my: 3 }} />
+    <SidebarDivider sx={{ my: 3 }} />
     <Controls />
   </>
 )

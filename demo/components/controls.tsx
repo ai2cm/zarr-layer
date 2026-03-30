@@ -12,7 +12,8 @@ import {
 } from '@carbonplan/components'
 import { useThemedColormap } from '@carbonplan/colormaps'
 import { Info, RotatingArrow } from '@carbonplan/icons'
-import { Box, Divider, Flex, IconButton } from 'theme-ui'
+import { Box, Flex, IconButton } from 'theme-ui'
+import { SidebarDivider } from '@carbonplan/layouts'
 import { useAppStore } from '../lib/store'
 import { subheadingSx } from './shared-controls'
 import DatasetBrowser from './dataset-browser'
@@ -423,7 +424,7 @@ const Controls = () => {
 
       <DatasetBrowser />
 
-      <Divider sx={{ mt: 4, mb: 3 }} />
+      <SidebarDivider sx={{ mt: 4, mb: 3 }} />
 
       <Row columns={[4, 4, 4, 4]} sx={{ alignItems: 'baseline' }}>
         <Column start={1} width={4}>
@@ -508,7 +509,7 @@ const Controls = () => {
         </Column>
       </Row>
 
-      <Divider sx={{ mt: 4, mb: 3 }} />
+      <SidebarDivider sx={{ mt: 4, mb: 3 }} />
 
       <Row columns={[4, 4, 4, 4]}>
         <Column start={1} width={4}>
@@ -596,7 +597,7 @@ const Controls = () => {
         </Column>
       </Row>
 
-      <Divider sx={{ mt: 4, mb: 3 }} />
+      <SidebarDivider sx={{ mt: 4, mb: 3 }} />
 
       <Box sx={headingSx}>Map</Box>
 
