@@ -161,7 +161,7 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
   const prevDatasetIdRef = useRef<string | null>(null)
   const datasetId = useAppStore((state) => state.datasetId)
   const datasetModule = useAppStore((state) => state.getDatasetModule())
-  const datasetState = useAppStore((state) => state.getDatasetState())
+  const datasetState = useAppStore((state) => state.datasetState)
   const opacity = useAppStore((state) => state.opacity)
   const clim = useAppStore((state) => state.clim)
   const colormap = useAppStore((state) => state.colormap)
@@ -219,7 +219,7 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
 
     const createLayer = async () => {
       const currentLayerConfig = datasetModule.buildLayerProps(
-        useAppStore.getState().getDatasetState()
+        useAppStore.getState().datasetState
       )
       const options: ZarrLayerOptions = {
         id: 'zarr-layer',
@@ -251,7 +251,7 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
       options.colormap = makeColormap(latestState.colormap, { format: 'hex' })
 
       const latestConfig = datasetModule.buildLayerProps(
-        latestState.getDatasetState()
+        latestState.datasetState
       )
       options.selector = latestConfig.selector
       if (latestConfig.customFrag) {
@@ -281,7 +281,7 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
           currentBand: latestBand,
         } = latestRangeStateRef.current
         const latestSelector = datasetModule.buildLayerProps(
-          useAppStore.getState().getDatasetState()
+          useAppStore.getState().datasetState
         ).selector
 
         let querySelector = latestSelector

@@ -224,7 +224,7 @@ const getRegionMean = (
 const Controls = () => {
   const datasetId = useAppStore((state) => state.datasetId)
   const datasetModule = useAppStore((state) => state.getDatasetModule())
-  const datasetState = useAppStore((state) => state.getDatasetState())
+  const datasetState = useAppStore((state) => state.datasetState)
   const opacity = useAppStore((state) => state.opacity)
   const clim = useAppStore((state) => state.clim)
   const colormap = useAppStore((state) => state.colormap)

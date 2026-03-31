@@ -42,7 +42,7 @@ const DatasetBrowser = () => {
   const datasetId = useAppStore((state) => state.datasetId)
   const setDatasetId = useAppStore((state) => state.setDatasetId)
   const datasetModule = useAppStore((state) => state.getDatasetModule())
-  const datasetState = useAppStore((state) => state.getDatasetState())
+  const datasetState = useAppStore((state) => state.datasetState)
   const setActiveDatasetState = useAppStore(
     (state) => state.setActiveDatasetState
   )
