@@ -14,7 +14,7 @@ import type {
   RendererUniforms,
 } from './renderer-types'
 import type { ZarrRenderer } from './zarr-renderer'
-import type { QueryGeometry, QueryResult } from './query/types'
+import type { QueryGeometry, QueryOptions, QueryResult } from './query/types'
 
 export interface RenderContext {
   gl: WebGL2RenderingContext
@@ -93,5 +93,9 @@ export interface ZarrMode {
   getTiledState?(): TiledRenderState | null
 
   // Query methods (optional)
-  queryData?(geometry: QueryGeometry, selector?: Selector): Promise<QueryResult>
+  queryData?(
+    geometry: QueryGeometry,
+    selector?: Selector,
+    options?: QueryOptions
+  ): Promise<QueryResult>
 }

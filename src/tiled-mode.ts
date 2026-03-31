@@ -4,7 +4,7 @@ import type {
   TileId,
   TiledRenderState,
 } from './zarr-mode'
-import type { QueryGeometry, QueryResult } from './query/types'
+import type { QueryGeometry, QueryOptions, QueryResult } from './query/types'
 import { queryRegionTiled } from './query/region-query'
 import type {
   LoadingStateCallback,
@@ -561,7 +561,8 @@ export class TiledMode implements ZarrMode {
    */
   async queryData(
     geometry: QueryGeometry,
-    selector?: Selector
+    selector?: Selector,
+    options?: QueryOptions
   ): Promise<QueryResult> {
     if (!this.tileCache || !this.xyLimits) {
       return {
@@ -588,7 +589,8 @@ export class TiledMode implements ZarrMode {
         scaleFactor: desc.scaleFactor,
         addOffset: desc.addOffset,
         fillValue: desc.fill_value,
-      }
+      },
+      options
     )
   }
 }

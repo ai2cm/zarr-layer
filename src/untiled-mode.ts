@@ -21,7 +21,7 @@ import type {
   TileId,
   RegionRenderState,
 } from './zarr-mode'
-import type { QueryGeometry, QueryResult } from './query/types'
+import type { QueryGeometry, QueryOptions, QueryResult } from './query/types'
 import type {
   LoadingStateCallback,
   MapLike,
@@ -52,11 +52,8 @@ import {
 import type { ZarrRenderer, ShaderProgram } from './zarr-renderer'
 import type { CustomShaderConfig } from './renderer-types'
 import { renderMapboxTile } from './mapbox-tile-renderer'
-import { queryRegionSingleImage } from './query/region-query'
-import {
-  mercatorBoundsToPixel,
-  computePixelBoundsFromGeometry,
-} from './query/query-utils'
+import { queryRegionUntiled } from './query/region-query'
+import { computePixelBoundsFromGeometry } from './query/query-utils'
 import {
   createTransformer,
   createTransformerTo4326,
@@ -65,7 +62,6 @@ import {
   sampleEdgesToMercatorBounds,
 } from './projection-utils'
 import { createHybridMesh } from './mesh-reprojector'
-import { setObjectValues } from './query/selector-utils'
 import { geoToArrayIndex } from './map-utils'
 import {
   type ThrottleState,
@@ -1202,16 +1198,13 @@ export class UntiledMode implements ZarrMode {
       includeSpatialSlices: boolean
       /** If true, track multi-value dimensions for channel packing */
       trackMultiValue: boolean
-      /** Spatial bounds for fetch - point for single pixel, bbox for region subset */
-      spatialBounds?:
-        | { type: 'point'; x: number; y: number }
-        | {
-            type: 'bbox'
-            minX: number
-            maxX: number
-            minY: number
-            maxY: number
-          }
+      /** Spatial bounds for fetch - bbox for region subset */
+      spatialBounds?: {
+        minX: number
+        maxX: number
+        minY: number
+        maxY: number
+      }
     }
   ): Promise<{
     sliceArgs: (number | zarr.Slice)[]
@@ -1244,9 +1237,7 @@ export class UntiledMode implements ZarrMode {
       const dimType = this.classifyDimension(dimName)
 
       if (dimType === 'lon') {
-        if (options.spatialBounds?.type === 'point') {
-          sliceArgs[dimInfo.index] = options.spatialBounds.x
-        } else if (options.spatialBounds?.type === 'bbox') {
+        if (options.spatialBounds) {
           sliceArgs[dimInfo.index] = zarr.slice(
             options.spatialBounds.minX,
             options.spatialBounds.maxX
@@ -1257,9 +1248,7 @@ export class UntiledMode implements ZarrMode {
             : 0
         }
       } else if (dimType === 'lat') {
-        if (options.spatialBounds?.type === 'point') {
-          sliceArgs[dimInfo.index] = options.spatialBounds.y
-        } else if (options.spatialBounds?.type === 'bbox') {
+        if (options.spatialBounds) {
           sliceArgs[dimInfo.index] = zarr.slice(
             options.spatialBounds.minY,
             options.spatialBounds.maxY
@@ -2475,13 +2464,15 @@ export class UntiledMode implements ZarrMode {
    */
   private async fetchQueryData(
     selector: NormalizedSelector,
-    spatialQuery:
-      | { type: 'point'; x: number; y: number }
-      | { type: 'bbox'; minX: number; maxX: number; minY: number; maxY: number }
+    spatialQuery: {
+      minX: number
+      maxX: number
+      minY: number
+      maxY: number
+    },
+    signal?: AbortSignal
   ): Promise<{
-    type: 'point' | 'bbox'
-    values: number[] // For point queries
-    data: Float32Array // For bbox queries
+    data: Float32Array
     width: number
     height: number
     channels: number
@@ -2493,7 +2484,7 @@ export class UntiledMode implements ZarrMode {
     try {
       const { sliceArgs: baseSliceArgs, multiValueDims } =
         await this.buildSliceArgsForSelector(selector, {
-          includeSpatialSlices: spatialQuery.type !== 'bbox',
+          includeSpatialSlices: false,
           trackMultiValue: true,
           spatialBounds: spatialQuery,
         })
@@ -2504,52 +2495,20 @@ export class UntiledMode implements ZarrMode {
       } = this.buildChannelCombinations(multiValueDims)
       const numChannels = channelCombinations.length || 1
       const multiValueDimNames = multiValueDims.map((d) => d.dimName)
+      const getOpts = signal ? { opts: { signal } } : undefined
 
-      // Point query: fetch individual values
-      if (spatialQuery.type === 'point') {
-        const values: number[] = []
-
-        if (numChannels === 1) {
-          const result = await zarr.get(this.zarrArray, baseSliceArgs)
-          const value = this.extractScalarValue(result)
-          if (value === null) return null
-          values.push(value)
-        } else {
-          for (let c = 0; c < numChannels; c++) {
-            const sliceArgs = [...baseSliceArgs]
-            const combo = channelCombinations[c]
-            for (let i = 0; i < multiValueDims.length; i++) {
-              sliceArgs[multiValueDims[i].dimIndex] = combo[i]
-            }
-            const result = await zarr.get(this.zarrArray, sliceArgs)
-            const value = this.extractScalarValue(result)
-            if (value !== null) values.push(value)
-          }
-        }
-
-        return {
-          type: 'point',
-          values,
-          data: new Float32Array(0),
-          width: 1,
-          height: 1,
-          channels: numChannels,
-          channelLabels: channelLabelCombinations,
-          multiValueDimNames,
-        }
-      }
-
-      // Bbox query: fetch region data
       const fetchWidth = spatialQuery.maxX - spatialQuery.minX
       const fetchHeight = spatialQuery.maxY - spatialQuery.minY
 
       if (numChannels === 1) {
-        const result = (await zarr.get(this.zarrArray, baseSliceArgs)) as {
+        const result = (await zarr.get(
+          this.zarrArray,
+          baseSliceArgs,
+          getOpts
+        )) as {
           data: ArrayLike<number>
         }
         return {
-          type: 'bbox',
-          values: [],
           data: new Float32Array(result.data),
           width: fetchWidth,
           height: fetchHeight,
@@ -2569,7 +2528,11 @@ export class UntiledMode implements ZarrMode {
           sliceArgs[multiValueDims[i].dimIndex] = combo[i]
         }
 
-        const bandData = (await zarr.get(this.zarrArray, sliceArgs)) as {
+        const bandData = (await zarr.get(
+          this.zarrArray,
+          sliceArgs,
+          getOpts
+        )) as {
           data: ArrayLike<number>
         }
         for (let pixIdx = 0; pixIdx < fetchWidth * fetchHeight; pixIdx++) {
@@ -2578,8 +2541,6 @@ export class UntiledMode implements ZarrMode {
       }
 
       return {
-        type: 'bbox',
-        values: [],
         data: packedData,
         width: fetchWidth,
         height: fetchHeight,
@@ -2588,25 +2549,10 @@ export class UntiledMode implements ZarrMode {
         multiValueDimNames,
       }
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err
       console.error('Error fetching query data:', err)
       return null
     }
-  }
-
-  /**
-   * Extract a scalar value from zarr.get result (handles various return formats).
-   */
-  private extractScalarValue(result: unknown): number | null {
-    if (result && typeof result === 'object' && 'data' in result) {
-      const data = (result as { data: ArrayLike<number> }).data
-      return data[0] ?? (data as unknown as number)
-    } else if (typeof result === 'number') {
-      return result
-    } else if (ArrayBuffer.isView(result)) {
-      return (result as Float32Array)[0]
-    }
-    console.warn('Unexpected zarr.get result format:', result)
-    return null
   }
 
   /**
@@ -2614,7 +2560,8 @@ export class UntiledMode implements ZarrMode {
    */
   async queryData(
     geometry: QueryGeometry,
-    selector?: Selector
+    selector?: Selector,
+    options?: QueryOptions
   ): Promise<QueryResult> {
     if (!this.mercatorBounds) {
       return {
@@ -2635,137 +2582,6 @@ export class UntiledMode implements ZarrMode {
     const addOffset = currentLevel?.addOffset ?? desc.addOffset
     const fill_value = currentLevel?.fillValue ?? desc.fill_value
 
-    // Point geometries: use optimized single-chunk fetch
-    if (geometry.type === 'Point') {
-      const [lon, lat] = geometry.coordinates
-      const coords = { lat: [lat], lon: [lon] }
-
-      const sourceBounds = this.xyLimits
-        ? ([
-            this.xyLimits.xMin,
-            this.xyLimits.yMin,
-            this.xyLimits.xMax,
-            this.xyLimits.yMax,
-          ] as [number, number, number, number])
-        : null
-      const pixel = mercatorBoundsToPixel(
-        lon,
-        lat,
-        this.mercatorBounds,
-        this.width,
-        this.height,
-        this.crs ?? 'EPSG:4326',
-        this.latIsAscending,
-        this.proj4def,
-        sourceBounds,
-        this.cachedWGS84Transformer ?? undefined
-      )
-
-      if (!pixel) {
-        return {
-          [this.variable]: [],
-          dimensions: ['lat', 'lon'],
-          coordinates: coords,
-        }
-      }
-
-      // Fetch only the chunk(s) containing this point
-      const pointData = await this.fetchQueryData(normalizedSelector, {
-        type: 'point',
-        x: pixel.x,
-        y: pixel.y,
-      })
-
-      if (!pointData) {
-        return {
-          [this.variable]: [],
-          dimensions: ['lat', 'lon'],
-          coordinates: coords,
-        }
-      }
-
-      const { values: rawValues, channelLabels, multiValueDimNames } = pointData
-      const valuesNested = multiValueDimNames.length > 0
-      let values: number[] | Record<string | number, any> = valuesNested
-        ? {}
-        : []
-
-      for (let c = 0; c < rawValues.length; c++) {
-        let value = rawValues[c]
-
-        // Filter invalid values
-        if (value === undefined || value === null || !Number.isFinite(value)) {
-          continue
-        }
-        if (fill_value !== null && value === fill_value) {
-          continue
-        }
-
-        // Apply transforms
-        if (scaleFactor !== 1) value *= scaleFactor
-        if (addOffset !== 0) value += addOffset
-
-        if (valuesNested) {
-          const labels = channelLabels?.[c]
-          if (
-            labels &&
-            multiValueDimNames.length > 0 &&
-            labels.length === multiValueDimNames.length
-          ) {
-            values = setObjectValues(values as any, labels, value) as any
-          } else if (Array.isArray(values)) {
-            values.push(value)
-          }
-        } else if (Array.isArray(values)) {
-          values.push(value)
-        }
-      }
-
-      const dimensions = desc.dimensions
-      const mappedDimensions = dimensions.map((d) => {
-        const dimLower = d.toLowerCase()
-        if (['x', 'lon', 'longitude'].includes(dimLower)) return 'lon'
-        if (['y', 'lat', 'latitude'].includes(dimLower)) return 'lat'
-        return d
-      })
-
-      const outputDimensions = valuesNested ? mappedDimensions : ['lat', 'lon']
-      const resultCoordinates: {
-        lat: number[]
-        lon: number[]
-        [key: string]: (number | string)[]
-      } = {
-        lat: coords.lat,
-        lon: coords.lon,
-      }
-
-      if (valuesNested) {
-        for (const dim of dimensions) {
-          const dimLower = dim.toLowerCase()
-          if (
-            ['x', 'lon', 'longitude', 'y', 'lat', 'latitude'].includes(dimLower)
-          ) {
-            continue
-          }
-          const selSpec = normalizedSelector[dim]
-          if (selSpec && 'selected' in selSpec) {
-            const selected = selSpec.selected
-            const vals = Array.isArray(selected) ? selected : [selected]
-            resultCoordinates[dim] = vals as (number | string)[]
-          } else if (desc.coordinates[dim]) {
-            resultCoordinates[dim] = desc.coordinates[dim]
-          }
-        }
-      }
-
-      return {
-        [this.variable]: values as any,
-        dimensions: outputDimensions,
-        coordinates: resultCoordinates,
-      }
-    }
-
-    // Region queries: calculate pixel bounds and fetch only that subset
     const sourceBounds: [number, number, number, number] | null = this.xyLimits
       ? [
           this.xyLimits.xMin,
@@ -2794,10 +2610,11 @@ export class UntiledMode implements ZarrMode {
       }
     }
 
-    const fetched = await this.fetchQueryData(normalizedSelector, {
-      type: 'bbox',
-      ...pixelBounds,
-    })
+    const fetched = await this.fetchQueryData(
+      normalizedSelector,
+      pixelBounds,
+      options?.signal
+    )
     if (!fetched) {
       return {
         [this.variable]: [],
@@ -2866,7 +2683,7 @@ export class UntiledMode implements ZarrMode {
       ]
     }
 
-    return queryRegionSingleImage(
+    return queryRegionUntiled(
       this.variable,
       geometry,
       normalizedSelector,
@@ -2887,7 +2704,8 @@ export class UntiledMode implements ZarrMode {
         fillValue: fill_value,
       },
       this.proj4def,
-      subsetSourceBounds
+      subsetSourceBounds,
+      options
     )
   }
 }
