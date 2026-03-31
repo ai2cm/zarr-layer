@@ -34,6 +34,7 @@ export interface RenderableRegion {
   // Data orientation: true = row 0 is south (latitude ascending)
   // Resolved by ZarrStore during init
   latIsAscending: boolean
+  lon360Wrap: boolean
 
   // Main texture (pre-uploaded)
   texture: WebGLTexture
@@ -128,6 +129,11 @@ export function renderRegion(
   }
   if (useFragmentReproject && shaderProgram.latIsAscendingLoc !== null) {
     gl.uniform1i(shaderProgram.latIsAscendingLoc, region.latIsAscending ? 1 : 0)
+  }
+
+  // Set longitude wrapping uniform
+  if (shaderProgram.lon360WrapLoc !== null) {
+    gl.uniform1i(shaderProgram.lon360WrapLoc, region.lon360Wrap ? 1 : 0)
   }
 
   // Bind geometry

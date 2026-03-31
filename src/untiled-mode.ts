@@ -116,6 +116,7 @@ interface RegionState {
   wgs84Bounds: Wgs84Bounds | null
   // Data orientation: true = row 0 is south
   latIsAscending: boolean
+  lon360Wrap: boolean
   // Version tracking for selector changes
   selectorVersion: number
   // Multi-band support
@@ -180,6 +181,7 @@ export class UntiledMode implements ZarrMode {
   private crs: CRS = 'EPSG:4326'
   private zarrArray: zarr.Array<zarr.DataType> | null = null
   private latIsAscending: boolean = true
+  private lon360Wrap: boolean = false
 
   // Multi-level support
   private levels: UntiledLevel[] = []
@@ -274,6 +276,7 @@ export class UntiledMode implements ZarrMode {
       this.crs = desc.crs
       this.xyLimits = desc.xyLimits
       this.latIsAscending = desc.latIsAscending
+      this.lon360Wrap = desc.lon360Wrap ?? false
       this.proj4def = desc.proj4 ?? null
 
       // Cache transformers once for reuse (major performance optimization)
@@ -326,9 +329,17 @@ export class UntiledMode implements ZarrMode {
         // For proj4, compute mercator bounds by transforming corners
         if (this.proj4def) {
           this.mercatorBounds = this.computeMercatorBoundsFromProjection()
+        } else if (this.lon360Wrap) {
+          // For 0-360 data, compute mercator bounds as [-180, 180]
+          // since getRegionBounds shifts longitudes to this range
+          this.mercatorBounds = boundsToMercatorNorm(
+            { xMin: -180, xMax: 180, yMin: this.xyLimits.yMin, yMax: this.xyLimits.yMax },
+            this.crs
+          )
         } else {
           this.mercatorBounds = boundsToMercatorNorm(this.xyLimits, this.crs)
         }
+        console.log('[untiled] init:', { xyLimits: this.xyLimits, mercatorBounds: this.mercatorBounds, lon360Wrap: this.lon360Wrap, width: this.width, height: this.height, regionSize: this.regionSize })
       } else {
         console.warn('UntiledMode: No XY limits found')
       }
@@ -602,8 +613,21 @@ export class UntiledMode implements ZarrMode {
     }
 
     // Standard case: viewport bounds are in same CRS as xyLimits
-    const xMinIdx = geoToArrayIndex(west, xMin, xMax, this.width)
-    const xMaxIdx = geoToArrayIndex(east, xMin, xMax, this.width)
+    // For 0-360 data: convert viewport bounds (-180/180) to 0-360 range
+    let viewWest = west
+    let viewEast = east
+    if (this.lon360Wrap) {
+      if (viewWest < 0) viewWest += 360
+      if (viewEast < 0) viewEast += 360
+      // If viewport spans the antimeridian (wraps around),
+      // show all longitude regions
+      if (viewWest > viewEast) {
+        viewWest = xMin
+        viewEast = xMax
+      }
+    }
+    const xMinIdx = geoToArrayIndex(viewWest, xMin, xMax, this.width)
+    const xMaxIdx = geoToArrayIndex(viewEast, xMin, xMax, this.width)
 
     // For Y axis, geoToArrayIndex assumes yMin maps to row 0.
     // But if latIsAscending=false (row 0 = north = yMax), we need to invert.
@@ -686,6 +710,7 @@ export class UntiledMode implements ZarrMode {
       mercatorBounds: null,
       wgs84Bounds: null,
       latIsAscending: this.latIsAscending,
+      lon360Wrap: this.lon360Wrap,
       selectorVersion: this.selectorVersion,
       bandData: new Map(),
       bandTextures: new Map(),
@@ -999,7 +1024,34 @@ export class UntiledMode implements ZarrMode {
       geoYMax = yMin + (pxYEnd / height) * (yMax - yMin)
     }
 
-    return { xMin: geoXMin, xMax: geoXMax, yMin: geoYMin, yMax: geoYMax }
+    // For 0-360 longitude data: shift geo longitudes > 180 to negative.
+    // This positions each region correctly on a -180/180 map.
+    let finalXMin = geoXMin
+    let finalXMax = geoXMax
+    if (this.lon360Wrap) {
+      if (finalXMin > 180) finalXMin -= 360
+      if (finalXMax > 180) finalXMax -= 360
+      // Handle the region that straddles the 180/-180 boundary:
+      // its geoXMin is < 180 but geoXMax is > 180 (after shift, geoXMax < geoXMin).
+      // This region wraps around the antimeridian.
+      // For now, clamp it — this causes a small gap at the antimeridian
+      // but avoids rendering artifacts.
+      if (finalXMin > finalXMax) {
+        // This region straddles the antimeridian.
+        // Render it on the side that has more of the region.
+        const wrapPoint = 180
+        const leftPortion = wrapPoint - geoXMin
+        const rightPortion = geoXMax - wrapPoint
+        if (leftPortion >= rightPortion) {
+          finalXMax = 180
+        } else {
+          finalXMin = -180
+          finalXMax = geoXMax - 360
+        }
+      }
+    }
+
+    return { xMin: finalXMin, xMax: finalXMax, yMin: geoYMin, yMax: geoYMax }
   }
 
   /**
@@ -2093,6 +2145,7 @@ export class UntiledMode implements ZarrMode {
       useIndexedMesh: region.useIndexedMesh,
       wgs84Bounds: region.wgs84Bounds ?? undefined,
       latIsAscending: region.latIsAscending,
+      lon360Wrap: region.lon360Wrap,
       texture: region.texture!,
       bandData: region.bandData,
       bandTextures: region.bandTextures,

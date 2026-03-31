@@ -278,6 +278,7 @@ uniform vec2 u_texOffset;
 uniform int u_reproject;      // 0 = no reprojection, 1 = Mercator inversion
 uniform vec2 u_latBounds;     // (latMin, latMax) in degrees
 uniform int u_latIsAscending; // 1 = row 0 is south, 0 = row 0 is north
+uniform int u_lon360Wrap;     // reserved for future use
 
 uniform sampler2D tex;
 uniform sampler2D cmap;
@@ -390,6 +391,7 @@ uniform vec2 u_texOffset;
 uniform int u_reproject;      // 0 = no reprojection, 1 = Mercator inversion
 uniform vec2 u_latBounds;     // (latMin, latMax) in degrees
 uniform int u_latIsAscending; // 1 = row 0 is south, 0 = row 0 is north
+uniform int u_lon360Wrap;     // reserved for future use
 
 uniform sampler2D colormap;
 
