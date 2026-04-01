@@ -117,6 +117,7 @@ interface RegionState {
   wgs84Bounds: Wgs84Bounds | null
   // Data orientation: true = row 0 is south
   latIsAscending: boolean
+  lon360Wrap: boolean
   // Version tracking for selector changes
   selectorVersion: number
   // Multi-band support
@@ -180,6 +181,7 @@ export class UntiledMode implements ZarrMode {
   private crs: CRS = 'EPSG:4326'
   private zarrArray: zarr.Array<zarr.DataType> | null = null
   private latIsAscending: boolean = true
+  private lon360Wrap: boolean = false
 
   // Multi-level support
   private levels: UntiledLevel[] = []
@@ -278,6 +280,7 @@ export class UntiledMode implements ZarrMode {
       this.crs = desc.crs
       this.xyLimits = desc.xyLimits
       this.latIsAscending = desc.latIsAscending
+      this.lon360Wrap = desc.lon360Wrap ?? false
       this.proj4def = desc.proj4 ?? null
 
       // Cache transformers once for reuse (major performance optimization)
@@ -330,9 +333,29 @@ export class UntiledMode implements ZarrMode {
         // For proj4, compute mercator bounds by transforming corners
         if (this.proj4def) {
           this.mercatorBounds = this.computeMercatorBoundsFromProjection()
+        } else if (this.lon360Wrap) {
+          // For 0-360 data, compute mercator bounds as [-180, 180]
+          // since getRegionBounds shifts longitudes to this range
+          this.mercatorBounds = boundsToMercatorNorm(
+            {
+              xMin: -180,
+              xMax: 180,
+              yMin: this.xyLimits.yMin,
+              yMax: this.xyLimits.yMax,
+            },
+            this.crs
+          )
         } else {
           this.mercatorBounds = boundsToMercatorNorm(this.xyLimits, this.crs)
         }
+        console.log('[untiled] init:', {
+          xyLimits: this.xyLimits,
+          mercatorBounds: this.mercatorBounds,
+          lon360Wrap: this.lon360Wrap,
+          width: this.width,
+          height: this.height,
+          regionSize: this.regionSize,
+        })
       } else {
         console.warn('UntiledMode: No XY limits found')
       }
@@ -606,8 +629,21 @@ export class UntiledMode implements ZarrMode {
     }
 
     // Standard case: viewport bounds are in same CRS as xyLimits
-    const xMinIdx = geoToArrayIndex(west, xMin, xMax, this.width)
-    const xMaxIdx = geoToArrayIndex(east, xMin, xMax, this.width)
+    // For 0-360 data: convert viewport bounds (-180/180) to 0-360 range
+    let viewWest = west
+    let viewEast = east
+    if (this.lon360Wrap) {
+      if (viewWest < 0) viewWest += 360
+      if (viewEast < 0) viewEast += 360
+      // If viewport spans the antimeridian (wraps around),
+      // show all longitude regions
+      if (viewWest > viewEast) {
+        viewWest = xMin
+        viewEast = xMax
+      }
+    }
+    const xMinIdx = geoToArrayIndex(viewWest, xMin, xMax, this.width)
+    const xMaxIdx = geoToArrayIndex(viewEast, xMin, xMax, this.width)
 
     // For Y axis, geoToArrayIndex assumes yMin maps to row 0.
     // But if latIsAscending=false (row 0 = north = yMax), we need to invert.
@@ -690,6 +726,9 @@ export class UntiledMode implements ZarrMode {
       mercatorBounds: null,
       wgs84Bounds: null,
       latIsAscending: this.latIsAscending,
+      // Only apply shader texture wrap for single-region-covers-full-globe case.
+      // For multi-region (chunked) 0-360 data, getRegionBounds handles the shift.
+      lon360Wrap: false,
       selectorVersion: this.selectorVersion,
       bandData: new Map(),
       bandTextures: new Map(),
@@ -1003,7 +1042,34 @@ export class UntiledMode implements ZarrMode {
       geoYMax = yMin + (pxYEnd / height) * (yMax - yMin)
     }
 
-    return { xMin: geoXMin, xMax: geoXMax, yMin: geoYMin, yMax: geoYMax }
+    // For 0-360 longitude data: convert bounds to -180/180 range.
+    let finalXMin = geoXMin
+    let finalXMax = geoXMax
+    if (this.lon360Wrap) {
+      const span = geoXMax - geoXMin
+      // Check if this region covers the full 360° (or nearly so)
+      if (Math.abs(span - 360) < 1) {
+        // Full globe: map to [-180, 180]
+        finalXMin = -180
+        finalXMax = 180
+      } else if (finalXMin > 180) {
+        // Entirely in the 180-360 range: shift to -180–0
+        finalXMin -= 360
+        finalXMax -= 360
+      } else if (finalXMax > 180) {
+        // Straddles 180°: clamp to the larger side
+        const leftPortion = 180 - geoXMin
+        const rightPortion = geoXMax - 180
+        if (leftPortion >= rightPortion) {
+          finalXMax = 180
+        } else {
+          finalXMin = -180
+          finalXMax = geoXMax - 360
+        }
+      }
+    }
+
+    return { xMin: finalXMin, xMax: finalXMax, yMin: geoYMin, yMax: geoYMax }
   }
 
   /**
@@ -1037,6 +1103,14 @@ export class UntiledMode implements ZarrMode {
       regionY,
       region.levelMeta ?? undefined
     )
+
+    // For 0-360 data: only apply shader texture wrap when this region
+    // covers the full globe (bounds are [-180, 180]). For sub-regions,
+    // getRegionBounds already shifted the geometry position.
+    if (this.lon360Wrap) {
+      const lonSpan = geoBounds.xMax - geoBounds.xMin
+      region.lon360Wrap = Math.abs(lonSpan - 360) < 1
+    }
 
     // Use cached mercatorBounds if set (from fetchRegion's resampling path),
     // otherwise compute from geoBounds (for non-resampling cases like EPSG:3857)
@@ -1855,9 +1929,22 @@ export class UntiledMode implements ZarrMode {
       ) {
         const detectedRegionSize = this.getRegionSize(this.zarrArray)
         this.regionSize = detectedRegionSize ?? [this.height, this.width]
+        console.log(
+          '[untiled] single-level regionSize set:',
+          this.regionSize,
+          'detected:',
+          detectedRegionSize
+        )
 
         // Build base slice args and let updateVisibleRegions handle loading
         this.buildBaseSliceArgs().then(() => {
+          const visible = this.getVisibleRegions(map)
+          console.log(
+            '[untiled] visible regions:',
+            visible,
+            'xyLimits:',
+            this.xyLimits
+          )
           this.updateVisibleRegions(map, gl)
         })
         return
@@ -2149,6 +2236,7 @@ export class UntiledMode implements ZarrMode {
       useIndexedMesh: region.useIndexedMesh,
       wgs84Bounds: region.wgs84Bounds ?? undefined,
       latIsAscending: region.latIsAscending,
+      lon360Wrap: region.lon360Wrap,
       texture: region.texture!,
       bandData: region.bandData,
       bandTextures: region.bandTextures,
@@ -2296,6 +2384,7 @@ export class UntiledMode implements ZarrMode {
       useIndexedMesh: region.useIndexedMesh,
       wgs84Bounds: region.wgs84Bounds ?? undefined,
       latIsAscending: region.latIsAscending,
+      lon360Wrap: region.lon360Wrap,
     }))
   }
 

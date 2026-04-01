@@ -57,6 +57,8 @@ export interface RegionRenderState {
   channels: number
   /** Data orientation: true = row 0 is south */
   latIsAscending: boolean
+  /** True when data uses 0-360 longitude convention */
+  lon360Wrap: boolean
   /** Band textures for multi-band custom shaders */
   bandData?: Map<string, Float32Array>
   bandTextures?: Map<string, WebGLTexture>

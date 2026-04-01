@@ -261,6 +261,7 @@ function renderRegionsToTile(
       // Include wgs84Bounds for both proj4 and EPSG:4326 datasets
       wgs84Bounds: region.wgs84Bounds,
       latIsAscending: region.latIsAscending,
+      lon360Wrap: region.lon360Wrap,
     }
 
     const rendered = renderRegion(

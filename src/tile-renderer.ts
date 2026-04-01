@@ -69,6 +69,7 @@ function tileToRenderable(
     ensureBandTexture: (bandName) =>
       tileCache.ensureBandTexture(renderTileKey, bandName),
     latIsAscending,
+    lon360Wrap: false,
   }
 }
 

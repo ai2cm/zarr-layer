@@ -34,6 +34,7 @@ export interface RenderableRegion {
   // Data orientation: true = row 0 is south (latitude ascending)
   // Resolved by ZarrStore during init
   latIsAscending: boolean
+  lon360Wrap: boolean
 
   // Render-time mode fields (computed in regionToRenderable, not cached on RegionState)
   // Defaults when unset: positionSpace = wgs84Bounds ? 'wgs84' : 'mercator'
@@ -142,6 +143,11 @@ export function renderRegion(
   }
   if (needsLatLookup && shaderProgram.latIsAscendingLoc !== null) {
     gl.uniform1i(shaderProgram.latIsAscendingLoc, region.latIsAscending ? 1 : 0)
+  }
+
+  // Set longitude wrapping uniform
+  if (shaderProgram.lon360WrapLoc !== null) {
+    gl.uniform1i(shaderProgram.lon360WrapLoc, region.lon360Wrap ? 1 : 0)
   }
 
   // Bind geometry

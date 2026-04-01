@@ -305,6 +305,7 @@ interface StoreDescription {
   addOffset: number
   coordinates: Record<string, (string | number)[]>
   latIsAscending: boolean
+  lon360Wrap: boolean
   proj4: string | null
 }
 
@@ -359,6 +360,7 @@ export class ZarrStore {
   addOffset: number = 0
   coordinates: Record<string, (string | number)[]> = {}
   latIsAscending: boolean = true // Default: row 0 = south; overridden by detection
+  lon360Wrap: boolean = false // True when data uses 0-360 longitude convention
   private _latIsAscendingUserSet: boolean = false
   proj4: string | null = null
   private _crsFromMetadata: boolean = false // Track if CRS was explicitly set from metadata
@@ -536,6 +538,7 @@ export class ZarrStore {
       addOffset: this.addOffset,
       coordinates: this.coordinates,
       latIsAscending: this.latIsAscending,
+      lon360Wrap: this.lon360Wrap,
       proj4: this.proj4,
     }
   }
@@ -1182,17 +1185,23 @@ export class ZarrStore {
       const yMax = coordYMax + (Number.isFinite(dy) ? dy / 2 : 0)
 
       // Normalize 0–360° longitude convention to -180–180°.
-      // Only applies when both bounds are > 180 (clearly 0–360° data, not
-      // projected meters) and within the degree range (xMax <= 360).
-      if (
-        xMin > 180 &&
-        xMax > 180 &&
-        xMax <= 360 &&
-        !this.proj4 &&
-        this.crs !== 'EPSG:3857'
-      ) {
-        xMin -= 360
-        xMax -= 360
+      if (!this.proj4 && this.crs !== 'EPSG:3857') {
+        if (xMin > 180 && xMax > 180 && xMax <= 361) {
+          // Both bounds > 180: shift everything (regional data in 180-360 range)
+          xMin -= 360
+          xMax -= 360
+        } else if (
+          xMin >= -1 &&
+          xMax > 180 &&
+          xMax <= 361 &&
+          Number.isFinite(dx) &&
+          Math.abs(xMax - xMin - 360) < dx
+        ) {
+          // Global 0-360 data: flag for per-region longitude wrapping.
+          // Keep bounds as [0, 360] so pixel-to-geo mapping is correct,
+          // then getRegionBounds shifts longitudes > 180 to negative values.
+          this.lon360Wrap = true
+        }
       }
 
       // For global datasets, snap bounds to exactly ±180 to avoid antimeridian
@@ -1208,6 +1217,16 @@ export class ZarrStore {
       if (needsBounds) {
         this.xyLimits = { xMin, xMax, yMin, yMax }
       }
+      console.log('[zarr-store] spatial metadata:', {
+        xMin,
+        xMax,
+        yMin,
+        yMax,
+        dx,
+        dy,
+        lon360Wrap: this.lon360Wrap,
+        latIsAscending: this.latIsAscending,
+      })
 
       // Warn users to set explicit values to skip future coordinate fetches
       if (this.multiscaleType === 'untiled') {

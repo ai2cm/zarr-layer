@@ -55,6 +55,7 @@ export interface ShaderProgram {
   reprojectLoc: WebGLUniformLocation | null
   latBoundsLoc: WebGLUniformLocation | null
   latIsAscendingLoc: WebGLUniformLocation | null
+  lon360WrapLoc: WebGLUniformLocation | null
 }
 
 export function resolveProjectionMode(
@@ -251,6 +252,7 @@ export function createShaderProgram(
     reprojectLoc: gl.getUniformLocation(program, 'u_reproject'),
     latBoundsLoc: gl.getUniformLocation(program, 'u_latBounds'),
     latIsAscendingLoc: gl.getUniformLocation(program, 'u_latIsAscending'),
+    lon360WrapLoc: gl.getUniformLocation(program, 'u_lon360Wrap'),
   }
 
   gl.deleteShader(vertexShader)
