@@ -87,9 +87,9 @@ const hrrr: Dataset<HRRRState> = {
   clim: [250, 310],
   colormap: 'fire',
   zarrVersion: 2,
-  info: 'HRRR Weather Model (CONUS) - Yesterday 12Z',
+  info: 'HRRR Weather Model (Lambert Conformal Conic)',
   sourceInfo:
-    'NOAA High-Resolution Rapid Refresh model via MesoWest. 3km resolution weather analysis over CONUS, updated daily. Reprojected from Lambert Conformal Conic using proj4.',
+    'NOAA HRRR weather model via MesoWest (updated daily), 3km resolution. Lambert Conformal Conic projection.',
   fillValue: -9999,
   // Map projection coordinate dimension names to lat/lon
   spatialDimensions: {

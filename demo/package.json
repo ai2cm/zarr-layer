@@ -2,6 +2,10 @@
   "name": "zarr-layer-demo",
   "version": "0.0.1",
   "private": true,
+  "prettier": "@carbonplan/prettier",
+  "lint-staged": {
+    "*.{js,ts,tsx,json,md}": "prettier --write"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
@@ -11,13 +15,13 @@
   },
   "dependencies": {
     "@carbonplan/colormaps": "^4.0.0",
-    "@carbonplan/components": "^13.1.1",
-    "@carbonplan/icechunk-js": "^0.2.3",
+    "@carbonplan/components": "^13.3.0",
     "@carbonplan/icons": "^2.0.0",
     "@carbonplan/layouts": "5.1.0",
     "@carbonplan/theme": "^8.1.0",
     "@carbonplan/zarr-layer": "file:../",
     "@protomaps/basemaps": "^5.0.1",
+    "icechunk-js": "^0.3.0",
     "mapbox-gl": "^3.6.0",
     "maplibre-gl": "^5.16.0",
     "next": "^14.2.24",
@@ -35,7 +39,8 @@
     "@types/react-dom": "^18.3.5",
     "eslint": "^8",
     "eslint-config-next": "14.2.24",
-    "prettier": "^3.5.3",
+    "lint-staged": "^16.2.7",
+    "prettier": "^2.2.1",
     "typescript": "^5.8.2"
   }
 }

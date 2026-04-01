@@ -2,7 +2,6 @@ import React from 'react'
 import type { AppProps } from 'next/app'
 import Script from 'next/script'
 import { ThemeProvider } from 'theme-ui'
-// @ts-expect-error - carbonplan theme types not available
 import theme from '@carbonplan/theme'
 import '@carbonplan/components/fonts.css'
 import '@carbonplan/components/globals.css'

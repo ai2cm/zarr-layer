@@ -1,12 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { Box, Spinner } from 'theme-ui'
-// @ts-expect-error - carbonplan colormaps types not available
 import { useThemedColormap, makeColormap } from '@carbonplan/colormaps'
 import {
   ZarrLayer,
   ZarrLayerOptions,
   QueryGeometry,
-  QueryResult,
 } from '@carbonplan/zarr-layer'
 import maplibregl from 'maplibre-gl'
 import mapboxgl from 'mapbox-gl'
@@ -14,6 +12,7 @@ import { layers, namedFlavor } from '@protomaps/basemaps'
 import { Protocol } from 'pmtiles'
 import { useAppStore } from '../lib/store'
 import type { LayerProps } from '../datasets/types'
+import MapZoomControls, { useAttributionStyles } from './map-controls'
 
 export type MapProvider = 'maplibre' | 'mapbox'
 
@@ -34,7 +33,7 @@ export interface MapInstance {
     getEast(): number
   }
   getZoom(): number
-  flyTo(options: { center: [number, number]; zoom: number }): void
+  easeTo(options: { center: [number, number]; zoom: number }): void
   getStyle(): { layers?: Array<{ id: string; type: string }> }
   addSource(id: string, source: any): void
   setTerrain(terrain: any): void
@@ -162,25 +161,26 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
   const prevDatasetIdRef = useRef<string | null>(null)
   const datasetId = useAppStore((state) => state.datasetId)
   const datasetModule = useAppStore((state) => state.getDatasetModule())
-  const datasetState = useAppStore((state) => state.getDatasetState())
+  const datasetState = useAppStore((state) => state.datasetState)
   const opacity = useAppStore((state) => state.opacity)
   const clim = useAppStore((state) => state.clim)
   const colormap = useAppStore((state) => state.colormap)
   const mapProvider = useAppStore((state) => state.mapProvider)
+  const renderPoles = useAppStore((state) => state.renderPoles)
   const setLoadingState = useAppStore((state) => state.setLoadingState)
   const colormapArray = useThemedColormap(colormap, { format: 'hex' })
   const setPointResult = useAppStore((state) => state.setPointResult)
   const setZarrLayer = useAppStore((state) => state.setZarrLayer)
 
   const layerConfig: LayerProps = useMemo(
-    () => datasetModule.buildLayerProps(datasetState as any),
+    () => datasetModule.buildLayerProps(datasetState),
     [datasetModule, datasetState]
   )
 
   const isCarbonplan4d = datasetModule.id === 'carbonplan_4d'
-  const currentBand = (datasetState as any)?.band
-  const monthStart = (datasetState as any)?.monthStart ?? null
-  const monthEnd = (datasetState as any)?.monthEnd ?? null
+  const currentBand = datasetState['band']
+  const monthStart = Number(datasetState['monthStart']) || null
+  const monthEnd = Number(datasetState['monthEnd']) || null
   const isRangeBand =
     isCarbonplan4d &&
     (currentBand === 'tavg_range' || currentBand === 'prec_range')
@@ -219,7 +219,7 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
 
     const createLayer = async () => {
       const currentLayerConfig = datasetModule.buildLayerProps(
-        useAppStore.getState().getDatasetState() as any
+        useAppStore.getState().datasetState
       )
       const options: ZarrLayerOptions = {
         id: 'zarr-layer',
@@ -236,6 +236,7 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
         latIsAscending: datasetModule.latIsAscending,
         proj4: datasetModule.proj4,
         onLoadingStateChange: setLoadingState,
+        renderPoles,
       }
 
       if (datasetModule.store) {
@@ -250,7 +251,7 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
       options.colormap = makeColormap(latestState.colormap, { format: 'hex' })
 
       const latestConfig = datasetModule.buildLayerProps(
-        latestState.getDatasetState() as any
+        latestState.datasetState
       )
       options.selector = latestConfig.selector
       if (latestConfig.customFrag) {
@@ -280,7 +281,7 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
           currentBand: latestBand,
         } = latestRangeStateRef.current
         const latestSelector = datasetModule.buildLayerProps(
-          useAppStore.getState().getDatasetState() as any
+          useAppStore.getState().datasetState
         ).selector
 
         let querySelector = latestSelector
@@ -294,17 +295,17 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
         }
 
         layer.queryData(geometry, querySelector).then((result) => {
-          console.log('queryData result', result)
-          setPointResult(result as QueryResult)
+          if (cancelled) return
+          setPointResult(result)
         })
       }
       map.on('click', clickHandler)
       zarrLayerRef.current = layer
       setZarrLayer(layer)
 
-      // Only fly to dataset center when dataset changes (not on variable/band change)
+      // Only ease to dataset center when dataset changes (not on variable/band change)
       if (datasetModule.center && prevDatasetIdRef.current !== datasetId) {
-        map.flyTo({
+        map.easeTo({
           center: datasetModule.center,
           zoom: datasetModule.zoom || 4,
         })
@@ -343,6 +344,7 @@ export const useMapLayer = (map: MapInstance | null, isMapLoaded: boolean) => {
     layerConfig.customFrag,
     layerConfig.variable,
     mapProvider,
+    renderPoles,
     setLoadingState,
   ])
 
@@ -369,6 +371,7 @@ export const Map = () => {
   const mapInstanceRef = useRef<MapInstance | null>(null)
   const [map, setMap] = useState<MapInstance | null>(null)
   const [isMapLoaded, setIsMapLoaded] = useState(false)
+  const attributionStyles = useAttributionStyles()
 
   const sidebarWidth = useAppStore((state) => state.sidebarWidth)
   const mapProvider = useAppStore((state) => state.mapProvider)
@@ -378,8 +381,6 @@ export const Map = () => {
   const setMapInstance = useAppStore((state) => state.setMapInstance)
 
   const mapConfig = getMapConfig(mapProvider)
-
-  useMapLayer(map, isMapLoaded)
 
   useEffect(() => {
     if (!mapContainer.current) return
@@ -426,6 +427,8 @@ export const Map = () => {
     }
   }, [map, isMapLoaded, terrainEnabled, mapProvider])
 
+  useMapLayer(map, isMapLoaded)
+
   useEffect(() => {
     if (!map || !isMapLoaded) return
     if (map.resize) {
@@ -443,8 +446,10 @@ export const Map = () => {
           right: 0,
           bottom: ['50vh', '50vh', 0],
           left: sidebarWidth ?? 0,
+          ...attributionStyles,
         }}
       />
+      <MapZoomControls />
       <Box
         sx={{
           position: 'absolute',

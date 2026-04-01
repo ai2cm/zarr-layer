@@ -1,4 +1,4 @@
-import { IcechunkStore } from '@carbonplan/icechunk-js'
+import { IcechunkStore } from 'icechunk-js'
 import type { Dataset, LayerProps } from './types'
 
 const ICECHUNK_URL =
@@ -12,12 +12,11 @@ const icechunkPrecip: Dataset<Record<string, never>> = {
   variable: 'IMERG_PRECTOT',
   clim: [0, 10],
   colormap: 'cool',
+  bounds: [-180, -90, 180, 90],
   zarrVersion: 3,
-  info: 'Precip, NetCDF in Icechunk store w/ multiscales',
+  info: 'Virtualized NetCDF of IMERG Precipitation (EPSG:4326)',
   sourceInfo:
-    'Icechunk store of virtualized NetCDF base level with multiscale overviews added. NASA / IMERG data.',
-  center: [-100, 45],
-  zoom: 2,
+    'Virtualized NetCDF of NASA IMERG precipitation stored in Icechunk with native multiscales added.',
   get store() {
     return (_storePromise ??= IcechunkStore.open(ICECHUNK_URL, {
       branch: 'main',
@@ -30,7 +29,7 @@ const icechunkPrecip: Dataset<Record<string, never>> = {
   defaultState: {},
   Controls: () => null,
   buildLayerProps: (): LayerProps => ({
-    selector: { time: { selected: 0, type: 'index' } },
+    selector: {},
   }),
 }
 

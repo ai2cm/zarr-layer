@@ -65,9 +65,9 @@ const hurricane: Dataset<HurricaneState> = {
   clim: [100000, 102500],
   colormap: 'cool',
   zarrVersion: 3,
-  info: 'Hurricane Florence (single image, 4D)',
+  info: 'Hurricane Florence (EPSG:4326)',
   sourceInfo:
-    'Single image Zarr v3 with time and level dimensions. Switch between surface pressure and wind velocity.',
+    'ERA5 Hurricane Florence, Zarr v3 single resolution. EPSG:4326, time and level dimensions.',
   center: [-65, 35],
   zoom: 3,
   defaultState: {

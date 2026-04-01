@@ -1,5 +1,4 @@
 import React from 'react'
-// @ts-expect-error - carbonplan components types not available
 import { Slider, Row, Column } from '@carbonplan/components'
 import { Box } from 'theme-ui'
 import type { Theme } from 'theme-ui'
@@ -48,7 +47,7 @@ export const RangeSlider: React.FC<RangeSliderProps> = ({
   }
 
   return (
-    <Row columns={[4, 4, 4, 4]} sx={{ alignItems: 'baseline', mb: 3 }}>
+    <Row columns={[4, 4, 4, 4]} sx={{ alignItems: 'baseline' }}>
       <Column start={1} width={1}>
         <Box sx={subheadingSx}>{label}</Box>
       </Column>

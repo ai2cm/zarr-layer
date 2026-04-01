@@ -56,7 +56,7 @@ const Controls = ({ state, setState }: ControlsProps<DEMState>) => {
 }
 
 const usgsdem: Dataset<DEMState> = {
-  id: 'usgsdem',
+  id: 'usgs_dem',
   source: `https://carbonplan-share.s3.us-west-2.amazonaws.com/zarr-layer-examples/USGS-CONUS-DEM-10m.zarr`,
   variable: 'DEM',
   clim: [0, 4000],
@@ -65,11 +65,10 @@ const usgsdem: Dataset<DEMState> = {
     49.09379633476274,
   ],
   latIsAscending: false,
-  sourceInfo:
-    'USGS 10m DEM with derived hillshade, aspect and slope angle shading.',
+  sourceInfo: 'Derived hillshade, aspect, and slope for 10m DEM.',
   colormap: 'warm',
   zarrVersion: 3,
-  info: 'USGS 10m DEM',
+  info: 'USGS 10m DEM (EPSG:4326)',
   center: [-98, 39],
   zoom: 3,
   defaultState: {

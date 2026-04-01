@@ -1,29 +1,37 @@
 export type SelectorSection = {
   label: string
+  description: string
   datasetIds: string[]
 }
 
 export const SELECTOR_SECTIONS: SelectorSection[] = [
   {
-    label: 'Tiled Pyramids',
-    datasetIds: ['carbonplan_4d', 'temperature_v3', 'tasmax_pyramid_4326'],
+    label: 'Multiscale',
+    description:
+      'Multiscale Zarr stores. Uses the zarr-conventions/multiscales format. See @carbonplan/topozarr for creation.',
+    datasetIds: ['usgs_dem', 'sentinel_2_eopf', 'burn_probability_conus'],
   },
   {
-    label: 'Single Image',
+    label: 'Single Resolution',
+    description: 'Single-resolution datasets. Reprojected if needed.',
     datasetIds: [
-      'hrrr_weather',
       'hurricane_florence',
+      'delta_fg_co2',
       'polar_antarctic',
       'antarctic_era5',
-      'delta_FG_CO2',
+      'hrrr_weather',
     ],
   },
   {
-    label: 'Untiled Multiscale',
-    datasetIds: ['usgsdem', 'sentinel_2_eopf', 'Burn Probability over CONUS'],
+    label: 'Icechunk',
+    description:
+      'Datasets served from Icechunk, a transactional storage engine for Zarr that supports virtual datasets via VirtualiZarr. Uses icechunk-js reader.',
+    datasetIds: ['icechunk_prec'],
   },
   {
-    label: 'Icechunk',
-    datasetIds: ['icechunk_prec'],
+    label: 'Legacy Tiled Pyramids',
+    description:
+      'Legacy format. Zarr stores resampled and rechunked to follow slippy-map tile pyramid conventions (zxy). See @carbonplan/ndpyramid for creation.',
+    datasetIds: ['carbonplan_4d', 'temperature_v3', 'tasmax_pyramid_4326'],
   },
 ]

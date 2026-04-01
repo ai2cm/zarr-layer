@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { DATASET_MAP, DEFAULT_DATASET_ID } from '../datasets'
-import type { Dataset } from '../datasets'
+import type { Dataset } from '../datasets/types'
 import type { MapProvider, MapInstance } from '../components/map-shared'
 import type {
   ZarrLayer,
@@ -16,8 +16,9 @@ interface AppState {
   colormap: string
   globeProjection: boolean
   terrainEnabled: boolean
+  renderPoles: boolean
   mapProvider: MapProvider
-  datasetState: Record<string, Record<string, unknown>>
+  datasetState: Record<string, unknown>
   loadingState: LoadingState
   pointResult: QueryResult | null
   regionResult: QueryResult | null
@@ -30,6 +31,7 @@ interface AppState {
   setColormap: (colormap: string) => void
   setGlobeProjection: (globeProjection: boolean) => void
   setTerrainEnabled: (terrainEnabled: boolean) => void
+  setRenderPoles: (renderPoles: boolean) => void
   setMapProvider: (provider: MapProvider) => void
   setActiveDatasetState: (updates: Record<string, unknown>) => void
   setLoadingState: (state: LoadingState) => void
@@ -37,8 +39,7 @@ interface AppState {
   setRegionResult: (result: QueryResult | null) => void
   setMapInstance: (map: MapInstance | null) => void
   setZarrLayer: (layer: InstanceType<typeof ZarrLayer> | null) => void
-  getDatasetModule: () => Dataset<any>
-  getDatasetState: () => Record<string, unknown>
+  getDatasetModule: () => Dataset
 }
 
 const defaultModule = DATASET_MAP[DEFAULT_DATASET_ID]
@@ -51,10 +52,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   colormap: defaultModule.colormap,
   globeProjection: true,
   terrainEnabled: false,
+  renderPoles: false,
   mapProvider: 'maplibre',
-  datasetState: {
-    [DEFAULT_DATASET_ID]: { ...defaultModule.defaultState },
-  },
+  datasetState: { ...defaultModule.defaultState },
   loadingState: { loading: false, metadata: false, chunks: false },
   pointResult: null,
   regionResult: null,
@@ -64,31 +64,25 @@ export const useAppStore = create<AppState>((set, get) => ({
   setLoadingState: (loadingState) => set({ loadingState }),
   setDatasetId: (id) => {
     const module = DATASET_MAP[id]
-    if (!module) return
+    if (!module || id === get().datasetId) return
 
-    set((state) => ({
+    set({
       datasetId: id,
       clim: module.clim,
       colormap: module.colormap,
-      datasetState: {
-        ...state.datasetState,
-        [id]: state.datasetState[id] ?? { ...module.defaultState },
-      },
-    }))
+      datasetState: { ...module.defaultState },
+    })
   },
   setOpacity: (opacity) => set({ opacity }),
   setClim: (clim) => set({ clim }),
   setColormap: (colormap) => set({ colormap }),
   setGlobeProjection: (globeProjection) => set({ globeProjection }),
   setTerrainEnabled: (terrainEnabled) => set({ terrainEnabled }),
+  setRenderPoles: (renderPoles) => set({ renderPoles }),
   setMapProvider: (mapProvider) => set({ mapProvider }),
   setActiveDatasetState: (updates) => {
-    const id = get().datasetId
     set((state) => ({
-      datasetState: {
-        ...state.datasetState,
-        [id]: { ...(state.datasetState[id] ?? {}), ...updates },
-      },
+      datasetState: { ...state.datasetState, ...updates },
     }))
   },
   setPointResult: (pointResult) => set({ pointResult }),
@@ -96,9 +90,4 @@ export const useAppStore = create<AppState>((set, get) => ({
   setMapInstance: (mapInstance) => set({ mapInstance }),
   setZarrLayer: (zarrLayer) => set({ zarrLayer }),
   getDatasetModule: () => DATASET_MAP[get().datasetId],
-  getDatasetState: () => {
-    const id = get().datasetId
-    const module = DATASET_MAP[id]
-    return get().datasetState[id] ?? module.defaultState
-  },
 }))
