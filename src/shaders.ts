@@ -256,6 +256,12 @@ const FRAGMENT_SHADER_REPROJECT = `
     // Standard linear texture lookup
     sample_coord = pix_coord * u_texScale + u_texOffset;
   }
+
+  // For 0-360 longitude data: shift texture X by 0.5 and wrap with fract()
+  // so that data starting at lon=0 renders correctly on a -180/180 map.
+  if (u_lon360Wrap == 1) {
+    sample_coord.x = fract(sample_coord.x + 0.5);
+  }
 `
 
 /**
@@ -278,7 +284,7 @@ uniform vec2 u_texOffset;
 uniform int u_reproject;      // 0 = no reprojection, 1 = Mercator inversion
 uniform vec2 u_latBounds;     // (latMin, latMax) in degrees
 uniform int u_latIsAscending; // 1 = row 0 is south, 0 = row 0 is north
-uniform int u_lon360Wrap;     // reserved for future use
+uniform int u_lon360Wrap;     // 1 = data uses 0-360 lon, shift texture X by 0.5
 
 uniform sampler2D tex;
 uniform sampler2D cmap;
@@ -391,7 +397,7 @@ uniform vec2 u_texOffset;
 uniform int u_reproject;      // 0 = no reprojection, 1 = Mercator inversion
 uniform vec2 u_latBounds;     // (latMin, latMax) in degrees
 uniform int u_latIsAscending; // 1 = row 0 is south, 0 = row 0 is north
-uniform int u_lon360Wrap;     // reserved for future use
+uniform int u_lon360Wrap;     // 1 = data uses 0-360 lon, shift texture X by 0.5
 
 uniform sampler2D colormap;
 

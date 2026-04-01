@@ -710,7 +710,9 @@ export class UntiledMode implements ZarrMode {
       mercatorBounds: null,
       wgs84Bounds: null,
       latIsAscending: this.latIsAscending,
-      lon360Wrap: this.lon360Wrap,
+      // Only apply shader texture wrap for single-region-covers-full-globe case.
+      // For multi-region (chunked) 0-360 data, getRegionBounds handles the shift.
+      lon360Wrap: false,
       selectorVersion: this.selectorVersion,
       bandData: new Map(),
       bandTextures: new Map(),
@@ -1024,24 +1026,24 @@ export class UntiledMode implements ZarrMode {
       geoYMax = yMin + (pxYEnd / height) * (yMax - yMin)
     }
 
-    // For 0-360 longitude data: shift geo longitudes > 180 to negative.
-    // This positions each region correctly on a -180/180 map.
+    // For 0-360 longitude data: convert bounds to -180/180 range.
     let finalXMin = geoXMin
     let finalXMax = geoXMax
     if (this.lon360Wrap) {
-      if (finalXMin > 180) finalXMin -= 360
-      if (finalXMax > 180) finalXMax -= 360
-      // Handle the region that straddles the 180/-180 boundary:
-      // its geoXMin is < 180 but geoXMax is > 180 (after shift, geoXMax < geoXMin).
-      // This region wraps around the antimeridian.
-      // For now, clamp it — this causes a small gap at the antimeridian
-      // but avoids rendering artifacts.
-      if (finalXMin > finalXMax) {
-        // This region straddles the antimeridian.
-        // Render it on the side that has more of the region.
-        const wrapPoint = 180
-        const leftPortion = wrapPoint - geoXMin
-        const rightPortion = geoXMax - wrapPoint
+      const span = geoXMax - geoXMin
+      // Check if this region covers the full 360° (or nearly so)
+      if (Math.abs(span - 360) < 1) {
+        // Full globe: map to [-180, 180]
+        finalXMin = -180
+        finalXMax = 180
+      } else if (finalXMin > 180) {
+        // Entirely in the 180-360 range: shift to -180–0
+        finalXMin -= 360
+        finalXMax -= 360
+      } else if (finalXMax > 180) {
+        // Straddles 180°: clamp to the larger side
+        const leftPortion = 180 - geoXMin
+        const rightPortion = geoXMax - 180
         if (leftPortion >= rightPortion) {
           finalXMax = 180
         } else {
@@ -1079,6 +1081,14 @@ export class UntiledMode implements ZarrMode {
       regionY,
       region.levelMeta ?? undefined
     )
+
+    // For 0-360 data: only apply shader texture wrap when this region
+    // covers the full globe (bounds are [-180, 180]). For sub-regions,
+    // getRegionBounds already shifted the geometry position.
+    if (this.lon360Wrap) {
+      const lonSpan = geoBounds.xMax - geoBounds.xMin
+      region.lon360Wrap = Math.abs(lonSpan - 360) < 1
+    }
 
     // Use cached mercatorBounds if set (from fetchRegion's resampling path),
     // otherwise compute from geoBounds (for non-resampling cases like EPSG:3857)
@@ -1897,9 +1907,12 @@ export class UntiledMode implements ZarrMode {
       ) {
         const detectedRegionSize = this.getRegionSize(this.zarrArray)
         this.regionSize = detectedRegionSize ?? [this.height, this.width]
+        console.log('[untiled] single-level regionSize set:', this.regionSize, 'detected:', detectedRegionSize)
 
         // Build base slice args and let updateVisibleRegions handle loading
         this.buildBaseSliceArgs().then(() => {
+          const visible = this.getVisibleRegions(map)
+          console.log('[untiled] visible regions:', visible, 'xyLimits:', this.xyLimits)
           this.updateVisibleRegions(map, gl)
         })
         return
