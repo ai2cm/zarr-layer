@@ -407,14 +407,12 @@ export function computePixelBoundsFromGeometry(
 
 import { DEFAULT_QUERY_DENSIFY_MAX_ERROR } from '../constants'
 
-/** Max pixel-space error before an edge is subdivided */
-const DENSIFY_MAX_ERROR = DEFAULT_QUERY_DENSIFY_MAX_ERROR
 /** Max recursion depth for adaptive subdivision */
 const DENSIFY_MAX_DEPTH = 10
 
 /**
  * Densify a ring by adaptively subdividing edges until the pixel-space error
- * is below DENSIFY_MAX_ERROR. For each edge, the midpoint is interpolated in
+ * is below DEFAULT_QUERY_DENSIFY_MAX_ERROR. For each edge, the midpoint is interpolated in
  * source coordinates (lon/lat), transformed to pixel space, and compared to
  * the straight-line midpoint in pixel space. If the deviation exceeds the
  * threshold, the edge is recursively split.
@@ -454,7 +452,10 @@ function densifyAndTransformRing(
     const dy = pxM[1] - expectedY
     const error = dx * dx + dy * dy // compare squared to avoid sqrt
 
-    if (error > DENSIFY_MAX_ERROR * DENSIFY_MAX_ERROR) {
+    if (
+      error >
+      DEFAULT_QUERY_DENSIFY_MAX_ERROR * DEFAULT_QUERY_DENSIFY_MAX_ERROR
+    ) {
       subdivide(lon0, lat0, px0, lonM, latM, pxM, depth + 1)
       result.push(pxM as number[])
       subdivide(lonM, latM, pxM, lon1, lat1, px1, depth + 1)
@@ -952,88 +953,4 @@ export function getTilesForPolygon(
 ): TileTuple[] {
   const bbox = computeBoundingBox(geometry)
   return getTilesForBoundingBox(bbox, zoom, crs, xyLimits)
-}
-
-/**
- * Converts mercator bounds to pixel coordinates within a data array.
- * Used for single-image mode queries.
- * Supports custom projections via proj4.
- */
-export function mercatorBoundsToPixel(
-  lng: number,
-  lat: number,
-  bounds: MercatorBounds,
-  width: number,
-  height: number,
-  crs: CRS,
-  latIsAscending?: boolean,
-  proj4def?: string | null,
-  sourceBounds?: Bounds | null,
-  cachedTransformer?: CachedTransformer
-): { x: number; y: number } | null {
-  // If proj4 is provided, use proj4 to transform lat/lon → source CRS → pixel
-  if (proj4def && sourceBounds) {
-    const transformer =
-      cachedTransformer ?? createWGS84ToSourceTransformer(proj4def)
-    const [srcX, srcY] = transformer.forward(lng, lat)
-
-    // Check if within source bounds
-    const [xMin, yMin, xMax, yMax] = sourceBounds
-    if (srcX < xMin || srcX > xMax || srcY < yMin || srcY > yMax) {
-      return null
-    }
-
-    // Convert source CRS coords to pixel indices
-    const [xPixel, yPixel] = sourceCRSToPixel(
-      srcX,
-      srcY,
-      sourceBounds,
-      width,
-      height,
-      latIsAscending
-    )
-
-    const x = Math.floor(xPixel)
-    const y = Math.floor(yPixel)
-
-    if (x < 0 || x >= width || y < 0 || y >= height) {
-      return null
-    }
-
-    return { x, y }
-  }
-
-  let normX: number
-  let normY: number
-
-  if (
-    crs === 'EPSG:4326' &&
-    bounds.latMin !== undefined &&
-    bounds.latMax !== undefined
-  ) {
-    // For equirectangular data, use linear lat mapping
-    normX = (lonToMercatorNorm(lng) - bounds.x0) / (bounds.x1 - bounds.x0)
-    // Convert lat to mercator for display, but sample linearly in source data
-    const latRange = bounds.latMax - bounds.latMin
-    if (latRange === 0) return null
-    const latNorm = latIsAscending
-      ? (lat - bounds.latMin) / latRange
-      : (bounds.latMax - lat) / latRange
-    normY = latNorm
-  } else {
-    normX = (lonToMercatorNorm(lng) - bounds.x0) / (bounds.x1 - bounds.x0)
-    normY = (latToMercatorNorm(lat) - bounds.y0) / (bounds.y1 - bounds.y0)
-  }
-
-  if (normX < 0 || normX > 1 || normY < 0 || normY > 1) {
-    return null
-  }
-
-  const x = Math.floor(normX * width)
-  const y = Math.floor(normY * height)
-
-  return {
-    x: Math.min(x, width - 1),
-    y: Math.min(y, height - 1),
-  }
 }
