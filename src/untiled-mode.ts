@@ -142,6 +142,97 @@ type LevelMeta = {
 
 /** Maximum number of regions to keep in cache (LRU eviction) */
 const MAX_CACHED_REGIONS = 128
+
+/**
+ * Default byte budget for the normalized data cache (200 MB).
+ * Stores post-normalization Float32Arrays keyed by regionKey + selectorHash
+ * so that revisiting a time step only requires a GPU texture upload (~2-5ms)
+ * rather than the full zarr.get → normalize pipeline (~20-50ms).
+ */
+const DEFAULT_NORMALIZED_CACHE_BYTES = 200 * 1024 * 1024
+
+/** Entry in the normalized data cache */
+interface NormalizedCacheEntry {
+  /** Interleaved multi-band data ready for texImage2D */
+  data: Float32Array
+  /** Per-band normalized arrays (for custom shaders) */
+  bandData: Map<string, Float32Array>
+  width: number
+  height: number
+  channels: number
+  /** Byte size of all Float32Arrays in this entry */
+  byteSize: number
+}
+
+/**
+ * LRU cache for normalized region data, keyed by `regionKey:selectorHash`.
+ * Allows instant GPU re-upload when revisiting a previously-seen time step,
+ * skipping zarr.get, slice extraction, scale/offset, and normalization.
+ */
+class NormalizedDataCache {
+  private cache: Map<string, NormalizedCacheEntry> = new Map()
+  private totalBytes: number = 0
+  readonly maxBytes: number
+
+  constructor(maxBytes: number = DEFAULT_NORMALIZED_CACHE_BYTES) {
+    this.maxBytes = maxBytes
+  }
+
+  /** Build a cache key from a region key and a selector hash */
+  static makeKey(regionKey: string, selectorHash: string): string {
+    return `${regionKey}@${selectorHash}`
+  }
+
+  /** Retrieve an entry and promote it in LRU order */
+  get(key: string): NormalizedCacheEntry | undefined {
+    const entry = this.cache.get(key)
+    if (entry) {
+      // Promote to most-recently-used
+      this.cache.delete(key)
+      this.cache.set(key, entry)
+    }
+    return entry
+  }
+
+  /** Store normalized data. Evicts oldest entries if over budget. */
+  put(key: string, entry: NormalizedCacheEntry): void {
+    // If replacing an existing entry, reclaim its bytes first
+    const existing = this.cache.get(key)
+    if (existing) {
+      this.totalBytes -= existing.byteSize
+      this.cache.delete(key)
+    }
+
+    // Evict until there's room
+    while (
+      this.totalBytes + entry.byteSize > this.maxBytes &&
+      this.cache.size > 0
+    ) {
+      const oldest = this.cache.keys().next().value!
+      const evicted = this.cache.get(oldest)!
+      this.totalBytes -= evicted.byteSize
+      this.cache.delete(oldest)
+    }
+
+    this.cache.set(key, entry)
+    this.totalBytes += entry.byteSize
+  }
+
+  /** Remove all entries */
+  clear(): void {
+    this.cache.clear()
+    this.totalBytes = 0
+  }
+
+  get size(): number {
+    return this.cache.size
+  }
+
+  get bytesUsed(): number {
+    return this.totalBytes
+  }
+}
+
 /** Snapshot of level state captured at fetch start to prevent race conditions */
 interface LevelSnapshot {
   index: number
@@ -253,6 +344,12 @@ export class UntiledMode implements ZarrMode {
   // Fixed data scale for normalization (set at initialization, passed from ZarrLayer)
   private fixedDataScale: number = 1
 
+  // Normalized data cache: stores post-normalization Float32Arrays keyed by
+  // regionKey + selectorHash for instant GPU re-upload on time step revisits
+  private normalizedCache: NormalizedDataCache = new NormalizedDataCache()
+  // Stable hash of the current selector (for cache keying, survives back-and-forth)
+  private currentSelectorHash: string = ''
+
   constructor(
     store: ZarrStore,
     variable: string,
@@ -268,6 +365,7 @@ export class UntiledMode implements ZarrMode {
     this.invalidate = invalidate
     this.throttleMs = throttleMs
     this.fixedDataScale = fixedDataScale
+    this.currentSelectorHash = this.computeSelectorHash(selector)
   }
 
   async initialize(): Promise<void> {
@@ -505,6 +603,7 @@ export class UntiledMode implements ZarrMode {
       this.disposeRegion(region, gl)
     }
     this.regionCache.clear()
+    this.normalizedCache.clear()
     this.lastViewportHash = ''
   }
 
@@ -1459,28 +1558,59 @@ export class UntiledMode implements ZarrMode {
       }
     }
 
-    // Separate regions into two categories:
+    // Separate regions into three categories:
     // 1. New regions (no data) - viewport change, fetch immediately
-    // 2. Stale regions (have data, wrong selector) - selector change, throttle
+    // 2. Cache-hit regions (stale selector but normalized data in cache) - GPU upload only
+    // 3. Stale regions (have data, wrong selector, no cache) - selector change, throttle
     const newRegions: Array<{ regionX: number; regionY: number }> = []
     const staleRegions: Array<{ regionX: number; regionY: number }> = []
+    let restoredFromCache = false
 
     for (const { regionX, regionY } of visible) {
       const key = this.makeRegionKey(levelIndex, regionX, regionY)
-      const cached = this.regionCache.get(key)
+      const region = this.regionCache.get(key)
 
       // Skip if already loading - when the load completes, invalidate() triggers
       // another updateVisibleRegions() check to see if refetch is needed
-      if (cached?.loading) {
+      if (region?.loading) {
         continue
       }
 
-      if (!cached?.data) {
+      if (!region?.data) {
         // No data yet - this is a new region (viewport change)
         newRegions.push({ regionX, regionY })
-      } else if (cached.selectorVersion !== this.selectorVersion) {
-        // Has data but stale selector - this is a selector change
-        staleRegions.push({ regionX, regionY })
+      } else if (region.selectorVersion !== this.selectorVersion) {
+        // Stale selector - check normalized cache before re-fetching
+        const cacheKey = NormalizedDataCache.makeKey(
+          key,
+          this.currentSelectorHash
+        )
+        const cachedNorm = this.normalizedCache.get(cacheKey)
+        if (cachedNorm && region.texture) {
+          // Fast path: restore from cache (GPU upload only, ~2-5ms)
+          region.data = cachedNorm.data
+          region.bandData = new Map(cachedNorm.bandData)
+          region.bandTexturesUploaded.clear()
+          region.width = cachedNorm.width
+          region.height = cachedNorm.height
+          region.channels = cachedNorm.channels
+          region.selectorVersion = this.selectorVersion
+          region.loading = false
+
+          const result = uploadDataTexture(gl, {
+            texture: region.texture,
+            data: cachedNorm.data,
+            width: cachedNorm.width,
+            height: cachedNorm.height,
+            channels: cachedNorm.channels,
+            configured: false,
+          })
+          region.textureUploaded = result.uploaded
+          restoredFromCache = true
+        } else {
+          // Slow path: need full fetch
+          staleRegions.push({ regionX, regionY })
+        }
       }
     }
 
@@ -1490,6 +1620,11 @@ export class UntiledMode implements ZarrMode {
       .join('|')}`
     const viewportChanged = viewportHash !== this.lastViewportHash
     this.lastViewportHash = viewportHash
+
+    // If we restored any regions from cache, trigger a repaint
+    if (restoredFromCache) {
+      this.invalidate()
+    }
 
     // Skip if nothing to fetch
     if (
@@ -1825,6 +1960,28 @@ export class UntiledMode implements ZarrMode {
 
       // Construct interleaved data from normalized bands
       region.data = interleaveBands(normalizedBands, numChannels)
+
+      // Store in normalized data cache for fast revisit
+      {
+        const cacheKey = NormalizedDataCache.makeKey(
+          key,
+          this.currentSelectorHash
+        )
+        let byteSize = region.data.byteLength
+        const bandDataCopy = new Map<string, Float32Array>()
+        for (const [name, arr] of region.bandData) {
+          bandDataCopy.set(name, arr)
+          byteSize += arr.byteLength
+        }
+        this.normalizedCache.put(cacheKey, {
+          data: region.data,
+          bandData: bandDataCopy,
+          width: outputW,
+          height: outputH,
+          channels: numChannels,
+          byteSize,
+        })
+      }
 
       // Check if geometry needs to be (re)created before updating dimensions
       // The adaptive mesh only depends on spatial bounds and dimensions, not the selector
@@ -2467,9 +2624,19 @@ export class UntiledMode implements ZarrMode {
     return this.levels.map((l) => l.asset)
   }
 
+  /** Compute a stable hash of a selector for use as a cache key */
+  private computeSelectorHash(selector: NormalizedSelector): string {
+    const sorted: Record<string, unknown> = {}
+    for (const key of Object.keys(selector).sort()) {
+      sorted[key] = selector[key]
+    }
+    return JSON.stringify(sorted)
+  }
+
   async setSelector(selector: NormalizedSelector): Promise<void> {
     this.selector = selector
     this.bandNames = getBands(this.variable, selector)
+    this.currentSelectorHash = this.computeSelectorHash(selector)
 
     const gl = this.cachedGl
     if (!gl) {
@@ -2488,7 +2655,75 @@ export class UntiledMode implements ZarrMode {
 
     this.selectorVersion++
 
-    // Abort in-flight fetches still running with the old selector.
+    // Before aborting in-flight fetches or re-fetching, check if the
+    // normalized cache can satisfy all currently visible regions instantly.
+    const visibleRegions = this.lastVisibleRegions
+    let allCached = visibleRegions.length > 0
+    for (const { regionX, regionY } of visibleRegions) {
+      const regionKey = this.makeRegionKey(
+        this.currentLevelIndex,
+        regionX,
+        regionY
+      )
+      const cacheKey = NormalizedDataCache.makeKey(
+        regionKey,
+        this.currentSelectorHash
+      )
+      if (!this.normalizedCache.get(cacheKey)) {
+        allCached = false
+        break
+      }
+    }
+
+    if (allCached && gl) {
+      // Fast path: restore all visible regions from cache (GPU upload only)
+      for (const { regionX, regionY } of visibleRegions) {
+        const regionKey = this.makeRegionKey(
+          this.currentLevelIndex,
+          regionX,
+          regionY
+        )
+        const cacheKey = NormalizedDataCache.makeKey(
+          regionKey,
+          this.currentSelectorHash
+        )
+        const cached = this.normalizedCache.get(cacheKey)!
+        const region = this.regionCache.get(regionKey)
+        if (!region) continue
+
+        // Restore normalized data
+        region.data = cached.data
+        region.bandData = new Map(cached.bandData)
+        region.bandTexturesUploaded.clear()
+        region.width = cached.width
+        region.height = cached.height
+        region.channels = cached.channels
+        region.selectorVersion = this.selectorVersion
+        region.loading = false
+
+        // Re-upload texture to GPU
+        if (!region.texture) {
+          region.texture = gl.createTexture()
+        }
+        const result = uploadDataTexture(gl, {
+          texture: region.texture!,
+          data: cached.data,
+          width: cached.width,
+          height: cached.height,
+          channels: cached.channels,
+          configured: false,
+        })
+        region.textureUploaded = result.uploaded
+      }
+
+      // Rebuild base slice args for consistency, then invalidate to render
+      await this.buildBaseSliceArgs()
+      this.lastViewportHash = ''
+      this.invalidate()
+      return
+    }
+
+    // Slow path: abort in-flight fetches and re-fetch.
     // The fetch's catch/finally handles state cleanup and re-invalidation.
     for (const [, region] of this.regionCache) {
       if (region.loading && region.requestId !== null) {
