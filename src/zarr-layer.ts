@@ -928,8 +928,8 @@ export class ZarrLayer {
     if (!this.mode?.queryData) {
       return {
         [this.variable]: [],
-        dimensions: ['lat', 'lon'],
-        coordinates: { lat: [], lon: [] },
+        dimensions: [],
+        coordinates: {},
       }
     }
     return this.mode.queryData(geometry, selector, options)
