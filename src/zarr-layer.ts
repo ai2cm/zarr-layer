@@ -178,6 +178,10 @@ export class ZarrLayer {
   private renderPoles: boolean
   private lastIsGlobe: boolean | null = null
   private usingDirectMapboxGlobePath: boolean = false
+  private maxChunkCacheBytes: number | undefined
+  private prefetchController: AbortController | null = null
+  /** Tracks which time step indices have been fetched (for cache status). */
+  private cachedTimeSteps: Set<number> = new Set()
   private mapboxDirectGlobePathAvailable: boolean = false
 
   private canUseMapboxDirectGlobePath(): boolean {
@@ -294,6 +298,7 @@ export class ZarrLayer {
     transformRequest,
     store,
     renderPoles = false,
+    maxChunkCacheBytes,
   }: ZarrLayerOptions) {
     if (!id) {
       throw new Error('[ZarrLayer] id is required')
@@ -361,6 +366,7 @@ export class ZarrLayer {
     this.transformRequest = transformRequest
     this.customStore = store
     this.renderPoles = renderPoles
+    this.maxChunkCacheBytes = maxChunkCacheBytes
   }
 
   private emitLoadingState(): void {
@@ -482,7 +488,74 @@ export class ZarrLayer {
     if (this.mode) {
       await this.mode.setSelector(this.normalizedSelector)
     }
+
+    // Mark the current time step as cached (its chunks are now in the CachingStore)
+    for (const [dimName, spec] of Object.entries(this.normalizedSelector)) {
+      const dimInfo = this.dimIndices[dimName]
+      if (
+        dimInfo &&
+        typeof spec.selected === 'number' &&
+        spec.type === 'index'
+      ) {
+        this.cachedTimeSteps.add(spec.selected)
+      }
+    }
+
     this.invalidate()
+  }
+
+  /**
+   * Pre-fetch chunk data for the given time step indices.
+   * Populates the chunk cache in the background so that future
+   * setSelector() calls for these time steps are instant.
+   *
+   * @param timeIndices - Array of time step indices to pre-fetch
+   * @param timeDimName - Name of the time dimension (default: 'time')
+   */
+  prefetchTimeSteps(timeIndices: number[], timeDimName: string = 'time'): void {
+    if (!this.mode?.prefetchTimeSteps) return
+
+    // Filter out already-cached steps
+    const needed = timeIndices.filter((idx) => !this.cachedTimeSteps.has(idx))
+    if (needed.length === 0) return
+
+    // Cancel any previous prefetch
+    this.prefetchController?.abort()
+    this.prefetchController = new AbortController()
+
+    const signal = this.prefetchController.signal
+
+    // Fire-and-forget; mark each step as cached on completion
+    this.mode
+      .prefetchTimeSteps(needed, timeDimName, signal)
+      .then(() => {
+        if (!signal.aborted) {
+          for (const idx of needed) this.cachedTimeSteps.add(idx)
+        }
+      })
+      .catch(() => {
+        // Aborted or failed — don't mark as cached
+      })
+  }
+
+  /**
+   * Check whether chunk data for a given time step index is cached.
+   * Used by animation loops to detect when buffering is needed.
+   */
+  isTimeStepCached(timeIndex: number): boolean {
+    return this.cachedTimeSteps.has(timeIndex)
+  }
+
+  /**
+   * Get cache status for multiple time step indices.
+   * Returns a record mapping each time index to 'cached' or 'missing'.
+   */
+  getCacheStatus(timeIndices: number[]): Record<number, 'cached' | 'missing'> {
+    const result: Record<number, 'cached' | 'missing'> = {}
+    for (const idx of timeIndices) {
+      result[idx] = this.cachedTimeSteps.has(idx) ? 'cached' : 'missing'
+    }
+    return result
   }
 
   onAdd(
@@ -632,6 +705,7 @@ export class ZarrLayer {
         proj4: this.proj4,
         transformRequest: this.transformRequest,
         customStore: this.customStore,
+        maxChunkCacheBytes: this.maxChunkCacheBytes,
       })
 
       await this.zarrStore.initialized

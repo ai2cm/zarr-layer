@@ -96,4 +96,11 @@ export interface ZarrMode {
 
   // Query methods (optional)
   queryData?(geometry: QueryGeometry, selector?: Selector): Promise<QueryResult>
+
+  // Pre-fetch methods (optional)
+  prefetchTimeSteps?(
+    timeIndices: number[],
+    timeDimName: string,
+    signal: AbortSignal
+  ): Promise<void>
 }

@@ -2501,6 +2501,46 @@ export class UntiledMode implements ZarrMode {
     this.invalidate()
   }
 
+  async prefetchTimeSteps(
+    timeIndices: number[],
+    timeDimName: string,
+    signal: AbortSignal
+  ): Promise<void> {
+    if (!this.zarrArray || !this.baseSliceArgsReady) return
+
+    for (const timeIndex of timeIndices) {
+      if (signal.aborted) return
+
+      // Build a modified selector with this future time step
+      const prefetchSelector: NormalizedSelector = { ...this.selector }
+      prefetchSelector[timeDimName] = {
+        selected: timeIndex,
+        type: 'index' as const,
+      }
+
+      // Build slice args for the full spatial extent at this time step
+      const { sliceArgs } = await this.buildSliceArgsForSelector(
+        prefetchSelector,
+        {
+          includeSpatialSlices: true,
+          trackMultiValue: false,
+        }
+      )
+
+      if (signal.aborted) return
+
+      // zarr.get() decomposes into chunk fetches → CachingStore caches them
+      try {
+        await zarr.get(this.zarrArray, sliceArgs, {
+          opts: { signal },
+        })
+      } catch (e) {
+        if ((e as Error).name === 'AbortError') return
+        // Swallow other errors for prefetch — non-critical
+      }
+    }
+  }
+
   private emitLoadingState(): void {
     // Update chunksLoading to include throttle state
     if (

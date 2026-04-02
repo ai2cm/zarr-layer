@@ -1,5 +1,6 @@
 import * as zarr from 'zarrita'
 import type { Readable, AsyncReadable } from '@zarrita/storage'
+import { CachingStore } from './caching-store'
 import type {
   Bounds,
   SpatialDimensions,
@@ -267,6 +268,7 @@ type ZarrStoreType =
   | zarr.FetchStore
   | TransformingFetchStore
   | ConsolidatedStore
+  | CachingStore
   | Readable<unknown>
   | AsyncReadable<unknown>
 
@@ -284,6 +286,8 @@ interface ZarrStoreOptions {
   transformRequest?: TransformRequest
   /** Custom store to use instead of FetchStore. When provided, source becomes optional. */
   customStore?: Readable<unknown> | AsyncReadable<unknown>
+  /** Maximum bytes for chunk cache. Set to 0 to disable caching. Default: 100 MB. */
+  maxChunkCacheBytes?: number
 }
 
 interface StoreDescription {
@@ -365,6 +369,9 @@ export class ZarrStore {
   proj4: string | null = null
   private _crsFromMetadata: boolean = false // Track if CRS was explicitly set from metadata
   private _crsOverride: boolean = false // Track if CRS was explicitly set by user
+  private maxChunkCacheBytes: number = 100 * 1024 * 1024 // 100 MB default
+  /** The caching store wrapper, if chunk caching is enabled. */
+  cachingStore: CachingStore | null = null
 
   /**
    * Returns the coarsest (lowest resolution) level path.
@@ -399,6 +406,7 @@ export class ZarrStore {
     proj4,
     transformRequest,
     customStore,
+    maxChunkCacheBytes,
   }: ZarrStoreOptions) {
     if (!source && !customStore) {
       throw new Error('source is required when customStore is not provided')
@@ -431,6 +439,9 @@ export class ZarrStore {
     }
     this.transformRequest = transformRequest
     this.customStore = customStore
+    if (maxChunkCacheBytes !== undefined) {
+      this.maxChunkCacheBytes = maxChunkCacheBytes
+    }
 
     this.initialized = this._initialize()
   }
@@ -472,7 +483,18 @@ export class ZarrStore {
       }
     }
 
-    this.store = await storeHandle
+    const resolvedStore = await storeHandle
+
+    // Wrap with CachingStore for chunk-level caching (unless disabled)
+    if (this.maxChunkCacheBytes > 0) {
+      this.cachingStore = new CachingStore(
+        resolvedStore as AsyncReadable<RequestInit>,
+        this.maxChunkCacheBytes
+      )
+      this.store = this.cachingStore as unknown as ZarrStoreType
+    } else {
+      this.store = resolvedStore
+    }
     this.root = zarr.root(this.store)
 
     if (this.version === 2) {

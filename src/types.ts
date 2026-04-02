@@ -151,6 +151,12 @@ export interface ZarrLayerOptions {
    * Default: `false`
    */
   renderPoles?: boolean
+  /**
+   * Maximum bytes for the chunk cache. The cache stores raw zarr chunk bytes
+   * at the store level, so all modes (tiled, untiled, queries) benefit.
+   * Set to 0 to disable caching. Default: 100 MB.
+   */
+  maxChunkCacheBytes?: number
 }
 
 export type CRS = 'EPSG:4326' | 'EPSG:3857'
