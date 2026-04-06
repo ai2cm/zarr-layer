@@ -6,6 +6,10 @@ import type {
 } from './zarr-mode'
 import type { QueryGeometry, QueryOptions, QueryResult } from './query/types'
 import { queryRegionTiled } from './query/region-query'
+import {
+  preprocessQueryGeometry,
+  rasterExtentCrossesAntimeridian,
+} from './query/query-utils'
 import type {
   LoadingStateCallback,
   MapLike,
@@ -116,6 +120,8 @@ export class TiledMode implements ZarrMode {
   private selectorVersion: number = 0
   private throttleMs: number
   private fixedDataScale: number
+
+  private _antimeridianWarnings: Set<string> = new Set()
 
   // Shared state managers
   private throttleState: ThrottleState = createThrottleState()
@@ -575,22 +581,54 @@ export class TiledMode implements ZarrMode {
     const querySelector = selector ? normalizeSelector(selector) : this.selector
     const level = this.currentLevel ?? this.maxLevelIndex
     const desc = this.zarrStore.describe()
+    const transforms = {
+      scaleFactor: desc.scaleFactor,
+      addOffset: desc.addOffset,
+      fillValue: desc.fill_value,
+    }
+
+    // Antimeridian preprocessing
+    const { geometry: processedGeometry, bbox: wrappedBbox } =
+      preprocessQueryGeometry(geometry)
+
+    // Raster extent guard (EPSG:4326 only)
+    if (
+      wrappedBbox.crossesAntimeridian &&
+      rasterExtentCrossesAntimeridian(this.crs, this.xyLimits)
+    ) {
+      if (!this._antimeridianWarnings.has('raster-extent-crossing')) {
+        this._antimeridianWarnings.add('raster-extent-crossing')
+        console.warn(
+          'Antimeridian-crossing polygon queries are not supported for rasters whose own extent crosses the antimeridian; results may be incorrect'
+        )
+      }
+      // Fall back to existing non-antimeridian flow
+      return queryRegionTiled(
+        this.variable,
+        geometry,
+        querySelector,
+        this.zarrStore,
+        this.crs,
+        this.xyLimits,
+        level,
+        this.tileSize,
+        transforms,
+        options
+      )
+    }
 
     return queryRegionTiled(
       this.variable,
-      geometry,
+      processedGeometry,
       querySelector,
       this.zarrStore,
       this.crs,
       this.xyLimits,
       level,
       this.tileSize,
-      {
-        scaleFactor: desc.scaleFactor,
-        addOffset: desc.addOffset,
-        fillValue: desc.fill_value,
-      },
-      options
+      transforms,
+      options,
+      wrappedBbox
     )
   }
 }

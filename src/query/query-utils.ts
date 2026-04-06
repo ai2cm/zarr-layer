@@ -19,12 +19,34 @@ import {
   type MercatorBounds,
 } from '../map-utils'
 import type { Bounds, CRS } from '../types'
-import type { BoundingBox, QueryGeometry } from './types'
+import type { BoundingBox, QueryGeometry, GeoJSONMultiPolygon } from './types'
 import {
   createWGS84ToSourceTransformer,
   sourceCRSToPixel,
   pixelToSourceCRS,
 } from '../projection-utils'
+
+/** Pixel rectangle with exclusive max bounds. */
+export interface PixelRect {
+  minX: number
+  maxX: number
+  minY: number
+  maxY: number
+}
+
+/**
+ * Check if a raster's own extent crosses the antimeridian (EPSG:4326 only).
+ * Returns true when the two-strip antimeridian query path is unsupported.
+ */
+export function rasterExtentCrossesAntimeridian(
+  crs: CRS,
+  xyLimits?: XYLimits | null
+): boolean {
+  if (crs !== 'EPSG:4326' || !xyLimits) return false
+  return (
+    xyLimits.xMin > xyLimits.xMax || xyLimits.xMax > 180 || xyLimits.xMin < -180
+  )
+}
 
 /** Cached transformer type for reuse across multiple pixelToLatLon calls */
 export type CachedTransformer = ReturnType<
@@ -254,6 +276,65 @@ export function computeBoundingBox(geometry: QueryGeometry): BoundingBox {
 }
 
 /**
+ * Compute the Y pixel range for a south/north lat extent against raster bounds.
+ * Handles both EPSG:4326 (linear latitude) and Mercator (normalized coords).
+ * Returns null if no overlap.
+ */
+function computeYPixelRange(
+  south: number,
+  north: number,
+  bounds: MercatorBounds,
+  height: number,
+  crs: CRS,
+  latIsAscending?: boolean
+): { yStart: number; yEnd: number } | null {
+  if (
+    crs === 'EPSG:4326' &&
+    bounds.latMin !== undefined &&
+    bounds.latMax !== undefined
+  ) {
+    const latRange = bounds.latMax - bounds.latMin
+    if (latRange === 0) return null
+    const clampedNorth = Math.min(Math.max(north, bounds.latMin), bounds.latMax)
+    const clampedSouth = Math.min(Math.max(south, bounds.latMin), bounds.latMax)
+    const toFrac = (lat: number) =>
+      latIsAscending
+        ? (lat - bounds.latMin!) / latRange
+        : (bounds.latMax! - lat) / latRange
+    const yFracMin = Math.min(toFrac(clampedNorth), toFrac(clampedSouth))
+    const yFracMax = Math.max(toFrac(clampedNorth), toFrac(clampedSouth))
+    const yStart = Math.min(
+      Math.max(0, Math.floor(yFracMin * height)),
+      height - 1
+    )
+    const yEnd = Math.min(
+      height,
+      Math.max(Math.ceil(yFracMax * height), yStart + 1)
+    )
+    if (yEnd <= yStart) return null
+    return { yStart, yEnd }
+  }
+
+  // Mercator
+  const normNorth = latToMercatorNorm(north)
+  const normSouth = latToMercatorNorm(south)
+  const overlapY0 = Math.max(bounds.y0, Math.min(normNorth, normSouth))
+  const overlapY1 = Math.min(bounds.y1, Math.max(normNorth, normSouth))
+  if (overlapY1 < overlapY0) return null
+  const rawMinY = Math.floor(
+    ((overlapY0 - bounds.y0) / (bounds.y1 - bounds.y0)) * height
+  )
+  const rawMaxY = Math.ceil(
+    ((overlapY1 - bounds.y0) / (bounds.y1 - bounds.y0)) * height
+  )
+  if (rawMaxY <= 0 || rawMinY >= height) return null
+  const yStart = Math.min(Math.max(0, rawMinY), height - 1)
+  const yEnd = Math.min(height, Math.max(rawMaxY, yStart + 1))
+  if (yEnd <= yStart) return null
+  return { yStart, yEnd }
+}
+
+/**
  * Computes pixel bounds from a geometry's bounding box.
  * Returns the pixel range [minX, maxX, minY, maxY] that covers the geometry.
  * Supports custom projections via proj4.
@@ -268,7 +349,7 @@ export function computePixelBoundsFromGeometry(
   proj4def?: string | null,
   sourceBounds?: Bounds | null,
   cachedTransformer?: CachedTransformer
-): { minX: number; maxX: number; minY: number; maxY: number } | null {
+): PixelRect | null {
   const bbox = computeBoundingBox(geometry)
 
   // If proj4 is provided, use proj4 to transform bbox
@@ -337,73 +418,31 @@ export function computePixelBoundsFromGeometry(
     return { minX: xStart, maxX: xEnd, minY: yStart, maxY: yEnd }
   }
 
-  // Convert bbox corners to mercator normalized coords
+  // Y pixel range (shared helper for both CRS types)
+  const yRange = computeYPixelRange(
+    bbox.south,
+    bbox.north,
+    bounds,
+    height,
+    crs,
+    latIsAscending
+  )
+  if (!yRange) return null
+
+  // X pixel range (uses mercator norm for both CRS types)
   const polyX0 = lonToMercatorNorm(bbox.west)
   const polyX1 = lonToMercatorNorm(bbox.east)
-  const polyY0 = latToMercatorNorm(bbox.north)
-  const polyY1 = latToMercatorNorm(bbox.south)
-
-  // Compute overlap with image bounds
   const overlapX0 = Math.max(bounds.x0, Math.min(polyX0, polyX1))
   const overlapX1 = Math.min(bounds.x1, Math.max(polyX0, polyX1))
+  if (overlapX1 < overlapX0) return null
 
-  let xStart: number
-  let xEnd: number
-  let yStart: number
-  let yEnd: number
+  const rawMinX = ((overlapX0 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
+  const rawMaxX = ((overlapX1 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
+  const xStart = Math.min(Math.max(0, Math.floor(rawMinX)), width - 1)
+  const xEnd = Math.min(width, Math.max(Math.ceil(rawMaxX), xStart + 1))
+  if (xEnd <= xStart) return null
 
-  if (
-    crs === 'EPSG:4326' &&
-    bounds.latMin !== undefined &&
-    bounds.latMax !== undefined
-  ) {
-    // For equirectangular data, compute Y overlap in linear latitude space
-    const latMax = bounds.latMax
-    const latMin = bounds.latMin
-    const clampedNorth = Math.min(Math.max(bbox.north, latMin), latMax)
-    const clampedSouth = Math.min(Math.max(bbox.south, latMin), latMax)
-
-    const latRange = latMax - latMin
-    if (latRange === 0) return null
-
-    const toFrac = (latVal: number) =>
-      latIsAscending
-        ? (latVal - latMin) / latRange
-        : (latMax - latVal) / latRange
-    const yStartFracRaw = toFrac(clampedNorth)
-    const yEndFracRaw = toFrac(clampedSouth)
-    const yFracMin = Math.min(yStartFracRaw, yEndFracRaw)
-    const yFracMax = Math.max(yStartFracRaw, yEndFracRaw)
-
-    if (overlapX1 < overlapX0 || yFracMax < yFracMin) return null
-
-    const minX = ((overlapX0 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
-    const maxX = ((overlapX1 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
-
-    xStart = Math.min(Math.max(0, Math.floor(minX)), width - 1)
-    xEnd = Math.min(width, Math.max(Math.ceil(maxX), xStart + 1))
-    yStart = Math.min(Math.max(0, Math.floor(yFracMin * height)), height - 1)
-    yEnd = Math.min(height, Math.max(Math.ceil(yFracMax * height), yStart + 1))
-  } else {
-    const overlapY0 = Math.max(bounds.y0, Math.min(polyY0, polyY1))
-    const overlapY1 = Math.min(bounds.y1, Math.max(polyY0, polyY1))
-
-    if (overlapX1 < overlapX0 || overlapY1 < overlapY0) return null
-
-    const minX = ((overlapX0 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
-    const maxX = ((overlapX1 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
-    const minY = ((overlapY0 - bounds.y0) / (bounds.y1 - bounds.y0)) * height
-    const maxY = ((overlapY1 - bounds.y0) / (bounds.y1 - bounds.y0)) * height
-
-    xStart = Math.min(Math.max(0, Math.floor(minX)), width - 1)
-    xEnd = Math.min(width, Math.max(Math.ceil(maxX), xStart + 1))
-    yStart = Math.min(Math.max(0, Math.floor(minY)), height - 1)
-    yEnd = Math.min(height, Math.max(Math.ceil(maxY), yStart + 1))
-  }
-
-  if (xEnd <= xStart || yEnd <= yStart) return null
-
-  return { minX: xStart, maxX: xEnd, minY: yStart, maxY: yEnd }
+  return { minX: xStart, maxX: xEnd, minY: yRange.yStart, maxY: yRange.yEnd }
 }
 
 import {
@@ -881,4 +920,584 @@ export function getTilesForPolygon(
 ): TileTuple[] {
   const bbox = computeBoundingBox(geometry)
   return getTilesForBoundingBox(bbox, zoom, crs, xyLimits)
+}
+
+// ---------------------------------------------------------------------------
+// Antimeridian preprocessing
+// ---------------------------------------------------------------------------
+
+/**
+ * Bounding box that correctly represents antimeridian-crossing regions.
+ * When crossesAntimeridian is true, west > east (e.g. west=170, east=-170).
+ */
+export interface WrappedBoundingBox {
+  west: number // in [-180, 180]
+  east: number // in [-180, 180]
+  south: number
+  north: number
+  crossesAntimeridian: boolean
+}
+
+/**
+ * Wrap a longitude into (-180, 180], preserving 180 (not folding to -180).
+ */
+function wrapLon(lon: number): number {
+  let w = (lon + 180) % 360
+  if (w < 0) w += 360
+  w -= 180
+  // Preserve 180: the modulo maps 180 to -180, but we want 180
+  if (w === -180 && lon > 0) w = 180
+  return w
+}
+
+/**
+ * Ensure a ring is closed (last vertex equals first vertex).
+ */
+function closeRing(ring: number[][]): number[][] {
+  if (ring.length < 2) return ring
+  const first = ring[0]
+  const last = ring[ring.length - 1]
+  if (first[0] !== last[0] || first[1] !== last[1]) {
+    return [...ring, [first[0], first[1]]]
+  }
+  return ring
+}
+
+/**
+ * Compute the centroid longitude of a closed ring (excludes closing vertex).
+ */
+function ringCentroidLon(ring: number[][]): number {
+  const count = Math.max(1, ring.length - 1)
+  let sum = 0
+  for (let i = 0; i < count; i++) {
+    sum += ring[i][0]
+  }
+  return sum / count
+}
+
+/**
+ * Find the single ±360° shift that places centroidLon closest to targetCenter.
+ */
+function nearestLonShift(centroidLon: number, targetCenter: number): number {
+  return Math.round((targetCenter - centroidLon) / 360) * 360
+}
+
+/**
+ * Shift all ring longitudes by a fixed offset.
+ */
+function shiftRingsLon(rings: number[][][], shift: number): number[][][] {
+  return rings.map((ring) => ring.map(([lon, lat]) => [lon + shift, lat]))
+}
+
+/**
+ * Scan closed rings for longitude range (excludes closing vertices).
+ */
+function lonRangeOfRings(rings: number[][][]): {
+  min: number
+  allAbove180: boolean
+} {
+  let min = Infinity
+  let allAbove180 = true
+  for (const ring of rings) {
+    for (let i = 0; i < ring.length - 1; i++) {
+      const lon = ring[i][0]
+      if (lon < min) min = lon
+      if (lon <= 180) allAbove180 = false
+    }
+  }
+  return { min, allAbove180 }
+}
+
+/**
+ * Compute the shift needed to canonicalize a longitude range:
+ * +360 if any lon < -180, -360 if all lons > 180, else 0.
+ */
+function canonicalLonShift(rings: number[][][]): number {
+  const { min, allAbove180 } = lonRangeOfRings(rings)
+  if (min < -180) return 360
+  if (allAbove180) return -360
+  return 0
+}
+
+/**
+ * Apply canonical longitude shift to a ring array.
+ */
+function canonicalizeLonRange(rings: number[][][]): number[][][] {
+  const shift = canonicalLonShift(rings)
+  return shift !== 0 ? shiftRingsLon(rings, shift) : rings
+}
+
+/**
+ * Normalize a polygon's ring longitudes for continuity.
+ *
+ * The outer ring (index 0) determines the unwrap direction. Holes (index 1+)
+ * are shifted by a single per-ring ±360 offset to match the outer ring's
+ * coordinate frame. If the result extends below -180, all rings are shifted
+ * +360 to canonicalize to eastward extension.
+ *
+ * Output rings are always closed.
+ */
+export function normalizePolygonRings(rings: number[][][]): number[][][] {
+  if (rings.length === 0) return rings
+
+  // Check if any vertex in any ring is outside [-180, 180] (explicit crossing)
+  let hasExplicit = false
+  for (const ring of rings) {
+    for (const [lon] of ring) {
+      if (lon > 180 || lon < -180) {
+        hasExplicit = true
+        break
+      }
+    }
+    if (hasExplicit) break
+  }
+
+  // All vertices in [-180, 180]: literal interpretation, just ensure rings are closed
+  if (!hasExplicit) {
+    return rings.map((ring) => closeRing(ring.map(([lon, lat]) => [lon, lat])))
+  }
+
+  // Explicit crossing: normalize outer ring for longitude continuity
+  const outer = normalizeRingLongitudes(rings[0])
+
+  // Align hole rings to outer ring's frame with a single per-ring ±360 shift
+  const outerCenter = ringCentroidLon(outer)
+  const result: number[][][] = [outer]
+  for (let r = 1; r < rings.length; r++) {
+    const hole = normalizeRingLongitudes(rings[r])
+    const shift = nearestLonShift(ringCentroidLon(hole), outerCenter)
+    result.push(
+      shift !== 0 ? hole.map(([lon, lat]) => [lon + shift, lat]) : hole
+    )
+  }
+
+  return canonicalizeLonRange(result)
+}
+
+/**
+ * Apply per-edge longitude unwrapping for continuity.
+ *
+ * Only called when the caller has already verified explicit out-of-range
+ * coordinates (|lon| > 180). Returns a new closed ring.
+ */
+function normalizeRingLongitudes(ring: number[][]): number[][] {
+  if (ring.length < 2) return ring.map(([lon, lat]) => [lon, lat])
+
+  const result: number[][] = [[ring[0][0], ring[0][1]]]
+  let prevLon = ring[0][0]
+
+  for (let i = 1; i < ring.length; i++) {
+    let lon = ring[i][0]
+    const lat = ring[i][1]
+    const delta = lon - prevLon
+    if (delta > 180) {
+      lon -= 360
+    } else if (delta < -180) {
+      lon += 360
+    }
+    result.push([lon, lat])
+    prevLon = lon
+  }
+
+  return closeRing(result)
+}
+
+/**
+ * Compute a WrappedBoundingBox from normalized polygon rings.
+ * Input rings must already be processed by normalizePolygonRings.
+ * Uses wrap-normalization (not clamping) for crossings.
+ */
+export function computeWrappedBboxFromNormalized(
+  normalizedRings: number[][][]
+): WrappedBoundingBox {
+  let rawMin = Infinity
+  let rawMax = -Infinity
+  let south = Infinity
+  let north = -Infinity
+
+  for (const ring of normalizedRings) {
+    for (let i = 0; i < ring.length - 1; i++) {
+      const lon = ring[i][0]
+      const lat = ring[i][1]
+      if (lon < rawMin) rawMin = lon
+      if (lon > rawMax) rawMax = lon
+      if (lat < south) south = lat
+      if (lat > north) north = lat
+    }
+  }
+
+  if (rawMin >= -180 && rawMax <= 180) {
+    return {
+      west: rawMin,
+      east: rawMax,
+      south,
+      north,
+      crossesAntimeridian: false,
+    }
+  }
+
+  // Crossing: rawMax > 180 (westward was canonicalized to eastward)
+  const west = wrapLon(rawMin)
+  const east = wrapLon(rawMax)
+  // Guard: if wrapping collapses the crossing (e.g. rawMin = -180 exactly),
+  // treat as non-crossing. This can't happen for valid simple polygons after
+  // canonicalization, but defends the west > east invariant.
+  if (west <= east) {
+    return { west, east, south, north, crossesAntimeridian: false }
+  }
+  return { west, east, south, north, crossesAntimeridian: true }
+}
+
+/**
+ * Sutherland-Hodgman clip of a closed ring against a half-plane.
+ *
+ * keepBelow=true:  keep lon <= clipLon
+ * keepBelow=false: keep lon > clipLon (output lons shifted by -360)
+ *
+ * Returns a closed ring (possibly empty or degenerate).
+ */
+export function clipRingToHalfPlane(
+  ring: number[][],
+  clipLon: number,
+  keepBelow: boolean
+): number[][] {
+  if (ring.length < 4) return [] // need at least a triangle (3 vertices + close)
+
+  const output: number[][] = []
+  const isInside = keepBelow
+    ? (lon: number) => lon <= clipLon
+    : (lon: number) => lon > clipLon
+
+  // Walk edges of the closed ring (ring[i] -> ring[i+1])
+  for (let i = 0; i < ring.length - 1; i++) {
+    const [lon0, lat0] = ring[i]
+    const [lon1, lat1] = ring[i + 1]
+    const in0 = isInside(lon0)
+    const in1 = isInside(lon1)
+
+    if (in0 && in1) {
+      // Both inside: output p1
+      output.push([lon1, lat1])
+    } else if (in0 && !in1) {
+      // Inside -> outside: output intersection
+      const t = (clipLon - lon0) / (lon1 - lon0)
+      const latI = lat0 + t * (lat1 - lat0)
+      output.push([clipLon, latI])
+    } else if (!in0 && in1) {
+      // Outside -> inside: output intersection, then p1
+      const t = (clipLon - lon0) / (lon1 - lon0)
+      const latI = lat0 + t * (lat1 - lat0)
+      output.push([clipLon, latI])
+      output.push([lon1, lat1])
+    }
+    // Both outside: output nothing
+  }
+
+  if (output.length < 3) return []
+
+  // Shift longitudes for the "outside" half
+  const shifted = !keepBelow
+    ? output.map(([lon, lat]) => [lon - 360, lat])
+    : output
+
+  return closeRing(shifted)
+}
+
+/**
+ * Clip a normalized polygon (outer + holes) at the antimeridian.
+ *
+ * Input rings must already be processed by normalizePolygonRings
+ * (crossing is always > 180, never < -180).
+ *
+ * Returns west (lon <= 180) and east (lon > 180, shifted -360) ring sets.
+ * Degenerate rings (< 3 unique vertices) are dropped.
+ */
+export function clipNormalizedPolygonAtAntimeridian(
+  normalizedRings: number[][][]
+): { west: number[][][]; east: number[][][] } {
+  // Check if any vertex lon > 180; if not, no crossing
+  let crosses = false
+  for (const ring of normalizedRings) {
+    for (let i = 0; i < ring.length - 1; i++) {
+      if (ring[i][0] > 180) {
+        crosses = true
+        break
+      }
+    }
+    if (crosses) break
+  }
+
+  if (!crosses) {
+    return { west: normalizedRings, east: [] }
+  }
+
+  const west: number[][][] = []
+  const east: number[][][] = []
+
+  for (const ring of normalizedRings) {
+    const w = clipRingToHalfPlane(ring, 180, true)
+    const e = clipRingToHalfPlane(ring, 180, false)
+    if (w.length >= 4) west.push(w)
+    if (e.length >= 4) east.push(e)
+  }
+
+  return { west, east }
+}
+
+/**
+ * Align independently-normalized MultiPolygon members into one shared unwrap frame.
+ *
+ * Uses gap detection across all outer rings to find the optimal unwrap center,
+ * then shifts each member by a single ±360 offset (preserving internal continuity).
+ * Applies eastward canonicalization if the shared range extends below -180.
+ */
+export function alignMultiPolygonMembers(
+  members: number[][][][]
+): number[][][][] {
+  if (members.length <= 1) return members
+
+  // Collect all outer ring lons, wrap-normalized to [-180, 180]
+  const wrappedLons: number[] = []
+  for (const member of members) {
+    const outer = member[0]
+    for (let i = 0; i < outer.length - 1; i++) {
+      wrappedLons.push(wrapLon(outer[i][0]))
+    }
+  }
+  wrappedLons.sort((a, b) => a - b)
+
+  // Find the largest gap between consecutive sorted lons (including wrap-around)
+  let maxGap = 0
+  let gapEndIndex = 0
+  for (let i = 1; i < wrappedLons.length; i++) {
+    const gap = wrappedLons[i] - wrappedLons[i - 1]
+    if (gap > maxGap) {
+      maxGap = gap
+      gapEndIndex = i
+    }
+  }
+  // Check the wrap-around gap
+  const wrapGap = wrappedLons[0] + 360 - wrappedLons[wrappedLons.length - 1]
+  if (wrapGap > maxGap) {
+    maxGap = wrapGap
+    gapEndIndex = 0
+  }
+
+  // The unwrap center is opposite the largest gap (180° from the gap's midpoint)
+  const gapStart =
+    gapEndIndex === 0
+      ? wrappedLons[wrappedLons.length - 1]
+      : wrappedLons[gapEndIndex - 1]
+  const gapEnd = wrappedLons[gapEndIndex]
+  const gapMidpoint =
+    gapEndIndex === 0 ? (gapStart + gapEnd + 360) / 2 : (gapStart + gapEnd) / 2
+  const center = wrapLon(gapMidpoint + 180)
+
+  // Shift each member by a single ±360 offset based on its outer ring centroid
+  const aligned: number[][][][] = members.map((member) => {
+    const shift = nearestLonShift(ringCentroidLon(member[0]), center)
+    return shift !== 0
+      ? member.map((ring) => ring.map(([lon, lat]) => [lon + shift, lat]))
+      : member
+  })
+
+  // Canonicalize: shift all if any lon < -180, or all > 180
+  const shift = canonicalLonShift(aligned.flatMap((m) => m))
+  if (shift !== 0) {
+    return aligned.map((member) => shiftRingsLon(member, shift))
+  }
+
+  return aligned
+}
+
+/**
+ * Preprocess a query geometry for antimeridian handling.
+ *
+ * For Polygon/MultiPolygon: normalizes ring longitudes, computes a
+ * WrappedBoundingBox, and clips at ±180 if crossing. For Point: returns as-is.
+ *
+ * Standard CRS only (EPSG:3857, EPSG:4326). Proj4 callers should skip this.
+ */
+export function preprocessQueryGeometry(geometry: QueryGeometry): {
+  geometry: QueryGeometry
+  bbox: WrappedBoundingBox
+} {
+  if (geometry.type === 'Point') {
+    const [lon, lat] = geometry.coordinates
+    return {
+      geometry,
+      bbox: {
+        west: lon,
+        east: lon,
+        south: lat,
+        north: lat,
+        crossesAntimeridian: false,
+      },
+    }
+  }
+
+  if (geometry.type === 'Polygon') {
+    const normalized = normalizePolygonRings(geometry.coordinates)
+    const bbox = computeWrappedBboxFromNormalized(normalized)
+
+    if (!bbox.crossesAntimeridian) {
+      return { geometry: { type: 'Polygon', coordinates: normalized }, bbox }
+    }
+
+    const { west, east } = clipNormalizedPolygonAtAntimeridian(normalized)
+    const polygons: number[][][][] = []
+    if (west.length > 0) polygons.push(west)
+    if (east.length > 0) polygons.push(east)
+
+    if (polygons.length === 0) {
+      return { geometry: { type: 'Polygon', coordinates: normalized }, bbox }
+    }
+
+    return {
+      geometry: {
+        type: 'MultiPolygon',
+        coordinates: polygons,
+      } as GeoJSONMultiPolygon,
+      bbox,
+    }
+  }
+
+  // MultiPolygon: normalize each member, align, compute combined bbox, clip
+  const normalizedMembers = geometry.coordinates.map((memberRings) =>
+    normalizePolygonRings(memberRings)
+  )
+  const aligned = alignMultiPolygonMembers(normalizedMembers)
+
+  // Compute combined bbox from all aligned rings
+  const allRings: number[][][] = []
+  for (const member of aligned) {
+    for (const ring of member) {
+      allRings.push(ring)
+    }
+  }
+  const bbox = computeWrappedBboxFromNormalized(allRings)
+
+  if (!bbox.crossesAntimeridian) {
+    return {
+      geometry: {
+        type: 'MultiPolygon',
+        coordinates: aligned,
+      } as GeoJSONMultiPolygon,
+      bbox,
+    }
+  }
+
+  // Clip each member
+  const resultPolygons: number[][][][] = []
+  for (const member of aligned) {
+    const { west, east } = clipNormalizedPolygonAtAntimeridian(member)
+    if (west.length > 0) resultPolygons.push(west)
+    if (east.length > 0) resultPolygons.push(east)
+  }
+
+  if (resultPolygons.length === 0) {
+    return {
+      geometry: {
+        type: 'MultiPolygon',
+        coordinates: aligned,
+      } as GeoJSONMultiPolygon,
+      bbox,
+    }
+  }
+
+  return {
+    geometry: {
+      type: 'MultiPolygon',
+      coordinates: resultPolygons,
+    } as GeoJSONMultiPolygon,
+    bbox,
+  }
+}
+
+/**
+ * Derive two pixel rectangles from a crossing WrappedBoundingBox.
+ *
+ * West strip: [westPx, width)  — covers lon [bbox.west, 180]
+ * East strip: [0, eastPx)      — covers lon [-180, bbox.east]
+ *
+ * Uses standard-CRS floor/ceil/clamp conventions from computePixelBoundsFromGeometry.
+ * Only valid for standard CRS (EPSG:3857, EPSG:4326), not proj4.
+ */
+export function wrappedBboxToPixelSpans(
+  bbox: WrappedBoundingBox,
+  bounds: MercatorBounds,
+  width: number,
+  height: number,
+  crs: CRS,
+  latIsAscending?: boolean
+): { west?: PixelRect; east?: PixelRect } {
+  // Y range shared by both strips
+  const yRange = computeYPixelRange(
+    bbox.south,
+    bbox.north,
+    bounds,
+    height,
+    crs,
+    latIsAscending
+  )
+  if (!yRange) return {}
+  const { yStart, yEnd } = yRange
+
+  const xRange = bounds.x1 - bounds.x0
+
+  const computeStrip = (
+    normMin: number,
+    normMax: number
+  ): PixelRect | undefined => {
+    const xFracMin = (normMin - bounds.x0) / xRange
+    const xFracMax = (normMax - bounds.x0) / xRange
+    // Raw pixel range before clamping
+    const rawMinX = Math.floor(xFracMin * width)
+    const rawMaxX = Math.ceil(xFracMax * width)
+    // Check for actual overlap with [0, width) before clamping
+    if (rawMaxX <= 0 || rawMinX >= width) return undefined
+    const minX = Math.max(0, rawMinX)
+    const maxX = Math.min(width, rawMaxX)
+    if (maxX <= minX) return undefined
+    return { minX, maxX, minY: yStart, maxY: yEnd }
+  }
+
+  // West strip: [bbox.west, 180]
+  const westNormMin = lonToMercatorNorm(bbox.west)
+  const westNormMax = lonToMercatorNorm(180)
+  // East strip: [-180, bbox.east]
+  const eastNormMin = lonToMercatorNorm(-180)
+  const eastNormMax = lonToMercatorNorm(bbox.east)
+
+  const result: { west?: PixelRect; east?: PixelRect } = {}
+
+  const westStrip = computeStrip(westNormMin, westNormMax)
+  if (westStrip) result.west = westStrip
+  const eastStrip = computeStrip(eastNormMin, eastNormMax)
+  if (eastStrip) result.east = eastStrip
+
+  return result
+}
+
+/**
+ * Check if a geometry contains explicit out-of-range coordinates (|lon| > 180).
+ *
+ * This does NOT determine whether the geometry actually crosses the antimeridian —
+ * coords like [200, 210] are out-of-range but canonicalize to a non-crossing
+ * [-160, -150]. Use preprocessQueryGeometry().bbox.crossesAntimeridian for that.
+ */
+export function hasOutOfRangeCoordinates(geometry: QueryGeometry): boolean {
+  if (geometry.type === 'Point') {
+    const [lon] = geometry.coordinates
+    return lon > 180 || lon < -180
+  }
+
+  const checkRing = (ring: number[][]): boolean =>
+    ring.some(([lon]) => lon > 180 || lon < -180)
+
+  if (geometry.type === 'Polygon') {
+    return geometry.coordinates.some(checkRing)
+  }
+
+  return geometry.coordinates.some((poly) => poly.some(checkRing))
 }

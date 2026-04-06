@@ -20,12 +20,14 @@ import type {
 } from './types'
 import {
   getTilesForPolygon,
+  getTilesForBoundingBox,
   tilePixelToLatLon,
   pixelToLatLon,
   transformGeometryToPixelSpace,
   transformGeometryToTilePixelSpace,
   buildScanlineTable,
   CachedTransformer,
+  type WrappedBoundingBox,
 } from './query-utils'
 import { createWGS84ToSourceTransformer } from '../projection-utils'
 import { setObjectValues, getChunks, getPointValues } from './selector-utils'
@@ -43,7 +45,7 @@ import { SPATIAL_DIMENSION_ALIASES } from '../constants'
  * Uses dimIndices (which incorporates spatialDimensions overrides) when available,
  * falling back to alias matching on the raw dimension names.
  */
-function findSpatialDimNames(
+export function findSpatialDimNames(
   dimensions: string[],
   isProj4: boolean,
   dimIndices?: DimIndicesProps
@@ -124,7 +126,8 @@ export async function queryRegionTiled(
   levelIndex: number,
   tileSize: number,
   transforms?: QueryTransformOptions,
-  options?: QueryOptions
+  options?: QueryOptions,
+  wrappedBbox?: WrappedBoundingBox
 ): Promise<QueryResult> {
   const { signal, includeSpatialCoordinates = true } = options ?? {}
   const desc = zarrStore.describe()
@@ -210,7 +213,9 @@ export async function queryRegionTiled(
   const actualZoom = parseLevelZoom(levelPath, levelIndex)
 
   // Get tiles that intersect the polygon
-  const tiles = getTilesForPolygon(geometry, actualZoom, crs, xyLimits)
+  const tiles = wrappedBbox
+    ? getTilesForBoundingBox(wrappedBbox, actualZoom, crs, xyLimits)
+    : getTilesForPolygon(geometry, actualZoom, crs, xyLimits)
   if (tiles.length === 0) return buildResult()
 
   checkAborted(signal)
