@@ -283,7 +283,7 @@ const Controls = () => {
   const setPointResult = useAppStore((state) => state.setPointResult)
   const themedColormap = useThemedColormap(colormap)
   const [queryInFlight, setQueryInFlight] = useState(false)
-  const queryGenRef = useRef(0)
+  const abortRef = useRef<AbortController | null>(null)
 
   const layerConfig = useMemo(
     () => datasetModule.buildLayerProps(datasetState),
@@ -299,8 +299,8 @@ const Controls = () => {
     (currentBand === 'tavg_range' || currentBand === 'prec_range')
 
   useEffect(() => {
-    // Clear query results when switching dataset or selector to avoid stale display
-    queryGenRef.current++
+    // Abort in-flight query and clear results when switching dataset or selector
+    abortRef.current?.abort()
     setPointResult(null)
     setRegionResult(null)
   }, [datasetId, datasetState, setPointResult, setRegionResult])
@@ -381,7 +381,12 @@ const Controls = () => {
   const handleViewportQuery = async () => {
     if (viewportQueryDisabled || queryInFlight) return
     if (!mapInstance || !zarrLayer || !mapInstance.getBounds) return
-    const gen = queryGenRef.current
+
+    // Abort any previous query
+    abortRef.current?.abort()
+    const controller = new AbortController()
+    abortRef.current = controller
+
     setQueryInFlight(true)
     try {
       const bounds = mapInstance.getBounds()
@@ -389,7 +394,6 @@ const Controls = () => {
         throw new Error('Viewport query is not available')
       }
       const geometry = boundsToGeometry(bounds)
-      console.log('geometry', geometry)
       // If in range mode, query only the selected month range
       let querySelector = layerConfig.selector
       if (isRangeBand && monthStart !== null && monthEnd !== null) {
@@ -400,19 +404,17 @@ const Controls = () => {
         // Get the base band (tavg or prec) from current selection
         const baseBand = currentBand === 'tavg_range' ? 'tavg' : 'prec'
         querySelector = { band: baseBand, month: monthRange }
-        console.log(
-          `Querying range mode: band=${baseBand}, months=${monthRange.join(
-            ','
-          )}`
-        )
       }
 
-      const result = await zarrLayer.queryData(geometry, querySelector)
-      if (gen !== queryGenRef.current) return
+      const result = (await zarrLayer.queryData(geometry, querySelector, {
+        signal: controller.signal,
+        includeSpatialCoordinates: false,
+      })) as QueryResult
       setRegionResult(result)
     } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return
       console.error('Viewport query failed', error)
-      if (gen === queryGenRef.current) setRegionResult(null)
+      setRegionResult(null)
     } finally {
       setQueryInFlight(false)
     }

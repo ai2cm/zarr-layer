@@ -38,7 +38,7 @@ import {
   isGlobeProjection as checkGlobeProjection,
 } from './map-utils'
 import { MAPBOX_IDENTITY_MATRIX } from './mapbox-utils'
-import type { QueryGeometry, QueryResult } from './query/types'
+import type { QueryGeometry, QueryOptions, QueryResult } from './query/types'
 import { SPATIAL_DIM_NAMES } from './constants'
 
 type MapboxInternals = {
@@ -922,15 +922,16 @@ export class ZarrLayer {
    */
   async queryData(
     geometry: QueryGeometry,
-    selector?: Selector
+    selector?: Selector,
+    options?: QueryOptions
   ): Promise<QueryResult> {
     if (!this.mode?.queryData) {
       return {
         [this.variable]: [],
-        dimensions: ['lat', 'lon'],
-        coordinates: { lat: [], lon: [] },
+        dimensions: [],
+        coordinates: {},
       }
     }
-    return this.mode.queryData(geometry, selector)
+    return this.mode.queryData(geometry, selector, options)
   }
 }

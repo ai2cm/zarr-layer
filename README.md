@@ -266,7 +266,18 @@ const result = await layer.queryData({
 // }
 ```
 
-**Note:** Query results match rendered values (`scale_factor`/`add_offset` applied, `fillValue`/NaN filtered). For datasets rendered via `proj4` reprojection, queries sample the underlying source grid; because reprojection/resampling occurs for display, a visual pixel click may not align perfectly with the nearest source pixel.
+Datasets using a custom projection (via the `proj4` option) return coordinates in the source coordinate system, with keys matching the store's axis names (e.g. `y`/`x`). All other datasets (EPSG:4326, EPSG:3857) return `lat`/`lon` keys with WGS84 degree values.
+
+You can pass a third `options` argument to control query behavior:
+
+```ts
+const result = await layer.queryData(geometry, selector, {
+  signal: abortController.signal, // cancel in-flight query
+  includeSpatialCoordinates: false, // omit per-pixel coordinates for slimmer results
+})
+```
+
+**Note:** Query results match rendered values (`scale_factor`/`add_offset` applied, `fillValue`/NaN filtered).
 
 ## authentication
 

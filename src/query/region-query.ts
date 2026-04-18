@@ -7,33 +7,85 @@
  */
 
 import type { MercatorBounds, XYLimits } from '../map-utils'
-import {
-  latToMercatorNorm,
-  lonToMercatorNorm,
-  mercatorNormToLat,
-  mercatorNormToLon,
-  parseLevelZoom,
-  tileToKey,
-} from '../map-utils'
+import { parseLevelZoom, tileToKey } from '../map-utils'
 import type { ZarrStore } from '../zarr-store'
-import type { Bounds, CRS, Selector } from '../types'
+import type { Bounds, CRS, DimIndicesProps, Selector } from '../types'
+import { pixelToSourceCRS } from '../projection-utils'
 import type {
   QueryGeometry,
+  QueryOptions,
   QueryResult,
   QueryDataValues,
   QueryTransformOptions,
 } from './types'
 import {
-  computeBoundingBox,
   getTilesForPolygon,
-  pixelIntersectsGeometrySingle,
-  pixelIntersectsGeometryTiled,
+  getTilesForBoundingBox,
   tilePixelToLatLon,
   pixelToLatLon,
+  transformGeometryToPixelSpace,
+  transformGeometryToTilePixelSpace,
+  buildScanlineTable,
   CachedTransformer,
+  type WrappedBoundingBox,
 } from './query-utils'
 import { createWGS84ToSourceTransformer } from '../projection-utils'
 import { setObjectValues, getChunks, getPointValues } from './selector-utils'
+import { SPATIAL_DIMENSION_ALIASES } from '../constants'
+
+/**
+ * Determine spatial coordinate keys for query results.
+ *
+ * For proj4 data we emit source-CRS values, so keys match the store's
+ * original axis names (e.g. 'y'/'x' or 'projection_y_coordinate').
+ *
+ * For standard CRS the values are always WGS84 lat/lon (from pixelToLatLon),
+ * so keys are always 'lat'/'lon' regardless of what the store calls its axes.
+ *
+ * Uses dimIndices (which incorporates spatialDimensions overrides) when available,
+ * falling back to alias matching on the raw dimension names.
+ */
+export function findSpatialDimNames(
+  dimensions: string[],
+  isProj4: boolean,
+  dimIndices?: DimIndicesProps
+): {
+  yDim: string
+  xDim: string
+  /** The raw store dimension name for y, used to map resultDimensions */
+  yStoreDim: string
+  /** The raw store dimension name for x, used to map resultDimensions */
+  xStoreDim: string
+} {
+  // Resolve the actual store dimension names from dimIndices if available
+  const yStoreDim = dimIndices?.lat?.name ?? findByAlias(dimensions, 'lat')
+  const xStoreDim = dimIndices?.lon?.name ?? findByAlias(dimensions, 'lon')
+
+  if (!isProj4) {
+    return { yDim: 'lat', xDim: 'lon', yStoreDim, xStoreDim }
+  }
+  // For proj4, emit coordinates under the store's own axis names
+  return { yDim: yStoreDim, xDim: xStoreDim, yStoreDim, xStoreDim }
+}
+
+function findByAlias(dimensions: string[], axis: 'lat' | 'lon'): string {
+  const aliases = SPATIAL_DIMENSION_ALIASES[axis]
+  return dimensions.find((d) => aliases.includes(d.toLowerCase())) ?? axis
+}
+
+function isMultiValSelector(value: Selector[string]): boolean {
+  if (Array.isArray(value)) return true
+  if (value && typeof value === 'object' && 'selected' in value) {
+    return Array.isArray((value as any).selected)
+  }
+  return false
+}
+
+function checkAborted(signal?: AbortSignal) {
+  if (signal?.aborted) {
+    throw new DOMException('The operation was aborted.', 'AbortError')
+  }
+}
 
 /**
  * Apply scale_factor/add_offset transforms and filter invalid values.
@@ -73,8 +125,11 @@ export async function queryRegionTiled(
   xyLimits: XYLimits,
   levelIndex: number,
   tileSize: number,
-  transforms?: QueryTransformOptions
+  transforms?: QueryTransformOptions,
+  options?: QueryOptions,
+  wrappedBbox?: WrappedBoundingBox
 ): Promise<QueryResult> {
+  const { signal, includeSpatialCoordinates = true } = options ?? {}
   const desc = zarrStore.describe()
   const dimensions = desc.dimensions
   const coordinates = desc.coordinates
@@ -83,13 +138,6 @@ export async function queryRegionTiled(
 
   // Calculate result dimension based on selector
   // resultDim = total dims - (number of single-valued dims)
-  const isMultiValSelector = (value: Selector[string]) => {
-    if (Array.isArray(value)) return true
-    if (value && typeof value === 'object' && 'selected' in value) {
-      return Array.isArray((value as any).selected)
-    }
-    return false
-  }
   const singleValuedDims = Object.keys(selector).filter(
     (k) => !isMultiValSelector(selector[k])
   ).length
@@ -99,32 +147,31 @@ export async function queryRegionTiled(
   const useNestedResults = resultDim > 2
   let results: QueryDataValues = useNestedResults ? {} : []
 
-  const latCoords: number[] = []
-  const lonCoords: number[] = []
+  const { yDim, xDim, yStoreDim, xStoreDim } = findSpatialDimNames(
+    dimensions,
+    false,
+    desc.dimIndices
+  )
+  const yCoords: number[] = []
+  const xCoords: number[] = []
 
-  const mappedDimensions = dimensions.map((d) => {
-    const dimLower = d.toLowerCase()
-    if (['x', 'lon', 'longitude'].includes(dimLower)) return 'lon'
-    if (['y', 'lat', 'latitude'].includes(dimLower)) return 'lat'
-    return d
-  })
-
-  const resultDimensions = useNestedResults ? mappedDimensions : ['lat', 'lon']
+  // Map spatial dimensions in the result to the emitted coordinate keys
+  const resultDimensions = useNestedResults
+    ? dimensions.map((d) =>
+        d === yStoreDim ? yDim : d === xStoreDim ? xDim : d
+      )
+    : [yDim, xDim]
 
   const buildResultCoordinates = (): Record<string, (number | string)[]> => {
     const coords: Record<string, (number | string)[]> = {
-      lat: latCoords,
-      lon: lonCoords,
+      [yDim]: yCoords,
+      [xDim]: xCoords,
     }
 
     if (useNestedResults) {
-      const addDimCoordinates = (dim: string) => {
-        const dimLower = dim.toLowerCase()
-        if (
-          ['x', 'lon', 'longitude', 'y', 'lat', 'latitude'].includes(dimLower)
-        ) {
-          return
-        }
+      for (const dim of dimensions) {
+        // Skip spatial dimensions — they're already emitted as yDim/xDim
+        if (dim === yStoreDim || dim === xStoreDim) continue
 
         const sel = selector[dim]
         let values: (number | string)[] | undefined
@@ -144,12 +191,17 @@ export async function queryRegionTiled(
           coords[dim] = values
         }
       }
-
-      dimensions.forEach(addDimCoordinates)
     }
 
     return coords
   }
+
+  const buildResult = () =>
+    ({
+      [variable]: results,
+      dimensions: resultDimensions,
+      coordinates: buildResultCoordinates(),
+    } as QueryResult)
 
   // Get level path for chunk fetching
   const levelPath = zarrStore.levels[levelIndex]
@@ -161,16 +213,12 @@ export async function queryRegionTiled(
   const actualZoom = parseLevelZoom(levelPath, levelIndex)
 
   // Get tiles that intersect the polygon
-  const tiles = getTilesForPolygon(geometry, actualZoom, crs, xyLimits)
-  if (tiles.length === 0) {
-    // Return empty result in carbonplan/maps format
-    const result = {
-      [variable]: results,
-      dimensions: resultDimensions,
-      coordinates: buildResultCoordinates(),
-    } as QueryResult
-    return result
-  }
+  const tiles = wrappedBbox
+    ? getTilesForBoundingBox(wrappedBbox, actualZoom, crs, xyLimits)
+    : getTilesForPolygon(geometry, actualZoom, crs, xyLimits)
+  if (tiles.length === 0) return buildResult()
+
+  checkAborted(signal)
 
   // For each tile, determine which chunks we need based on selector and fetch them
   const tileChunkData = new Map<string, Map<string, Float32Array>>()
@@ -196,7 +244,11 @@ export async function queryRegionTiled(
       await Promise.all(
         chunksToFetch.map(async (chunkIndices) => {
           try {
-            const chunk = await zarrStore.getChunk(levelPath, chunkIndices)
+            const chunk = await zarrStore.getChunk(
+              levelPath,
+              chunkIndices,
+              signal ? { signal } : undefined
+            )
             // Make a proper copy to avoid buffer sharing issues
             const chunkData = new Float32Array(chunk.data as ArrayLike<number>)
 
@@ -204,6 +256,9 @@ export async function queryRegionTiled(
             const chunkKey = chunkIndices.join(',')
             chunkDataMap.set(chunkKey, chunkData)
           } catch (err) {
+            if (err instanceof DOMException && err.name === 'AbortError') {
+              throw err
+            }
             console.warn(
               `Failed to fetch chunk ${chunkIndices} for tile ${tileKey}:`,
               err
@@ -216,11 +271,21 @@ export async function queryRegionTiled(
     })
   )
 
-  // Iterate over tiles and pixels to extract values
+  // Iterate over tiles, using scanline rasterization per tile
   for (const tileTuple of tiles) {
     const tileKey = tileToKey(tileTuple)
     const chunkDataMap = tileChunkData.get(tileKey)
     if (!chunkDataMap || chunkDataMap.size === 0) continue
+
+    // Transform geometry into this tile's pixel space once
+    const tileGeometry = transformGeometryToTilePixelSpace(
+      geometry,
+      tileTuple,
+      tileSize,
+      crs,
+      xyLimits
+    )
+    if (!tileGeometry) continue
 
     // Get all chunk indices for this tile
     const [, x, y] = tileTuple
@@ -234,53 +299,39 @@ export async function queryRegionTiled(
       y
     )
 
-    for (let pixelY = 0; pixelY < tileSize; pixelY++) {
-      for (let pixelX = 0; pixelX < tileSize; pixelX++) {
-        if (
-          !pixelIntersectsGeometryTiled(
-            tileTuple,
-            pixelX,
-            pixelY,
-            tileSize,
-            crs,
-            xyLimits,
-            geometry
-          )
-        ) {
-          continue
-        }
+    // Process a single pixel: extract values from chunks and emit results.
+    // Defined per-tile so it captures tileTuple/chunksForTile/chunkDataMap.
+    const processPixel = (pixelX: number, pixelY: number) => {
+      const pixelValues: { keys: (string | number)[]; value: number }[] = []
 
-        // Collect all values for this pixel first
-        const pixelValues: { keys: (string | number)[]; value: number }[] = []
+      for (const chunkIndices of chunksForTile) {
+        const chunkKey = chunkIndices.join(',')
+        const chunkData = chunkDataMap.get(chunkKey)
+        if (!chunkData) continue
 
-        for (const chunkIndices of chunksForTile) {
-          const chunkKey = chunkIndices.join(',')
-          const chunkData = chunkDataMap.get(chunkKey)
-          if (!chunkData) continue
+        const valuesToSet = getPointValues(
+          chunkData,
+          pixelX,
+          pixelY,
+          selector,
+          dimensions,
+          coordinates,
+          shape,
+          chunks,
+          chunkIndices
+        )
 
-          const valuesToSet = getPointValues(
-            chunkData,
-            pixelX,
-            pixelY,
-            selector,
-            dimensions,
-            coordinates,
-            shape,
-            chunks,
-            chunkIndices
-          )
-
-          for (const { keys, value } of valuesToSet) {
-            const transformed = transformValue(value, transforms)
-            if (transformed !== null) {
-              pixelValues.push({ keys, value: transformed })
-            }
+        for (const { keys, value } of valuesToSet) {
+          const transformed = transformValue(value, transforms)
+          if (transformed !== null) {
+            pixelValues.push({ keys, value: transformed })
           }
         }
+      }
 
-        // Only add coordinates and values if we have valid data
-        if (pixelValues.length === 0) continue
+      if (pixelValues.length === 0) return
 
+      if (includeSpatialCoordinates) {
         const geo = tilePixelToLatLon(
           tileTuple,
           pixelX + 0.5,
@@ -289,35 +340,56 @@ export async function queryRegionTiled(
           crs,
           xyLimits
         )
+        yCoords.push(geo.lat)
+        xCoords.push(geo.lon)
+      }
 
-        latCoords.push(geo.lat)
-        lonCoords.push(geo.lon)
+      for (const { keys, value } of pixelValues) {
+        if (keys.length > 0) {
+          setObjectValues(results, keys, value)
+        } else if (Array.isArray(results)) {
+          results.push(value)
+        }
+      }
+    }
 
-        for (const { keys, value } of pixelValues) {
-          if (keys.length > 0) {
-            setObjectValues(results, keys, value)
-          } else if (Array.isArray(results)) {
-            results.push(value)
-          }
+    // Point geometry: process the single pixel directly
+    if (tileGeometry.type === 'Point') {
+      const px = Math.min(Math.floor(tileGeometry.coordinates[0]), tileSize - 1)
+      const py = Math.min(Math.floor(tileGeometry.coordinates[1]), tileSize - 1)
+      if (px >= 0 && py >= 0) {
+        processPixel(px, py)
+      }
+      continue
+    }
+
+    // Build scanline table for this tile's pixel range
+    const scanlines = buildScanlineTable(tileGeometry, 0, tileSize)
+
+    for (let pixelY = 0; pixelY < tileSize; pixelY++) {
+      checkAborted(signal)
+      const crossings = scanlines.get(pixelY)
+      if (!crossings || crossings.length < 2) continue
+
+      for (let i = 0; i < crossings.length - 1; i += 2) {
+        const xFrom = Math.max(0, Math.ceil(crossings[i] - 0.5))
+        const xTo = Math.min(tileSize, Math.floor(crossings[i + 1] - 0.5) + 1)
+
+        for (let pixelX = xFrom; pixelX < xTo; pixelX++) {
+          processPixel(pixelX, pixelY)
         }
       }
     }
   }
 
-  const result = {
-    [variable]: results,
-    dimensions: resultDimensions,
-    coordinates: buildResultCoordinates(),
-  } as QueryResult
-
-  return result
+  return buildResult()
 }
 
 /**
  * Query a region in single-image mode.
  * Returns structure matching carbonplan/maps: { [variable]: values, dimensions, coordinates }
  */
-export async function queryRegionSingleImage(
+export function queryRegionUntiled(
   variable: string,
   geometry: QueryGeometry,
   selector: Selector,
@@ -334,16 +406,13 @@ export async function queryRegionSingleImage(
   latIsAscending?: boolean,
   transforms?: QueryTransformOptions,
   proj4def?: string | null,
-  sourceBounds?: Bounds | null
-): Promise<QueryResult> {
+  sourceBounds?: Bounds | null,
+  options?: QueryOptions,
+  dimIndices?: DimIndicesProps
+): QueryResult {
+  const { signal, includeSpatialCoordinates = true } = options ?? {}
+
   // Calculate result dimension
-  const isMultiValSelector = (value: Selector[string]) => {
-    if (Array.isArray(value)) return true
-    if (value && typeof value === 'object' && 'selected' in value) {
-      return Array.isArray((value as any).selected)
-    }
-    return false
-  }
   const singleValuedDims = Object.keys(selector).filter(
     (k) => !isMultiValSelector(selector[k])
   ).length
@@ -353,32 +422,30 @@ export async function queryRegionSingleImage(
   const useNestedResults = resultDim > 2
   let results: QueryDataValues = useNestedResults ? {} : []
 
-  const latCoords: number[] = []
-  const lonCoords: number[] = []
+  const { yDim, xDim, yStoreDim, xStoreDim } = findSpatialDimNames(
+    dimensions,
+    !!proj4def,
+    dimIndices
+  )
+  const yCoords: number[] = []
+  const xCoords: number[] = []
 
-  const mappedDimensions = dimensions.map((d) => {
-    const dimLower = d.toLowerCase()
-    if (['x', 'lon', 'longitude'].includes(dimLower)) return 'lon'
-    if (['y', 'lat', 'latitude'].includes(dimLower)) return 'lat'
-    return d
-  })
-
-  const resultDimensions = useNestedResults ? mappedDimensions : ['lat', 'lon']
+  // Map spatial dimensions in the result to the emitted coordinate keys
+  const resultDimensions = useNestedResults
+    ? dimensions.map((d) =>
+        d === yStoreDim ? yDim : d === xStoreDim ? xDim : d
+      )
+    : [yDim, xDim]
 
   const buildResultCoordinates = (): Record<string, (number | string)[]> => {
     const coords: Record<string, (number | string)[]> = {
-      lat: latCoords,
-      lon: lonCoords,
+      [yDim]: yCoords,
+      [xDim]: xCoords,
     }
 
     if (useNestedResults) {
-      const addDimCoordinates = (dim: string) => {
-        const dimLower = dim.toLowerCase()
-        if (
-          ['x', 'lon', 'longitude', 'y', 'lat', 'latitude'].includes(dimLower)
-        ) {
-          return
-        }
+      for (const dim of dimensions) {
+        if (dim === yStoreDim || dim === xStoreDim) continue
 
         const sel = selector[dim]
         let values: (number | string)[] | undefined
@@ -398,202 +465,170 @@ export async function queryRegionSingleImage(
           coords[dim] = values
         }
       }
-
-      dimensions.forEach(addDimCoordinates)
     }
 
     return coords
   }
 
-  if (!data) {
-    const result = {
+  const buildResult = () =>
+    ({
       [variable]: results,
       dimensions: resultDimensions,
       coordinates: buildResultCoordinates(),
-    } as QueryResult
-    return result
-  }
+    } as QueryResult)
 
-  // Compute iteration bounds
-  // For proj4, the data is already the subset matching the geometry bbox,
-  // so iterate over all pixels. For standard CRS, compute overlap.
-  let xStart = 0
-  let xEnd = width
-  let yStart = 0
-  let yEnd = height
+  if (!data) return buildResult()
 
-  if (!proj4def) {
-    const bbox = computeBoundingBox(geometry)
-
-    // Compute overlap of polygon bbox with image bounds in mercator space
-    const polyX0 = lonToMercatorNorm(bbox.west)
-    const polyX1 = lonToMercatorNorm(bbox.east)
-    const polyY0 = latToMercatorNorm(bbox.north)
-    const polyY1 = latToMercatorNorm(bbox.south)
-
-    const overlapX0 = Math.max(bounds.x0, Math.min(polyX0, polyX1))
-    const overlapX1 = Math.min(bounds.x1, Math.max(polyX0, polyX1))
-
-    if (
-      _crs === 'EPSG:4326' &&
-      bounds.latMin !== undefined &&
-      bounds.latMax !== undefined
-    ) {
-      // For equirectangular data, compute Y overlap in linear latitude space.
-      const latMax = bounds.latMax
-      const latMin = bounds.latMin
-      const clampedNorth = Math.min(Math.max(bbox.north, latMin), latMax)
-      const clampedSouth = Math.min(Math.max(bbox.south, latMin), latMax)
-
-      const latRange = latMax - latMin
-      if (latRange === 0) {
-        const result = {
-          [variable]: results,
-          dimensions: resultDimensions,
-          coordinates: buildResultCoordinates(),
-        } as QueryResult
-        return result
-      }
-      const toFrac = (latVal: number) =>
-        latIsAscending
-          ? (latVal - latMin) / latRange
-          : (latMax - latVal) / latRange
-      const yStartFracRaw = toFrac(clampedNorth)
-      const yEndFracRaw = toFrac(clampedSouth)
-      const yFracMin = Math.min(yStartFracRaw, yEndFracRaw)
-      const yFracMax = Math.max(yStartFracRaw, yEndFracRaw)
-
-      if (overlapX1 <= overlapX0 || yFracMax <= yFracMin) {
-        const result = {
-          [variable]: results,
-          dimensions: resultDimensions,
-          coordinates: buildResultCoordinates(),
-        } as QueryResult
-        return result
-      }
-
-      const minX = ((overlapX0 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
-      const maxX = ((overlapX1 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
-
-      xStart = Math.max(0, Math.floor(minX))
-      xEnd = Math.min(width, Math.ceil(maxX + 1))
-      yStart = Math.max(0, Math.floor(yFracMin * height))
-      yEnd = Math.min(height, Math.ceil(yFracMax * height))
-    } else {
-      const overlapY0 = Math.max(bounds.y0, Math.min(polyY0, polyY1))
-      const overlapY1 = Math.min(bounds.y1, Math.max(polyY0, polyY1))
-
-      if (overlapX1 <= overlapX0 || overlapY1 <= overlapY0) {
-        const result = {
-          [variable]: results,
-          dimensions: resultDimensions,
-          coordinates: buildResultCoordinates(),
-        } as QueryResult
-        return result
-      }
-
-      const minX = ((overlapX0 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
-      const maxX = ((overlapX1 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
-      const minY = ((overlapY0 - bounds.y0) / (bounds.y1 - bounds.y0)) * height
-      const maxY = ((overlapY1 - bounds.y0) / (bounds.y1 - bounds.y0)) * height
-
-      xStart = Math.max(0, Math.floor(minX))
-      xEnd = Math.min(width, Math.ceil(maxX + 1))
-      yStart = Math.max(0, Math.floor(minY))
-      yEnd = Math.min(height, Math.ceil(maxY + 1))
-    }
-
-    if (xEnd <= xStart || yEnd <= yStart) {
-      const result = {
-        [variable]: results,
-        dimensions: resultDimensions,
-        coordinates: buildResultCoordinates(),
-      } as QueryResult
-      return result
-    }
-  }
+  checkAborted(signal)
 
   // Create transformer once for all pixels
   const cachedTransformer: CachedTransformer | undefined = proj4def
     ? createWGS84ToSourceTransformer(proj4def)
     : undefined
 
-  // Iterate pixels within bounding box
-  for (let y = yStart; y < yEnd; y++) {
-    for (let x = xStart; x < xEnd; x++) {
-      if (
-        !pixelIntersectsGeometrySingle(
-          bounds,
-          width,
-          height,
-          x,
-          y,
-          _crs,
-          geometry,
-          latIsAscending,
-          proj4def,
-          sourceBounds,
-          cachedTransformer
-        )
-      ) {
-        continue
+  // Transform the query polygon into pixel-space coordinates once.
+  // This eliminates per-pixel proj4 calls during the intersection test.
+  const pixelGeometry = transformGeometryToPixelSpace(
+    geometry,
+    bounds,
+    width,
+    height,
+    _crs,
+    latIsAscending,
+    proj4def,
+    sourceBounds,
+    cachedTransformer
+  )
+  if (!pixelGeometry) return buildResult()
+
+  // Emit pixel-center coordinates: source CRS for proj4, lat/lon otherwise.
+  // Both paths use pixel centers (+0.5); pixelToLatLon applies it internally.
+  const emitCoords =
+    proj4def && sourceBounds
+      ? (x: number, y: number) => {
+          const [srcX, srcY] = pixelToSourceCRS(
+            x + 0.5,
+            y + 0.5,
+            sourceBounds,
+            width,
+            height,
+            latIsAscending
+          )
+          yCoords.push(srcY)
+          xCoords.push(srcX)
+        }
+      : (x: number, y: number) => {
+          const { lat, lon } = pixelToLatLon(
+            x,
+            y,
+            bounds,
+            width,
+            height,
+            _crs,
+            latIsAscending
+          )
+          yCoords.push(lat)
+          xCoords.push(lon)
+        }
+
+  // Helper to process a single pixel
+  const processPixel = (x: number, y: number) => {
+    const baseIndex = (y * width + x) * channels
+
+    // Single-channel fast path
+    if (channels === 1 && !useNestedResults) {
+      const rawValue = data![baseIndex]
+      const transformed = transformValue(rawValue, transforms)
+      if (transformed === null) return
+
+      if (includeSpatialCoordinates) emitCoords(x, y)
+      ;(results as number[]).push(transformed)
+      return
+    }
+
+    // Multi-channel path
+    let hasValid = false
+    for (let c = 0; c < channels; c++) {
+      const rawValue = data![baseIndex + c]
+      const transformed = transformValue(rawValue, transforms)
+      if (transformed === null) continue
+
+      if (!hasValid) {
+        if (includeSpatialCoordinates) emitCoords(x, y)
+        hasValid = true
       }
 
-      // Use consolidated helper for pixel → lat/lon conversion
-      const { lat, lon } = pixelToLatLon(
-        x,
-        y,
-        bounds,
-        width,
-        height,
-        _crs,
-        latIsAscending,
-        proj4def,
-        sourceBounds,
-        cachedTransformer
-      )
-
-      const baseIndex = (y * width + x) * channels
-
-      // Collect valid values for this pixel first
-      const pixelValues: { keys: (string | number)[]; value: number }[] = []
-
-      for (let c = 0; c < channels; c++) {
-        const rawValue = data[baseIndex + c]
-        const transformed = transformValue(rawValue, transforms)
-        if (transformed === null) continue
-
-        if (useNestedResults && multiValueDimNames) {
-          const labels = channelLabels?.[c]
-          const keys =
-            labels && labels.length === multiValueDimNames.length ? labels : [c]
-          pixelValues.push({ keys, value: transformed })
-        } else {
-          pixelValues.push({ keys: [], value: transformed })
-        }
-      }
-
-      // Only add coordinates and values if we have valid data
-      if (pixelValues.length === 0) continue
-
-      latCoords.push(lat)
-      lonCoords.push(lon)
-
-      for (const { keys, value } of pixelValues) {
-        if (keys.length > 0) {
-          setObjectValues(results, keys, value)
-        } else if (Array.isArray(results)) {
-          results.push(value)
-        }
+      if (useNestedResults && multiValueDimNames) {
+        const labels = channelLabels?.[c]
+        const keys =
+          labels && labels.length === multiValueDimNames.length ? labels : [c]
+        setObjectValues(results, keys, transformed)
+      } else if (Array.isArray(results)) {
+        results.push(transformed)
       }
     }
   }
 
-  const result = {
-    [variable]: results,
-    dimensions: resultDimensions,
-    coordinates: buildResultCoordinates(),
-  } as QueryResult
+  // Point geometry: process the single pixel directly
+  if (pixelGeometry.type === 'Point') {
+    const px = Math.min(Math.floor(pixelGeometry.coordinates[0]), width - 1)
+    const py = Math.min(Math.floor(pixelGeometry.coordinates[1]), height - 1)
+    if (px >= 0 && py >= 0) {
+      processPixel(px, py)
+    }
+    return buildResult()
+  }
 
-  return result
+  // Polygon/MultiPolygon: compute tight bbox and scanline table
+  let pxMinX = Infinity
+  let pxMaxX = -Infinity
+  let pxMinY = Infinity
+  let pxMaxY = -Infinity
+
+  const scanRings = (rings: number[][][]) => {
+    for (const ring of rings) {
+      for (const [px, py] of ring) {
+        if (px < pxMinX) pxMinX = px
+        if (px > pxMaxX) pxMaxX = px
+        if (py < pxMinY) pxMinY = py
+        if (py > pxMaxY) pxMaxY = py
+      }
+    }
+  }
+  if (pixelGeometry.type === 'Polygon') {
+    scanRings(pixelGeometry.coordinates)
+  } else {
+    for (const poly of pixelGeometry.coordinates) scanRings(poly)
+  }
+
+  const xStart = Math.max(0, Math.floor(pxMinX))
+  const xEnd = Math.min(width, Math.ceil(pxMaxX))
+  const yStart = Math.max(0, Math.floor(pxMinY))
+  const yEnd = Math.min(height, Math.ceil(pxMaxY))
+
+  if (xEnd <= xStart || yEnd <= yStart) return buildResult()
+
+  // Build scanline intersection table: for each row Y, sorted X-crossings of polygon edges.
+  // Pixels between consecutive pairs of crossings are inside the polygon.
+  // Scanline table eliminates the O(V) per-pixel cost of point-in-polygon tests.
+  const scanlines = buildScanlineTable(pixelGeometry, yStart, yEnd)
+
+  // Iterate rows using the scanline table
+  for (let y = yStart; y < yEnd; y++) {
+    checkAborted(signal)
+    const crossings = scanlines.get(y)
+    if (!crossings || crossings.length < 2) continue
+
+    // Walk crossing pairs: include pixels whose center (x+0.5) is inside the interval.
+    for (let i = 0; i < crossings.length - 1; i += 2) {
+      const xFrom = Math.max(xStart, Math.ceil(crossings[i] - 0.5))
+      const xTo = Math.min(xEnd, Math.floor(crossings[i + 1] - 0.5) + 1)
+
+      for (let x = xFrom; x < xTo; x++) {
+        processPixel(x, y)
+      }
+    }
+  }
+
+  return buildResult()
 }

@@ -19,12 +19,34 @@ import {
   type MercatorBounds,
 } from '../map-utils'
 import type { Bounds, CRS } from '../types'
-import type { BoundingBox, QueryGeometry } from './types'
+import type { BoundingBox, QueryGeometry, GeoJSONMultiPolygon } from './types'
 import {
   createWGS84ToSourceTransformer,
   sourceCRSToPixel,
   pixelToSourceCRS,
 } from '../projection-utils'
+
+/** Pixel rectangle with exclusive max bounds. */
+export interface PixelRect {
+  minX: number
+  maxX: number
+  minY: number
+  maxY: number
+}
+
+/**
+ * Check if a raster's own extent crosses the antimeridian (EPSG:4326 only).
+ * Returns true when the two-strip antimeridian query path is unsupported.
+ */
+export function rasterExtentCrossesAntimeridian(
+  crs: CRS,
+  xyLimits?: XYLimits | null
+): boolean {
+  if (crs !== 'EPSG:4326' || !xyLimits) return false
+  return (
+    xyLimits.xMin > xyLimits.xMax || xyLimits.xMax > 180 || xyLimits.xMin < -180
+  )
+}
 
 /** Cached transformer type for reuse across multiple pixelToLatLon calls */
 export type CachedTransformer = ReturnType<
@@ -254,6 +276,65 @@ export function computeBoundingBox(geometry: QueryGeometry): BoundingBox {
 }
 
 /**
+ * Compute the Y pixel range for a south/north lat extent against raster bounds.
+ * Handles both EPSG:4326 (linear latitude) and Mercator (normalized coords).
+ * Returns null if no overlap.
+ */
+function computeYPixelRange(
+  south: number,
+  north: number,
+  bounds: MercatorBounds,
+  height: number,
+  crs: CRS,
+  latIsAscending?: boolean
+): { yStart: number; yEnd: number } | null {
+  if (
+    crs === 'EPSG:4326' &&
+    bounds.latMin !== undefined &&
+    bounds.latMax !== undefined
+  ) {
+    const latRange = bounds.latMax - bounds.latMin
+    if (latRange === 0) return null
+    const clampedNorth = Math.min(Math.max(north, bounds.latMin), bounds.latMax)
+    const clampedSouth = Math.min(Math.max(south, bounds.latMin), bounds.latMax)
+    const toFrac = (lat: number) =>
+      latIsAscending
+        ? (lat - bounds.latMin!) / latRange
+        : (bounds.latMax! - lat) / latRange
+    const yFracMin = Math.min(toFrac(clampedNorth), toFrac(clampedSouth))
+    const yFracMax = Math.max(toFrac(clampedNorth), toFrac(clampedSouth))
+    const yStart = Math.min(
+      Math.max(0, Math.floor(yFracMin * height)),
+      height - 1
+    )
+    const yEnd = Math.min(
+      height,
+      Math.max(Math.ceil(yFracMax * height), yStart + 1)
+    )
+    if (yEnd <= yStart) return null
+    return { yStart, yEnd }
+  }
+
+  // Mercator
+  const normNorth = latToMercatorNorm(north)
+  const normSouth = latToMercatorNorm(south)
+  const overlapY0 = Math.max(bounds.y0, Math.min(normNorth, normSouth))
+  const overlapY1 = Math.min(bounds.y1, Math.max(normNorth, normSouth))
+  if (overlapY1 < overlapY0) return null
+  const rawMinY = Math.floor(
+    ((overlapY0 - bounds.y0) / (bounds.y1 - bounds.y0)) * height
+  )
+  const rawMaxY = Math.ceil(
+    ((overlapY1 - bounds.y0) / (bounds.y1 - bounds.y0)) * height
+  )
+  if (rawMaxY <= 0 || rawMinY >= height) return null
+  const yStart = Math.min(Math.max(0, rawMinY), height - 1)
+  const yEnd = Math.min(height, Math.max(rawMaxY, yStart + 1))
+  if (yEnd <= yStart) return null
+  return { yStart, yEnd }
+}
+
+/**
  * Computes pixel bounds from a geometry's bounding box.
  * Returns the pixel range [minX, maxX, minY, maxY] that covers the geometry.
  * Supports custom projections via proj4.
@@ -268,7 +349,7 @@ export function computePixelBoundsFromGeometry(
   proj4def?: string | null,
   sourceBounds?: Bounds | null,
   cachedTransformer?: CachedTransformer
-): { minX: number; maxX: number; minY: number; maxY: number } | null {
+): PixelRect | null {
   const bbox = computeBoundingBox(geometry)
 
   // If proj4 is provided, use proj4 to transform bbox
@@ -326,308 +407,155 @@ export function computePixelBoundsFromGeometry(
 
     // Clamp to valid range
     // Use floor + 1 to ensure integer maxX/maxY values include that pixel
-    const xStart = Math.max(0, Math.floor(minX))
-    const xEnd = Math.min(width, Math.floor(maxX) + 1)
-    const yStart = Math.max(0, Math.floor(minY))
-    const yEnd = Math.min(height, Math.floor(maxY) + 1)
+    // Clamp start to last pixel so points on the max edge map to the last pixel
+    const xStart = Math.min(Math.max(0, Math.floor(minX)), width - 1)
+    const xEnd = Math.min(width, Math.max(Math.floor(maxX) + 1, xStart + 1))
+    const yStart = Math.min(Math.max(0, Math.floor(minY)), height - 1)
+    const yEnd = Math.min(height, Math.max(Math.floor(maxY) + 1, yStart + 1))
 
     if (xEnd <= xStart || yEnd <= yStart) return null
 
     return { minX: xStart, maxX: xEnd, minY: yStart, maxY: yEnd }
   }
 
-  // Convert bbox corners to mercator normalized coords
+  // Y pixel range (shared helper for both CRS types)
+  const yRange = computeYPixelRange(
+    bbox.south,
+    bbox.north,
+    bounds,
+    height,
+    crs,
+    latIsAscending
+  )
+  if (!yRange) return null
+
+  // X pixel range (uses mercator norm for both CRS types)
   const polyX0 = lonToMercatorNorm(bbox.west)
   const polyX1 = lonToMercatorNorm(bbox.east)
-  const polyY0 = latToMercatorNorm(bbox.north)
-  const polyY1 = latToMercatorNorm(bbox.south)
-
-  // Compute overlap with image bounds
   const overlapX0 = Math.max(bounds.x0, Math.min(polyX0, polyX1))
   const overlapX1 = Math.min(bounds.x1, Math.max(polyX0, polyX1))
+  if (overlapX1 < overlapX0) return null
 
-  let xStart: number
-  let xEnd: number
-  let yStart: number
-  let yEnd: number
+  const rawMinX = ((overlapX0 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
+  const rawMaxX = ((overlapX1 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
+  const xStart = Math.min(Math.max(0, Math.floor(rawMinX)), width - 1)
+  const xEnd = Math.min(width, Math.max(Math.ceil(rawMaxX), xStart + 1))
+  if (xEnd <= xStart) return null
 
-  if (
-    crs === 'EPSG:4326' &&
-    bounds.latMin !== undefined &&
-    bounds.latMax !== undefined
+  return { minX: xStart, maxX: xEnd, minY: yRange.yStart, maxY: yRange.yEnd }
+}
+
+import {
+  DEFAULT_QUERY_DENSIFY_MAX_ERROR,
+  MERCATOR_LAT_LIMIT,
+} from '../constants'
+
+/** Max recursion depth for adaptive subdivision */
+const DENSIFY_MAX_DEPTH = 10
+
+/**
+ * Densify a ring by adaptively subdividing edges until the pixel-space error
+ * is below DEFAULT_QUERY_DENSIFY_MAX_ERROR. For each edge, the midpoint is interpolated in
+ * source coordinates (lon/lat), transformed to pixel space, and compared to
+ * the straight-line midpoint in pixel space. If the deviation exceeds the
+ * threshold, the edge is recursively split.
+ *
+ * This matches the adaptive mesh reprojection precision (0.125px) so query
+ * polygon boundaries align with rendered pixel boundaries.
+ */
+function densifyAndTransformRing(
+  ring: number[][],
+  transformVertex: (lon: number, lat: number) => [number, number]
+): number[][] {
+  const result: number[][] = []
+
+  function subdivide(
+    lon0: number,
+    lat0: number,
+    px0: [number, number],
+    lon1: number,
+    lat1: number,
+    px1: [number, number],
+    depth: number
   ) {
-    // For equirectangular data, compute Y overlap in linear latitude space
-    const latMax = bounds.latMax
-    const latMin = bounds.latMin
-    const clampedNorth = Math.min(Math.max(bbox.north, latMin), latMax)
-    const clampedSouth = Math.min(Math.max(bbox.south, latMin), latMax)
+    if (depth >= DENSIFY_MAX_DEPTH) return
 
-    const latRange = latMax - latMin
-    if (latRange === 0) return null
+    // Midpoint in source space
+    const lonM = (lon0 + lon1) * 0.5
+    const latM = (lat0 + lat1) * 0.5
+    const pxM = transformVertex(lonM, latM)
+    if (!isFinite(pxM[0]) || !isFinite(pxM[1])) return
 
-    const toFrac = (latVal: number) =>
-      latIsAscending
-        ? (latVal - latMin) / latRange
-        : (latMax - latVal) / latRange
-    const yStartFracRaw = toFrac(clampedNorth)
-    const yEndFracRaw = toFrac(clampedSouth)
-    const yFracMin = Math.min(yStartFracRaw, yEndFracRaw)
-    const yFracMax = Math.max(yStartFracRaw, yEndFracRaw)
+    // Straight-line midpoint in pixel space
+    const expectedX = (px0[0] + px1[0]) * 0.5
+    const expectedY = (px0[1] + px1[1]) * 0.5
 
-    if (overlapX1 <= overlapX0 || yFracMax <= yFracMin) return null
+    // Error: distance from true projected midpoint to straight-line midpoint
+    const dx = pxM[0] - expectedX
+    const dy = pxM[1] - expectedY
+    const error = dx * dx + dy * dy // compare squared to avoid sqrt
 
-    const minX = ((overlapX0 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
-    const maxX = ((overlapX1 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
-
-    xStart = Math.max(0, Math.floor(minX))
-    xEnd = Math.min(width, Math.ceil(maxX))
-    yStart = Math.max(0, Math.floor(yFracMin * height))
-    yEnd = Math.min(height, Math.ceil(yFracMax * height))
-  } else {
-    const overlapY0 = Math.max(bounds.y0, Math.min(polyY0, polyY1))
-    const overlapY1 = Math.min(bounds.y1, Math.max(polyY0, polyY1))
-
-    if (overlapX1 <= overlapX0 || overlapY1 <= overlapY0) return null
-
-    const minX = ((overlapX0 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
-    const maxX = ((overlapX1 - bounds.x0) / (bounds.x1 - bounds.x0)) * width
-    const minY = ((overlapY0 - bounds.y0) / (bounds.y1 - bounds.y0)) * height
-    const maxY = ((overlapY1 - bounds.y0) / (bounds.y1 - bounds.y0)) * height
-
-    xStart = Math.max(0, Math.floor(minX))
-    xEnd = Math.min(width, Math.ceil(maxX))
-    yStart = Math.max(0, Math.floor(minY))
-    yEnd = Math.min(height, Math.ceil(maxY))
-  }
-
-  if (xEnd <= xStart || yEnd <= yStart) return null
-
-  return { minX: xStart, maxX: xEnd, minY: yStart, maxY: yEnd }
-}
-
-/**
- * Ray-casting point-in-polygon test.
- * Tests if a point is inside a single polygon ring.
- */
-export function pointInPolygon(
-  point: [number, number],
-  polygon: number[][]
-): boolean {
-  let inside = false
-  const [x, y] = point
-
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const xi = polygon[i][0]
-    const yi = polygon[i][1]
-    const xj = polygon[j][0]
-    const yj = polygon[j][1]
-
-    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) {
-      inside = !inside
+    if (
+      error >
+      DEFAULT_QUERY_DENSIFY_MAX_ERROR * DEFAULT_QUERY_DENSIFY_MAX_ERROR
+    ) {
+      subdivide(lon0, lat0, px0, lonM, latM, pxM, depth + 1)
+      result.push(pxM as number[])
+      subdivide(lonM, latM, pxM, lon1, lat1, px1, depth + 1)
     }
   }
 
-  return inside
-}
+  for (let i = 0; i < ring.length - 1; i++) {
+    const [lon0, lat0] = ring[i]
+    const [lon1, lat1] = ring[i + 1]
+    const px0 = transformVertex(lon0, lat0)
+    const px1 = transformVertex(lon1, lat1)
 
-/**
- * Tests if a point is inside a GeoJSON geometry (Polygon or MultiPolygon).
- * Correctly handles holes in polygons.
- */
-export function pointInGeoJSON(
-  point: [number, number],
-  geometry: QueryGeometry
-): boolean {
-  if (geometry.type === 'Point') {
-    return (
-      point[0] === geometry.coordinates[0] &&
-      point[1] === geometry.coordinates[1]
-    )
-  }
-
-  if (geometry.type === 'Polygon') {
-    // Test outer ring
-    if (!pointInPolygon(point, geometry.coordinates[0])) return false
-    // Test holes (if inside any hole, point is outside polygon)
-    for (let i = 1; i < geometry.coordinates.length; i++) {
-      if (pointInPolygon(point, geometry.coordinates[i])) return false
+    if (isFinite(px0[0]) && isFinite(px0[1])) {
+      result.push(px0 as number[])
     }
-    return true
-  }
-
-  // MultiPolygon - check each polygon
-  for (const polygon of geometry.coordinates) {
-    if (pointInPolygon(point, polygon[0])) {
-      let inHole = false
-      for (let i = 1; i < polygon.length; i++) {
-        if (pointInPolygon(point, polygon[i])) {
-          inHole = true
-          break
-        }
-      }
-      if (!inHole) return true
+    if (
+      isFinite(px0[0]) &&
+      isFinite(px0[1]) &&
+      isFinite(px1[0]) &&
+      isFinite(px1[1])
+    ) {
+      subdivide(lon0, lat0, px0, lon1, lat1, px1, 0)
     }
   }
 
-  return false
+  // Close ring (only if first vertex was valid)
+  if (result.length > 0 && isFinite(result[0][0]) && isFinite(result[0][1])) {
+    result.push([result[0][0], result[0][1]])
+  }
+  return result
 }
 
 /**
- * Lightweight polygon-rectangle intersection test.
- * Returns true if any rectangle corner is inside geometry,
- * any geometry vertex is inside rectangle, or if any edges intersect.
+ * Transform a query geometry from WGS84 lon/lat into pixel-space coordinates.
+ * For proj4 projections: forward-transforms vertices, then converts source CRS → pixel.
+ * For standard CRS: uses mercator/equirect math → pixel.
+ * Densifies edges to preserve curvature under nonlinear projections.
+ *
+ * Returns a geometry with the same GeoJSON ring structure but in pixel coordinates,
+ * suitable for use with scanline rasterization.
  */
-function rectIntersectsGeometry(
-  rect: [number, number][],
-  geometry: QueryGeometry
-): boolean {
-  const rectMinX = Math.min(...rect.map((p) => p[0]))
-  const rectMaxX = Math.max(...rect.map((p) => p[0]))
-  const rectMinY = Math.min(...rect.map((p) => p[1]))
-  const rectMaxY = Math.max(...rect.map((p) => p[1]))
-
-  const pointInRect = (p: [number, number]) =>
-    p[0] >= rectMinX && p[0] <= rectMaxX && p[1] >= rectMinY && p[1] <= rectMaxY
-
-  // Any rect corner inside geometry (supports point or polygon)
-  for (const corner of rect) {
-    if (pointInGeoJSON(corner, geometry)) return true
-  }
-
-  // Point geometry inside rectangle
-  if (
-    geometry.type === 'Point' &&
-    pointInRect([geometry.coordinates[0], geometry.coordinates[1]])
-  ) {
-    return true
-  }
-
-  // Any polygon vertex inside rect
-  if (geometry.type !== 'Point') {
-    const rings =
-      geometry.type === 'Polygon'
-        ? geometry.coordinates
-        : geometry.coordinates.flatMap((poly) => poly)
-    for (const ring of rings) {
-      for (const [lon, lat] of ring) {
-        if (pointInRect([lon, lat])) return true
-      }
-    }
-  }
-
-  // Edge intersection: rectangle edges vs polygon edges (outer rings only)
-  const rectEdges: [[number, number], [number, number]][] = [
-    [rect[0], rect[1]],
-    [rect[1], rect[2]],
-    [rect[2], rect[3]],
-    [rect[3], rect[0]],
-  ]
-
-  const edgesFromRing = (ring: number[][]) =>
-    ring
-      .slice(0, -1)
-      .map(
-        (_, i) => [ring[i], ring[i + 1]] as [[number, number], [number, number]]
-      )
-
-  const segments =
-    geometry.type === 'Polygon'
-      ? edgesFromRing(geometry.coordinates[0])
-      : geometry.type === 'MultiPolygon'
-      ? geometry.coordinates.flatMap((poly) => edgesFromRing(poly[0]))
-      : []
-
-  const intersects = (
-    a1: [number, number],
-    a2: [number, number],
-    b1: [number, number],
-    b2: [number, number]
-  ): boolean => {
-    const cross = (v1: [number, number], v2: [number, number]) =>
-      v1[0] * v2[1] - v1[1] * v2[0]
-    const sub = (p1: [number, number], p2: [number, number]) =>
-      [p1[0] - p2[0], p1[1] - p2[1]] as [number, number]
-
-    const d1 = sub(a2, a1)
-    const d2 = sub(b2, b1)
-    const denom = cross(d1, d2)
-    if (denom === 0) return false
-
-    const s = cross(sub(b1, a1), d2) / denom
-    const t = cross(sub(b1, a1), d1) / denom
-    return s >= 0 && s <= 1 && t >= 0 && t <= 1
-  }
-
-  for (const edge of rectEdges) {
-    for (const seg of segments) {
-      if (intersects(edge[0], edge[1], seg[0], seg[1])) {
-        return true
-      }
-    }
-  }
-
-  return false
-}
-
-/**
- * Rectangle (pixel) corners in lon/lat for tiled mode.
- */
-function pixelRectLonLat(
-  tile: TileTuple,
-  pixelX: number,
-  pixelY: number,
-  tileSize: number,
-  crs: CRS,
-  xyLimits: XYLimits
-): [number, number][] {
-  const corners: [number, number][] = []
-  const offsets = [
-    [0, 0],
-    [1, 0],
-    [1, 1],
-    [0, 1],
-  ]
-  for (const [dx, dy] of offsets) {
-    const p = tilePixelToLatLon(
-      tile,
-      pixelX + dx,
-      pixelY + dy,
-      tileSize,
-      crs,
-      xyLimits
-    )
-    corners.push([p.lon, p.lat])
-  }
-  return corners
-}
-
-/**
- * Rectangle (pixel) corners in lon/lat for single-image mode.
- * Uses pixelToLatLon for consistent handling of all CRS types including proj4 reprojection.
- */
-function pixelRectLonLatSingle(
+export function transformGeometryToPixelSpace(
+  geometry: QueryGeometry,
   bounds: MercatorBounds,
   width: number,
   height: number,
-  x: number,
-  y: number,
   crs: CRS,
   latIsAscending?: boolean,
   proj4def?: string | null,
   sourceBounds?: Bounds | null,
   cachedTransformer?: CachedTransformer
-): [number, number][] {
-  const offsets = [
-    [0, 0],
-    [1, 0],
-    [1, 1],
-    [0, 1],
-  ]
-  const corners: [number, number][] = []
-  for (const [dx, dy] of offsets) {
-    const { lon, lat } = pixelToLatLon(
-      x + dx,
-      y + dy,
+): QueryGeometry | null {
+  if (geometry.type === 'Point') {
+    const [lon, lat] = geometry.coordinates
+    const px = lonLatToPixel(
+      lon,
+      lat,
       bounds,
       width,
       height,
@@ -635,53 +563,329 @@ function pixelRectLonLatSingle(
       latIsAscending,
       proj4def,
       sourceBounds,
-      cachedTransformer,
-      false // Use pixel corners, not centers
+      cachedTransformer
     )
-    corners.push([lon, lat])
+    if (!px) return null
+    return { type: 'Point', coordinates: [px[0], px[1]] }
   }
-  return corners
+
+  // Build the vertex transform function
+  const transformVertex = (lon: number, lat: number): [number, number] => {
+    const px = lonLatToPixel(
+      lon,
+      lat,
+      bounds,
+      width,
+      height,
+      crs,
+      latIsAscending,
+      proj4def,
+      sourceBounds,
+      cachedTransformer
+    )
+    return px ?? [NaN, NaN]
+  }
+
+  // Densify for any nonlinear CRS. EPSG:3857 uses latToMercatorNorm (nonlinear in Y).
+  // EPSG:4326 with lat bounds is linear and doesn't need densification.
+  const isLinear4326 =
+    crs === 'EPSG:4326' &&
+    bounds.latMin !== undefined &&
+    bounds.latMax !== undefined
+  const needsDensification =
+    !!proj4def || (!isLinear4326 && crs !== 'EPSG:4326')
+
+  const transformRing = (ring: number[][]): number[][] => {
+    if (needsDensification) {
+      return densifyAndTransformRing(ring, transformVertex)
+    }
+    // For linear projections, just transform vertices directly
+    const result: number[][] = []
+    for (const [lon, lat] of ring) {
+      const pt = transformVertex(lon, lat)
+      if (isFinite(pt[0]) && isFinite(pt[1])) {
+        result.push(pt as number[])
+      }
+    }
+    // Ensure ring is closed
+    if (
+      result.length > 1 &&
+      (result[0][0] !== result[result.length - 1][0] ||
+        result[0][1] !== result[result.length - 1][1])
+    ) {
+      result.push([result[0][0], result[0][1]])
+    }
+    return result
+  }
+
+  if (geometry.type === 'Polygon') {
+    const coords = geometry.coordinates.map(transformRing)
+    if (coords[0].length < 4) return null // Need at least a triangle
+    return { type: 'Polygon', coordinates: coords }
+  }
+
+  // MultiPolygon
+  const coords = geometry.coordinates.map((polygon) =>
+    polygon.map(transformRing)
+  )
+  // Filter out degenerate polygons
+  const valid = coords.filter((poly) => poly[0].length >= 4)
+  if (valid.length === 0) return null
+  return { type: 'MultiPolygon', coordinates: valid }
 }
 
-export function pixelIntersectsGeometryTiled(
+/**
+ * Transform a query geometry from WGS84 lon/lat into tile-pixel coordinates.
+ * For EPSG:3857 the lat→Y mapping is nonlinear, so edges are densified.
+ * For EPSG:4326 the mapping is linear and vertices are transformed directly.
+ */
+export function transformGeometryToTilePixelSpace(
+  geometry: QueryGeometry,
   tile: TileTuple,
-  pixelX: number,
-  pixelY: number,
   tileSize: number,
   crs: CRS,
-  xyLimits: XYLimits,
-  geometry: QueryGeometry
-): boolean {
-  const rect = pixelRectLonLat(tile, pixelX, pixelY, tileSize, crs, xyLimits)
-  return rectIntersectsGeometry(rect, geometry)
+  xyLimits: XYLimits
+): QueryGeometry | null {
+  const transformVertex = (lon: number, lat: number): [number, number] => {
+    // Clamp latitude to Mercator limits to avoid infinities at the poles
+    const clampedLat =
+      crs !== 'EPSG:4326'
+        ? Math.max(-MERCATOR_LAT_LIMIT, Math.min(MERCATOR_LAT_LIMIT, lat))
+        : lat
+    const { fracX, fracY } = geoToTileFraction(
+      lon,
+      clampedLat,
+      tile,
+      crs,
+      xyLimits
+    )
+    return [fracX * tileSize, fracY * tileSize]
+  }
+
+  if (geometry.type === 'Point') {
+    const [lon, lat] = geometry.coordinates
+    const pt = transformVertex(lon, lat)
+    if (!isFinite(pt[0]) || !isFinite(pt[1])) return null
+    return { type: 'Point', coordinates: [pt[0], pt[1]] }
+  }
+
+  // EPSG:3857 is nonlinear in Y; EPSG:4326 is linear
+  const needsDensification = crs !== 'EPSG:4326'
+
+  const transformRing = (ring: number[][]): number[][] => {
+    if (needsDensification) {
+      return densifyAndTransformRing(ring, transformVertex)
+    }
+    const result: number[][] = []
+    for (const [lon, lat] of ring) {
+      const pt = transformVertex(lon, lat)
+      if (isFinite(pt[0]) && isFinite(pt[1])) {
+        result.push(pt as number[])
+      }
+    }
+    if (
+      result.length > 1 &&
+      (result[0][0] !== result[result.length - 1][0] ||
+        result[0][1] !== result[result.length - 1][1])
+    ) {
+      result.push([result[0][0], result[0][1]])
+    }
+    return result
+  }
+
+  if (geometry.type === 'Polygon') {
+    const coords = geometry.coordinates.map(transformRing)
+    if (coords[0].length < 4) return null
+    return { type: 'Polygon', coordinates: coords }
+  }
+
+  const coords = geometry.coordinates.map((polygon) =>
+    polygon.map(transformRing)
+  )
+  const valid = coords.filter((poly) => poly[0].length >= 4)
+  if (valid.length === 0) return null
+  return { type: 'MultiPolygon', coordinates: valid }
 }
 
-export function pixelIntersectsGeometrySingle(
+/**
+ * Convert a single lon/lat point to pixel coordinates.
+ * Handles proj4, EPSG:4326, and EPSG:3857.
+ */
+function lonLatToPixel(
+  lon: number,
+  lat: number,
   bounds: MercatorBounds,
   width: number,
   height: number,
-  x: number,
-  y: number,
   crs: CRS,
-  geometry: QueryGeometry,
   latIsAscending?: boolean,
   proj4def?: string | null,
   sourceBounds?: Bounds | null,
   cachedTransformer?: CachedTransformer
-): boolean {
-  const rect = pixelRectLonLatSingle(
-    bounds,
-    width,
-    height,
-    x,
-    y,
-    crs,
-    latIsAscending,
-    proj4def,
-    sourceBounds,
-    cachedTransformer
+): [number, number] | null {
+  if (proj4def && sourceBounds) {
+    const transformer =
+      cachedTransformer ?? createWGS84ToSourceTransformer(proj4def)
+    const [srcX, srcY] = transformer.forward(lon, lat)
+    if (!isFinite(srcX) || !isFinite(srcY)) return null
+    return sourceCRSToPixel(
+      srcX,
+      srcY,
+      sourceBounds,
+      width,
+      height,
+      latIsAscending
+    )
+  }
+
+  // Standard CRS: convert to mercator normalized, then to pixel.
+  // No bounds clamping — polygon vertices can legitimately lie far outside
+  // the raster extent (e.g. when the polygon fully contains a small raster).
+  const normX = lonToMercatorNorm(lon)
+  const xFrac = (normX - bounds.x0) / (bounds.x1 - bounds.x0)
+
+  let yFrac: number
+  if (
+    crs === 'EPSG:4326' &&
+    bounds.latMin !== undefined &&
+    bounds.latMax !== undefined
+  ) {
+    const latRange = bounds.latMax - bounds.latMin
+    if (latRange === 0) return null
+    yFrac = latIsAscending
+      ? (lat - bounds.latMin) / latRange
+      : (bounds.latMax - lat) / latRange
+  } else {
+    const normY = latToMercatorNorm(lat)
+    yFrac = (normY - bounds.y0) / (bounds.y1 - bounds.y0)
+  }
+
+  return [xFrac * width, yFrac * height]
+}
+
+/**
+ * Build a scanline table for a single polygon (outer ring + holes).
+ * Returns a Map from integer Y to sorted array of X-intersection values.
+ */
+function buildScanlineTableForRings(
+  rings: number[][][],
+  yStart: number,
+  yEnd: number
+): Map<number, number[]> {
+  const table = new Map<number, number[]>()
+
+  for (const ring of rings) {
+    for (let i = 0; i < ring.length - 1; i++) {
+      const x0 = ring[i][0]
+      const y0 = ring[i][1]
+      const x1 = ring[i + 1][0]
+      const y1 = ring[i + 1][1]
+
+      if (y0 === y1) continue
+
+      const edgeYMin = Math.min(y0, y1)
+      const edgeYMax = Math.max(y0, y1)
+      const scanYMin = Math.max(yStart, Math.floor(edgeYMin + 0.5))
+      const scanYMax = Math.min(yEnd - 1, Math.ceil(edgeYMax - 0.5) - 1)
+      const slope = (x1 - x0) / (y1 - y0)
+
+      for (let row = scanYMin; row <= scanYMax; row++) {
+        const scanY = row + 0.5
+        const xIntersect = x0 + (scanY - y0) * slope
+        let arr = table.get(row)
+        if (!arr) {
+          arr = []
+          table.set(row, arr)
+        }
+        arr.push(xIntersect)
+      }
+    }
+  }
+
+  for (const [, arr] of table) {
+    arr.sort((a, b) => a - b)
+  }
+
+  return table
+}
+
+/**
+ * Union two sets of scanline crossing pairs.
+ * Each input is a sorted array where consecutive pairs (0-1, 2-3, ...) define filled intervals.
+ * Returns a new sorted crossing array whose pairs represent the union of both interval sets.
+ */
+function unionScanlineIntervals(a: number[], b: number[]): number[] {
+  // Convert crossing pairs to [start, end] intervals
+  const intervals: [number, number][] = []
+  for (let i = 0; i < a.length - 1; i += 2) intervals.push([a[i], a[i + 1]])
+  for (let i = 0; i < b.length - 1; i += 2) intervals.push([b[i], b[i + 1]])
+
+  // Sort by start
+  intervals.sort((x, y) => x[0] - y[0])
+
+  // Merge overlapping intervals
+  const result: number[] = []
+  let [curStart, curEnd] = intervals[0]
+  for (let i = 1; i < intervals.length; i++) {
+    if (intervals[i][0] <= curEnd) {
+      curEnd = Math.max(curEnd, intervals[i][1])
+    } else {
+      result.push(curStart, curEnd)
+      curStart = intervals[i][0]
+      curEnd = intervals[i][1]
+    }
+  }
+  result.push(curStart, curEnd)
+  return result
+}
+
+/**
+ * Scanline fill: precompute sorted X-intersections for each row in the pixel-space polygon.
+ * Returns a Map from integer Y to sorted array of X-intersection values.
+ * For each row, pixels between pairs of intersections (0-1, 2-3, ...) are inside.
+ *
+ * Uses center-based sampling (row + 0.5) matching standard rasterization tools
+ * (GDAL/rasterio default). A pixel is included if its center is inside the polygon.
+ *
+ * For MultiPolygon, each polygon member is rasterized independently and intervals
+ * are merged with union semantics, so overlapping members are included (not cancelled
+ * by even-odd parity across members).
+ *
+ * Complexity: O(H*E + H*E*logE) vs O(W*H*V) for per-pixel point-in-polygon.
+ */
+export function buildScanlineTable(
+  geometry: QueryGeometry,
+  yStart: number,
+  yEnd: number
+): Map<number, number[]> {
+  if (geometry.type === 'Polygon') {
+    return buildScanlineTableForRings(geometry.coordinates, yStart, yEnd)
+  }
+
+  if (geometry.type === 'Point') {
+    return new Map()
+  }
+
+  // MultiPolygon: rasterize each polygon independently, then merge intervals
+  const perPolygon = geometry.coordinates.map((polygon) =>
+    buildScanlineTableForRings(polygon, yStart, yEnd)
   )
-  return rectIntersectsGeometry(rect, geometry)
+  if (perPolygon.length === 1) return perPolygon[0]
+
+  // Merge: collect all rows, union their interval sets
+  const merged = new Map<number, number[]>()
+  for (const table of perPolygon) {
+    for (const [row, crossings] of table) {
+      // Convert crossing pairs to intervals, then merge with existing
+      const existing = merged.get(row)
+      if (!existing) {
+        merged.set(row, crossings)
+      } else {
+        merged.set(row, unionScanlineIntervals(existing, crossings))
+      }
+    }
+  }
+  return merged
 }
 
 /**
@@ -718,86 +922,582 @@ export function getTilesForPolygon(
   return getTilesForBoundingBox(bbox, zoom, crs, xyLimits)
 }
 
+// ---------------------------------------------------------------------------
+// Antimeridian preprocessing
+// ---------------------------------------------------------------------------
+
 /**
- * Converts mercator bounds to pixel coordinates within a data array.
- * Used for single-image mode queries.
- * Supports custom projections via proj4.
+ * Bounding box that correctly represents antimeridian-crossing regions.
+ * When crossesAntimeridian is true, west > east (e.g. west=170, east=-170).
  */
-export function mercatorBoundsToPixel(
-  lng: number,
-  lat: number,
+export interface WrappedBoundingBox {
+  west: number // in [-180, 180]
+  east: number // in [-180, 180]
+  south: number
+  north: number
+  crossesAntimeridian: boolean
+}
+
+/**
+ * Wrap a longitude into (-180, 180], preserving 180 (not folding to -180).
+ */
+function wrapLon(lon: number): number {
+  let w = (lon + 180) % 360
+  if (w < 0) w += 360
+  w -= 180
+  // Preserve 180: the modulo maps 180 to -180, but we want 180
+  if (w === -180 && lon > 0) w = 180
+  return w
+}
+
+/**
+ * Ensure a ring is closed (last vertex equals first vertex).
+ */
+function closeRing(ring: number[][]): number[][] {
+  if (ring.length < 2) return ring
+  const first = ring[0]
+  const last = ring[ring.length - 1]
+  if (first[0] !== last[0] || first[1] !== last[1]) {
+    return [...ring, [first[0], first[1]]]
+  }
+  return ring
+}
+
+/**
+ * Compute the centroid longitude of a closed ring (excludes closing vertex).
+ */
+function ringCentroidLon(ring: number[][]): number {
+  const count = Math.max(1, ring.length - 1)
+  let sum = 0
+  for (let i = 0; i < count; i++) {
+    sum += ring[i][0]
+  }
+  return sum / count
+}
+
+/**
+ * Find the single ±360° shift that places centroidLon closest to targetCenter.
+ */
+function nearestLonShift(centroidLon: number, targetCenter: number): number {
+  return Math.round((targetCenter - centroidLon) / 360) * 360
+}
+
+/**
+ * Shift all ring longitudes by a fixed offset.
+ */
+function shiftRingsLon(rings: number[][][], shift: number): number[][][] {
+  return rings.map((ring) => ring.map(([lon, lat]) => [lon + shift, lat]))
+}
+
+/**
+ * Scan closed rings for longitude range (excludes closing vertices).
+ */
+function lonRangeOfRings(rings: number[][][]): {
+  min: number
+  allAbove180: boolean
+} {
+  let min = Infinity
+  let allAbove180 = true
+  for (const ring of rings) {
+    for (let i = 0; i < ring.length - 1; i++) {
+      const lon = ring[i][0]
+      if (lon < min) min = lon
+      if (lon <= 180) allAbove180 = false
+    }
+  }
+  return { min, allAbove180 }
+}
+
+/**
+ * Compute the shift needed to canonicalize a longitude range:
+ * +360 if any lon < -180, -360 if all lons > 180, else 0.
+ */
+function canonicalLonShift(rings: number[][][]): number {
+  const { min, allAbove180 } = lonRangeOfRings(rings)
+  if (min < -180) return 360
+  if (allAbove180) return -360
+  return 0
+}
+
+/**
+ * Apply canonical longitude shift to a ring array.
+ */
+function canonicalizeLonRange(rings: number[][][]): number[][][] {
+  const shift = canonicalLonShift(rings)
+  return shift !== 0 ? shiftRingsLon(rings, shift) : rings
+}
+
+/**
+ * Normalize a polygon's ring longitudes for continuity.
+ *
+ * The outer ring (index 0) determines the unwrap direction. Holes (index 1+)
+ * are shifted by a single per-ring ±360 offset to match the outer ring's
+ * coordinate frame. If the result extends below -180, all rings are shifted
+ * +360 to canonicalize to eastward extension.
+ *
+ * Output rings are always closed.
+ */
+export function normalizePolygonRings(rings: number[][][]): number[][][] {
+  if (rings.length === 0) return rings
+
+  // Check if any vertex in any ring is outside [-180, 180] (explicit crossing)
+  let hasExplicit = false
+  for (const ring of rings) {
+    for (const [lon] of ring) {
+      if (lon > 180 || lon < -180) {
+        hasExplicit = true
+        break
+      }
+    }
+    if (hasExplicit) break
+  }
+
+  // All vertices in [-180, 180]: literal interpretation, just ensure rings are closed
+  if (!hasExplicit) {
+    return rings.map((ring) => closeRing(ring.map(([lon, lat]) => [lon, lat])))
+  }
+
+  // Explicit crossing: normalize outer ring for longitude continuity
+  const outer = normalizeRingLongitudes(rings[0])
+
+  // Align hole rings to outer ring's frame with a single per-ring ±360 shift
+  const outerCenter = ringCentroidLon(outer)
+  const result: number[][][] = [outer]
+  for (let r = 1; r < rings.length; r++) {
+    const hole = normalizeRingLongitudes(rings[r])
+    const shift = nearestLonShift(ringCentroidLon(hole), outerCenter)
+    result.push(
+      shift !== 0 ? hole.map(([lon, lat]) => [lon + shift, lat]) : hole
+    )
+  }
+
+  return canonicalizeLonRange(result)
+}
+
+/**
+ * Apply per-edge longitude unwrapping for continuity.
+ *
+ * Only called when the caller has already verified explicit out-of-range
+ * coordinates (|lon| > 180). Returns a new closed ring.
+ */
+function normalizeRingLongitudes(ring: number[][]): number[][] {
+  if (ring.length < 2) return ring.map(([lon, lat]) => [lon, lat])
+
+  const result: number[][] = [[ring[0][0], ring[0][1]]]
+  let prevLon = ring[0][0]
+
+  for (let i = 1; i < ring.length; i++) {
+    let lon = ring[i][0]
+    const lat = ring[i][1]
+    const delta = lon - prevLon
+    if (delta > 180) {
+      lon -= 360
+    } else if (delta < -180) {
+      lon += 360
+    }
+    result.push([lon, lat])
+    prevLon = lon
+  }
+
+  return closeRing(result)
+}
+
+/**
+ * Compute a WrappedBoundingBox from normalized polygon rings.
+ * Input rings must already be processed by normalizePolygonRings.
+ * Uses wrap-normalization (not clamping) for crossings.
+ */
+export function computeWrappedBboxFromNormalized(
+  normalizedRings: number[][][]
+): WrappedBoundingBox {
+  let rawMin = Infinity
+  let rawMax = -Infinity
+  let south = Infinity
+  let north = -Infinity
+
+  for (const ring of normalizedRings) {
+    for (let i = 0; i < ring.length - 1; i++) {
+      const lon = ring[i][0]
+      const lat = ring[i][1]
+      if (lon < rawMin) rawMin = lon
+      if (lon > rawMax) rawMax = lon
+      if (lat < south) south = lat
+      if (lat > north) north = lat
+    }
+  }
+
+  if (rawMin >= -180 && rawMax <= 180) {
+    return {
+      west: rawMin,
+      east: rawMax,
+      south,
+      north,
+      crossesAntimeridian: false,
+    }
+  }
+
+  // Crossing: rawMax > 180 (westward was canonicalized to eastward)
+  const west = wrapLon(rawMin)
+  const east = wrapLon(rawMax)
+  // Guard: if wrapping collapses the crossing (e.g. rawMin = -180 exactly),
+  // treat as non-crossing. This can't happen for valid simple polygons after
+  // canonicalization, but defends the west > east invariant.
+  if (west <= east) {
+    return { west, east, south, north, crossesAntimeridian: false }
+  }
+  return { west, east, south, north, crossesAntimeridian: true }
+}
+
+/**
+ * Sutherland-Hodgman clip of a closed ring against a half-plane.
+ *
+ * keepBelow=true:  keep lon <= clipLon
+ * keepBelow=false: keep lon > clipLon (output lons shifted by -360)
+ *
+ * Returns a closed ring (possibly empty or degenerate).
+ */
+export function clipRingToHalfPlane(
+  ring: number[][],
+  clipLon: number,
+  keepBelow: boolean
+): number[][] {
+  if (ring.length < 4) return [] // need at least a triangle (3 vertices + close)
+
+  const output: number[][] = []
+  const isInside = keepBelow
+    ? (lon: number) => lon <= clipLon
+    : (lon: number) => lon > clipLon
+
+  // Walk edges of the closed ring (ring[i] -> ring[i+1])
+  for (let i = 0; i < ring.length - 1; i++) {
+    const [lon0, lat0] = ring[i]
+    const [lon1, lat1] = ring[i + 1]
+    const in0 = isInside(lon0)
+    const in1 = isInside(lon1)
+
+    if (in0 && in1) {
+      // Both inside: output p1
+      output.push([lon1, lat1])
+    } else if (in0 && !in1) {
+      // Inside -> outside: output intersection
+      const t = (clipLon - lon0) / (lon1 - lon0)
+      const latI = lat0 + t * (lat1 - lat0)
+      output.push([clipLon, latI])
+    } else if (!in0 && in1) {
+      // Outside -> inside: output intersection, then p1
+      const t = (clipLon - lon0) / (lon1 - lon0)
+      const latI = lat0 + t * (lat1 - lat0)
+      output.push([clipLon, latI])
+      output.push([lon1, lat1])
+    }
+    // Both outside: output nothing
+  }
+
+  if (output.length < 3) return []
+
+  // Shift longitudes for the "outside" half
+  const shifted = !keepBelow
+    ? output.map(([lon, lat]) => [lon - 360, lat])
+    : output
+
+  return closeRing(shifted)
+}
+
+/**
+ * Clip a normalized polygon (outer + holes) at the antimeridian.
+ *
+ * Input rings must already be processed by normalizePolygonRings
+ * (crossing is always > 180, never < -180).
+ *
+ * Returns west (lon <= 180) and east (lon > 180, shifted -360) ring sets.
+ * Degenerate rings (< 3 unique vertices) are dropped.
+ */
+export function clipNormalizedPolygonAtAntimeridian(
+  normalizedRings: number[][][]
+): { west: number[][][]; east: number[][][] } {
+  // Check if any vertex lon > 180; if not, no crossing
+  let crosses = false
+  for (const ring of normalizedRings) {
+    for (let i = 0; i < ring.length - 1; i++) {
+      if (ring[i][0] > 180) {
+        crosses = true
+        break
+      }
+    }
+    if (crosses) break
+  }
+
+  if (!crosses) {
+    return { west: normalizedRings, east: [] }
+  }
+
+  const west: number[][][] = []
+  const east: number[][][] = []
+
+  for (const ring of normalizedRings) {
+    const w = clipRingToHalfPlane(ring, 180, true)
+    const e = clipRingToHalfPlane(ring, 180, false)
+    if (w.length >= 4) west.push(w)
+    if (e.length >= 4) east.push(e)
+  }
+
+  return { west, east }
+}
+
+/**
+ * Align independently-normalized MultiPolygon members into one shared unwrap frame.
+ *
+ * Uses gap detection across all outer rings to find the optimal unwrap center,
+ * then shifts each member by a single ±360 offset (preserving internal continuity).
+ * Applies eastward canonicalization if the shared range extends below -180.
+ */
+export function alignMultiPolygonMembers(
+  members: number[][][][]
+): number[][][][] {
+  if (members.length <= 1) return members
+
+  // Collect all outer ring lons, wrap-normalized to [-180, 180]
+  const wrappedLons: number[] = []
+  for (const member of members) {
+    const outer = member[0]
+    for (let i = 0; i < outer.length - 1; i++) {
+      wrappedLons.push(wrapLon(outer[i][0]))
+    }
+  }
+  wrappedLons.sort((a, b) => a - b)
+
+  // Find the largest gap between consecutive sorted lons (including wrap-around)
+  let maxGap = 0
+  let gapEndIndex = 0
+  for (let i = 1; i < wrappedLons.length; i++) {
+    const gap = wrappedLons[i] - wrappedLons[i - 1]
+    if (gap > maxGap) {
+      maxGap = gap
+      gapEndIndex = i
+    }
+  }
+  // Check the wrap-around gap
+  const wrapGap = wrappedLons[0] + 360 - wrappedLons[wrappedLons.length - 1]
+  if (wrapGap > maxGap) {
+    maxGap = wrapGap
+    gapEndIndex = 0
+  }
+
+  // The unwrap center is opposite the largest gap (180° from the gap's midpoint)
+  const gapStart =
+    gapEndIndex === 0
+      ? wrappedLons[wrappedLons.length - 1]
+      : wrappedLons[gapEndIndex - 1]
+  const gapEnd = wrappedLons[gapEndIndex]
+  const gapMidpoint =
+    gapEndIndex === 0 ? (gapStart + gapEnd + 360) / 2 : (gapStart + gapEnd) / 2
+  const center = wrapLon(gapMidpoint + 180)
+
+  // Shift each member by a single ±360 offset based on its outer ring centroid
+  const aligned: number[][][][] = members.map((member) => {
+    const shift = nearestLonShift(ringCentroidLon(member[0]), center)
+    return shift !== 0
+      ? member.map((ring) => ring.map(([lon, lat]) => [lon + shift, lat]))
+      : member
+  })
+
+  // Canonicalize: shift all if any lon < -180, or all > 180
+  const shift = canonicalLonShift(aligned.flatMap((m) => m))
+  if (shift !== 0) {
+    return aligned.map((member) => shiftRingsLon(member, shift))
+  }
+
+  return aligned
+}
+
+/**
+ * Preprocess a query geometry for antimeridian handling.
+ *
+ * For Polygon/MultiPolygon: normalizes ring longitudes, computes a
+ * WrappedBoundingBox, and clips at ±180 if crossing. For Point: returns as-is.
+ *
+ * Standard CRS only (EPSG:3857, EPSG:4326). Proj4 callers should skip this.
+ */
+export function preprocessQueryGeometry(geometry: QueryGeometry): {
+  geometry: QueryGeometry
+  bbox: WrappedBoundingBox
+} {
+  if (geometry.type === 'Point') {
+    const [lon, lat] = geometry.coordinates
+    return {
+      geometry,
+      bbox: {
+        west: lon,
+        east: lon,
+        south: lat,
+        north: lat,
+        crossesAntimeridian: false,
+      },
+    }
+  }
+
+  if (geometry.type === 'Polygon') {
+    const normalized = normalizePolygonRings(geometry.coordinates)
+    const bbox = computeWrappedBboxFromNormalized(normalized)
+
+    if (!bbox.crossesAntimeridian) {
+      return { geometry: { type: 'Polygon', coordinates: normalized }, bbox }
+    }
+
+    const { west, east } = clipNormalizedPolygonAtAntimeridian(normalized)
+    const polygons: number[][][][] = []
+    if (west.length > 0) polygons.push(west)
+    if (east.length > 0) polygons.push(east)
+
+    if (polygons.length === 0) {
+      return { geometry: { type: 'Polygon', coordinates: normalized }, bbox }
+    }
+
+    return {
+      geometry: {
+        type: 'MultiPolygon',
+        coordinates: polygons,
+      } as GeoJSONMultiPolygon,
+      bbox,
+    }
+  }
+
+  // MultiPolygon: normalize each member, align, compute combined bbox, clip
+  const normalizedMembers = geometry.coordinates.map((memberRings) =>
+    normalizePolygonRings(memberRings)
+  )
+  const aligned = alignMultiPolygonMembers(normalizedMembers)
+
+  // Compute combined bbox from all aligned rings
+  const allRings: number[][][] = []
+  for (const member of aligned) {
+    for (const ring of member) {
+      allRings.push(ring)
+    }
+  }
+  const bbox = computeWrappedBboxFromNormalized(allRings)
+
+  if (!bbox.crossesAntimeridian) {
+    return {
+      geometry: {
+        type: 'MultiPolygon',
+        coordinates: aligned,
+      } as GeoJSONMultiPolygon,
+      bbox,
+    }
+  }
+
+  // Clip each member
+  const resultPolygons: number[][][][] = []
+  for (const member of aligned) {
+    const { west, east } = clipNormalizedPolygonAtAntimeridian(member)
+    if (west.length > 0) resultPolygons.push(west)
+    if (east.length > 0) resultPolygons.push(east)
+  }
+
+  if (resultPolygons.length === 0) {
+    return {
+      geometry: {
+        type: 'MultiPolygon',
+        coordinates: aligned,
+      } as GeoJSONMultiPolygon,
+      bbox,
+    }
+  }
+
+  return {
+    geometry: {
+      type: 'MultiPolygon',
+      coordinates: resultPolygons,
+    } as GeoJSONMultiPolygon,
+    bbox,
+  }
+}
+
+/**
+ * Derive two pixel rectangles from a crossing WrappedBoundingBox.
+ *
+ * West strip: [westPx, width)  — covers lon [bbox.west, 180]
+ * East strip: [0, eastPx)      — covers lon [-180, bbox.east]
+ *
+ * Uses standard-CRS floor/ceil/clamp conventions from computePixelBoundsFromGeometry.
+ * Only valid for standard CRS (EPSG:3857, EPSG:4326), not proj4.
+ */
+export function wrappedBboxToPixelSpans(
+  bbox: WrappedBoundingBox,
   bounds: MercatorBounds,
   width: number,
   height: number,
   crs: CRS,
-  latIsAscending?: boolean,
-  proj4def?: string | null,
-  sourceBounds?: Bounds | null,
-  cachedTransformer?: CachedTransformer
-): { x: number; y: number } | null {
-  // If proj4 is provided, use proj4 to transform lat/lon → source CRS → pixel
-  if (proj4def && sourceBounds) {
-    const transformer =
-      cachedTransformer ?? createWGS84ToSourceTransformer(proj4def)
-    const [srcX, srcY] = transformer.forward(lng, lat)
+  latIsAscending?: boolean
+): { west?: PixelRect; east?: PixelRect } {
+  // Y range shared by both strips
+  const yRange = computeYPixelRange(
+    bbox.south,
+    bbox.north,
+    bounds,
+    height,
+    crs,
+    latIsAscending
+  )
+  if (!yRange) return {}
+  const { yStart, yEnd } = yRange
 
-    // Check if within source bounds
-    const [xMin, yMin, xMax, yMax] = sourceBounds
-    if (srcX < xMin || srcX > xMax || srcY < yMin || srcY > yMax) {
-      return null
-    }
+  const xRange = bounds.x1 - bounds.x0
 
-    // Convert source CRS coords to pixel indices
-    const [xPixel, yPixel] = sourceCRSToPixel(
-      srcX,
-      srcY,
-      sourceBounds,
-      width,
-      height,
-      latIsAscending
-    )
-
-    const x = Math.floor(xPixel)
-    const y = Math.floor(yPixel)
-
-    if (x < 0 || x >= width || y < 0 || y >= height) {
-      return null
-    }
-
-    return { x, y }
+  const computeStrip = (
+    normMin: number,
+    normMax: number
+  ): PixelRect | undefined => {
+    const xFracMin = (normMin - bounds.x0) / xRange
+    const xFracMax = (normMax - bounds.x0) / xRange
+    // Raw pixel range before clamping
+    const rawMinX = Math.floor(xFracMin * width)
+    const rawMaxX = Math.ceil(xFracMax * width)
+    // Check for actual overlap with [0, width) before clamping
+    if (rawMaxX <= 0 || rawMinX >= width) return undefined
+    const minX = Math.max(0, rawMinX)
+    const maxX = Math.min(width, rawMaxX)
+    if (maxX <= minX) return undefined
+    return { minX, maxX, minY: yStart, maxY: yEnd }
   }
 
-  let normX: number
-  let normY: number
+  // West strip: [bbox.west, 180]
+  const westNormMin = lonToMercatorNorm(bbox.west)
+  const westNormMax = lonToMercatorNorm(180)
+  // East strip: [-180, bbox.east]
+  const eastNormMin = lonToMercatorNorm(-180)
+  const eastNormMax = lonToMercatorNorm(bbox.east)
 
-  if (
-    crs === 'EPSG:4326' &&
-    bounds.latMin !== undefined &&
-    bounds.latMax !== undefined
-  ) {
-    // For equirectangular data, use linear lat mapping
-    normX = (lonToMercatorNorm(lng) - bounds.x0) / (bounds.x1 - bounds.x0)
-    // Convert lat to mercator for display, but sample linearly in source data
-    const latRange = bounds.latMax - bounds.latMin
-    if (latRange === 0) return null
-    const latNorm = latIsAscending
-      ? (lat - bounds.latMin) / latRange
-      : (bounds.latMax - lat) / latRange
-    normY = latNorm
-  } else {
-    normX = (lonToMercatorNorm(lng) - bounds.x0) / (bounds.x1 - bounds.x0)
-    normY = (latToMercatorNorm(lat) - bounds.y0) / (bounds.y1 - bounds.y0)
+  const result: { west?: PixelRect; east?: PixelRect } = {}
+
+  const westStrip = computeStrip(westNormMin, westNormMax)
+  if (westStrip) result.west = westStrip
+  const eastStrip = computeStrip(eastNormMin, eastNormMax)
+  if (eastStrip) result.east = eastStrip
+
+  return result
+}
+
+/**
+ * Check if a geometry contains explicit out-of-range coordinates (|lon| > 180).
+ *
+ * This does NOT determine whether the geometry actually crosses the antimeridian —
+ * coords like [200, 210] are out-of-range but canonicalize to a non-crossing
+ * [-160, -150]. Use preprocessQueryGeometry().bbox.crossesAntimeridian for that.
+ */
+export function hasOutOfRangeCoordinates(geometry: QueryGeometry): boolean {
+  if (geometry.type === 'Point') {
+    const [lon] = geometry.coordinates
+    return lon > 180 || lon < -180
   }
 
-  if (normX < 0 || normX > 1 || normY < 0 || normY > 1) {
-    return null
+  const checkRing = (ring: number[][]): boolean =>
+    ring.some(([lon]) => lon > 180 || lon < -180)
+
+  if (geometry.type === 'Polygon') {
+    return geometry.coordinates.some(checkRing)
   }
 
-  const x = Math.floor(normX * width)
-  const y = Math.floor(normY * height)
-
-  return {
-    x: Math.min(x, width - 1),
-    y: Math.min(y, height - 1),
-  }
+  return geometry.coordinates.some((poly) => poly.some(checkRing))
 }

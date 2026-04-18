@@ -17,6 +17,10 @@ export type QueryDataValues = number[] | NestedValues
 /**
  * Result from a query (point or region).
  * Matches carbonplan/maps structure: { [variable]: values, dimensions, coordinates }
+ *
+ * Spatial coordinate keys depend on the dataset's CRS:
+ * - Standard CRS (EPSG:3857/4326): `lat`/`lon`
+ * - Projected CRS (proj4): `y`/`x` in the source coordinate system
  */
 export interface QueryResult {
   /** Variable name mapped to its values (flat array or nested based on selector) */
@@ -24,12 +28,10 @@ export interface QueryResult {
     | QueryDataValues
     | string[]
     | { [key: string]: (number | string)[] }
-  /** Dimension names in order (e.g., ['month', 'lat', 'lon']) */
+  /** Dimension names in order (e.g., ['month', 'lat', 'lon'] or ['month', 'y', 'x']) */
   dimensions: string[]
   /** Coordinate arrays for each dimension */
   coordinates: {
-    lat: number[]
-    lon: number[]
     [key: string]: (number | string)[]
   }
 }
@@ -94,4 +96,14 @@ export interface QueryTransformOptions {
   addOffset?: number
   /** Fill value to filter out (along with NaN/Infinity) */
   fillValue?: number | null
+}
+
+/**
+ * Options for queryData calls.
+ */
+export interface QueryOptions {
+  /** AbortSignal to cancel the query. */
+  signal?: AbortSignal
+  /** Include per-pixel coordinates in the result. Defaults to true. */
+  includeSpatialCoordinates?: boolean
 }
