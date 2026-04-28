@@ -91,7 +91,7 @@ export interface ZarrLayerOptions {
    * new ZarrLayer({ id: 'my-layer', store, variable: 'temperature', ... })
    * ```
    */
-  store?: zarr.Readable<unknown>
+  store?: zarr.Readable
   selector?: Selector
   colormap: ColormapArray
   clim: [number, number]
@@ -162,17 +162,6 @@ export interface ZarrLayerOptions {
 export type CRS = 'EPSG:4326' | 'EPSG:3857'
 
 // Untiled multiscale types (zarr-conventions/multiscales format)
-export interface MultiscaleTransform {
-  scale: [number, number]
-  translation: [number, number]
-}
-
-export interface UntiledMultiscaleLayoutItem {
-  asset: string
-  transform: MultiscaleTransform
-  derived_from?: string
-}
-
 export interface UntiledLevel {
   asset: string
   scale: [number, number]
@@ -183,13 +172,6 @@ export interface UntiledLevel {
   addOffset?: number
   fillValue?: number | null
   dtype?: string | null
-}
-
-export interface VisibleChunk {
-  levelIndex: number
-  chunkX: number
-  chunkY: number
-  fullIndices: number[]
 }
 
 export interface BoundsLike {

@@ -7,24 +7,23 @@
  * benefit from caching transparently.
  */
 
-import type { AsyncReadable } from '@zarrita/storage'
+import type { AsyncReadable, GetOptions, RangeQuery } from '@zarrita/storage'
 
 type AbsolutePath = `/${string}`
-type RangeQuery = { offset: number; length: number } | { suffixLength: number }
 
 interface CacheEntry {
   data: Uint8Array
   byteSize: number
 }
 
-export class CachingStore implements AsyncReadable<RequestInit> {
+export class CachingStore implements AsyncReadable {
   private cache: Map<string, CacheEntry> = new Map()
   private totalBytes: number = 0
   readonly maxBytes: number
-  private baseStore: AsyncReadable<RequestInit>
+  private baseStore: AsyncReadable
 
   constructor(
-    baseStore: AsyncReadable<RequestInit>,
+    baseStore: AsyncReadable,
     maxBytes: number = 100 * 1024 * 1024 // 100 MB default
   ) {
     this.baseStore = baseStore
@@ -33,7 +32,7 @@ export class CachingStore implements AsyncReadable<RequestInit> {
 
   async get(
     key: AbsolutePath,
-    opts?: RequestInit
+    opts?: GetOptions
   ): Promise<Uint8Array | undefined> {
     const cached = this.cache.get(key)
     if (cached) {
@@ -56,7 +55,7 @@ export class CachingStore implements AsyncReadable<RequestInit> {
   async getRange(
     key: AbsolutePath,
     range: RangeQuery,
-    opts?: RequestInit
+    opts?: GetOptions
   ): Promise<Uint8Array | undefined> {
     // For sharded zarr v3, chunk reads may go through getRange.
     // Cache with a composite key that includes the range.

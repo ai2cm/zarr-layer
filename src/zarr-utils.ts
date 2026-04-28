@@ -6,6 +6,7 @@
  */
 
 import * as zarr from 'zarrita'
+import type { Readable } from '@zarrita/storage'
 import {
   type SelectorSpec,
   type SelectorValue,
@@ -21,7 +22,9 @@ type CoordinateArray = zarr.Array<zarr.DataType> & {
 }
 type CoordinatesMap = Record<string, CoordinateArray>
 
-const resolveOpenFunc = (zarrVersion: 2 | 3 | null): typeof zarr.open => {
+export const resolveOpenFunc = (
+  zarrVersion: 2 | 3 | null
+): typeof zarr.open => {
   if (zarrVersion === 2) return zarr.open.v2 as typeof zarr.open
   if (zarrVersion === 3) return zarr.open.v3 as typeof zarr.open
   return zarr.open
@@ -37,7 +40,7 @@ const resolveOpenFunc = (zarrVersion: 2 | 3 | null): typeof zarr.open => {
  * sanitizeGlslName('123abc') // returns '_123abc'
  * sanitizeGlslName('band-1') // returns 'band_1'
  */
-export function sanitizeGlslName(name: string): string {
+function sanitizeGlslName(name: string): string {
   // Replace any non-alphanumeric character (except underscore) with underscore
   let sanitized = name.replace(/[^a-zA-Z0-9_]/g, '_')
 
@@ -120,7 +123,7 @@ export async function loadDimensionValues(
   dimensionValues: Record<string, Float64Array | number[] | string[]>,
   levelInfo: string | null,
   dimIndices: DimIndicesProps[string],
-  root: zarr.Location<zarr.FetchStore>,
+  root: zarr.Location<Readable>,
   zarrVersion: 2 | 3 | null,
   slice?: [number, number]
 ): Promise<Float64Array | number[] | string[]> {

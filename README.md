@@ -266,7 +266,18 @@ const result = await layer.queryData({
 // }
 ```
 
-**Note:** Query results match rendered values (`scale_factor`/`add_offset` applied, `fillValue`/NaN filtered). For datasets rendered via `proj4` reprojection, queries sample the underlying source grid; because reprojection/resampling occurs for display, a visual pixel click may not align perfectly with the nearest source pixel.
+Datasets using a custom projection (via the `proj4` option) return coordinates in the source coordinate system, with keys matching the store's axis names (e.g. `y`/`x`). All other datasets (EPSG:4326, EPSG:3857) return `lat`/`lon` keys with WGS84 degree values.
+
+You can pass a third `options` argument to control query behavior:
+
+```ts
+const result = await layer.queryData(geometry, selector, {
+  signal: abortController.signal, // cancel in-flight query
+  includeSpatialCoordinates: false, // omit per-pixel coordinates for slimmer results
+})
+```
+
+**Note:** Query results match rendered values (`scale_factor`/`add_offset` applied, `fillValue`/NaN filtered).
 
 ## authentication
 
@@ -304,6 +315,47 @@ new ZarrLayer({
 ```
 
 The store must implement the zarrita `Readable` interface with at minimum a `get(key: string)` method.
+
+## codecs
+
+The library uses [zarrita](https://github.com/manzt/zarrita.js) for Zarr data access. zarrita includes built-in codecs for `bytes`, `zlib`, `gzip`, `blosc`, `lz4`, `zstd`, `transpose`, `crc32c`, and `bitround`. You can add more if needed!
+
+### adding custom codecs
+
+Virtualized NetCDF data may use `numcodecs.*`-prefixed codec names (e.g., `numcodecs.zlib`, `numcodecs.shuffle`) that zarrita doesn't recognize by default. Use `codecRegistry` to register them before creating layers:
+
+```ts
+import { codecRegistry } from '@carbonplan/zarr-layer'
+
+// Alias numcodecs.zlib → zarrita's built-in zlib
+const zlibFactory = codecRegistry.get('zlib')
+if (zlibFactory) codecRegistry.set('numcodecs.zlib', zlibFactory)
+
+// numcodecs.shuffle — byte un-shuffle by element size
+codecRegistry.set('numcodecs.shuffle', async () => ({
+  fromConfig(config: { elementsize?: number }) {
+    const elementsize = config?.elementsize ?? 1
+    return {
+      kind: 'bytes_to_bytes',
+      decode(bytes: Uint8Array): Uint8Array {
+        if (elementsize <= 1) return bytes
+        const n = bytes.length
+        const count = Math.floor(n / elementsize)
+        const out = new Uint8Array(n)
+        for (let i = 0; i < count; i++) {
+          for (let j = 0; j < elementsize; j++) {
+            out[i * elementsize + j] = bytes[j * count + i]
+          }
+        }
+        for (let i = count * elementsize; i < n; i++) {
+          out[i] = bytes[i]
+        }
+        return out
+      },
+    }
+  },
+}))
+```
 
 ## thanks
 

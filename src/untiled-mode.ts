@@ -21,7 +21,13 @@ import type {
   TileId,
   RegionRenderState,
 } from './zarr-mode'
-import type { QueryGeometry, QueryResult } from './query/types'
+import type {
+  QueryGeometry,
+  QueryOptions,
+  QueryResult,
+  QueryDataValues,
+  NestedValues,
+} from './query/types'
 import type {
   LoadingStateCallback,
   MapLike,
@@ -52,10 +58,13 @@ import {
 import type { ZarrRenderer, ShaderProgram } from './zarr-renderer'
 import type { CustomShaderConfig } from './renderer-types'
 import { renderMapboxTile } from './mapbox-tile-renderer'
-import { queryRegionSingleImage } from './query/region-query'
+import { queryRegionUntiled, findSpatialDimNames } from './query/region-query'
 import {
-  mercatorBoundsToPixel,
   computePixelBoundsFromGeometry,
+  preprocessQueryGeometry,
+  wrappedBboxToPixelSpans,
+  rasterExtentCrossesAntimeridian,
+  type PixelRect,
 } from './query/query-utils'
 import {
   createTransformer,
@@ -65,7 +74,6 @@ import {
   sampleEdgesToMercatorBounds,
 } from './projection-utils'
 import { createHybridMesh } from './mesh-reprojector'
-import { setObjectValues } from './query/selector-utils'
 import { geoToArrayIndex } from './map-utils'
 import {
   type ThrottleState,
@@ -296,6 +304,7 @@ export class UntiledMode implements ZarrMode {
   // Loading state
   private isRemoved: boolean = false
   private throttleMs: number
+  private _antimeridianWarnings: Set<string> = new Set()
 
   // Shared state managers
   private throttleState: ThrottleState = createThrottleState()
@@ -1375,16 +1384,13 @@ export class UntiledMode implements ZarrMode {
       includeSpatialSlices: boolean
       /** If true, track multi-value dimensions for channel packing */
       trackMultiValue: boolean
-      /** Spatial bounds for fetch - point for single pixel, bbox for region subset */
-      spatialBounds?:
-        | { type: 'point'; x: number; y: number }
-        | {
-            type: 'bbox'
-            minX: number
-            maxX: number
-            minY: number
-            maxY: number
-          }
+      /** Spatial bounds for fetch - bbox for region subset */
+      spatialBounds?: {
+        minX: number
+        maxX: number
+        minY: number
+        maxY: number
+      }
     }
   ): Promise<{
     sliceArgs: (number | zarr.Slice)[]
@@ -1417,9 +1423,7 @@ export class UntiledMode implements ZarrMode {
       const dimType = this.classifyDimension(dimName)
 
       if (dimType === 'lon') {
-        if (options.spatialBounds?.type === 'point') {
-          sliceArgs[dimInfo.index] = options.spatialBounds.x
-        } else if (options.spatialBounds?.type === 'bbox') {
+        if (options.spatialBounds) {
           sliceArgs[dimInfo.index] = zarr.slice(
             options.spatialBounds.minX,
             options.spatialBounds.maxX
@@ -1430,9 +1434,7 @@ export class UntiledMode implements ZarrMode {
             : 0
         }
       } else if (dimType === 'lat') {
-        if (options.spatialBounds?.type === 'point') {
-          sliceArgs[dimInfo.index] = options.spatialBounds.y
-        } else if (options.spatialBounds?.type === 'bbox') {
+        if (options.spatialBounds) {
           sliceArgs[dimInfo.index] = zarr.slice(
             options.spatialBounds.minY,
             options.spatialBounds.maxY
@@ -1837,7 +1839,7 @@ export class UntiledMode implements ZarrMode {
         if (isStale()) return
 
         const result = (await zarr.get(snapshot.zarrArray, baseSliceArgs, {
-          opts: { signal: controller.signal },
+          signal: controller.signal,
         })) as { data: ArrayLike<number> }
 
         if (isStale()) return
@@ -1866,7 +1868,7 @@ export class UntiledMode implements ZarrMode {
         const results = await Promise.all(
           allSliceArgs.map((sliceArgs) =>
             zarr.get(snapshot.zarrArray, sliceArgs, {
-              opts: { signal: controller.signal },
+              signal: controller.signal,
             })
           )
         )
@@ -2839,13 +2841,15 @@ export class UntiledMode implements ZarrMode {
    */
   private async fetchQueryData(
     selector: NormalizedSelector,
-    spatialQuery:
-      | { type: 'point'; x: number; y: number }
-      | { type: 'bbox'; minX: number; maxX: number; minY: number; maxY: number }
+    spatialQuery: {
+      minX: number
+      maxX: number
+      minY: number
+      maxY: number
+    },
+    signal?: AbortSignal
   ): Promise<{
-    type: 'point' | 'bbox'
-    values: number[] // For point queries
-    data: Float32Array // For bbox queries
+    data: Float32Array
     width: number
     height: number
     channels: number
@@ -2857,7 +2861,7 @@ export class UntiledMode implements ZarrMode {
     try {
       const { sliceArgs: baseSliceArgs, multiValueDims } =
         await this.buildSliceArgsForSelector(selector, {
-          includeSpatialSlices: spatialQuery.type !== 'bbox',
+          includeSpatialSlices: false,
           trackMultiValue: true,
           spatialBounds: spatialQuery,
         })
@@ -2868,52 +2872,20 @@ export class UntiledMode implements ZarrMode {
       } = this.buildChannelCombinations(multiValueDims)
       const numChannels = channelCombinations.length || 1
       const multiValueDimNames = multiValueDims.map((d) => d.dimName)
+      const getOpts = signal ? { signal } : undefined
 
-      // Point query: fetch individual values
-      if (spatialQuery.type === 'point') {
-        const values: number[] = []
-
-        if (numChannels === 1) {
-          const result = await zarr.get(this.zarrArray, baseSliceArgs)
-          const value = this.extractScalarValue(result)
-          if (value === null) return null
-          values.push(value)
-        } else {
-          for (let c = 0; c < numChannels; c++) {
-            const sliceArgs = [...baseSliceArgs]
-            const combo = channelCombinations[c]
-            for (let i = 0; i < multiValueDims.length; i++) {
-              sliceArgs[multiValueDims[i].dimIndex] = combo[i]
-            }
-            const result = await zarr.get(this.zarrArray, sliceArgs)
-            const value = this.extractScalarValue(result)
-            if (value !== null) values.push(value)
-          }
-        }
-
-        return {
-          type: 'point',
-          values,
-          data: new Float32Array(0),
-          width: 1,
-          height: 1,
-          channels: numChannels,
-          channelLabels: channelLabelCombinations,
-          multiValueDimNames,
-        }
-      }
-
-      // Bbox query: fetch region data
       const fetchWidth = spatialQuery.maxX - spatialQuery.minX
       const fetchHeight = spatialQuery.maxY - spatialQuery.minY
 
       if (numChannels === 1) {
-        const result = (await zarr.get(this.zarrArray, baseSliceArgs)) as {
+        const result = (await zarr.get(
+          this.zarrArray,
+          baseSliceArgs,
+          getOpts
+        )) as {
           data: ArrayLike<number>
         }
         return {
-          type: 'bbox',
-          values: [],
           data: new Float32Array(result.data),
           width: fetchWidth,
           height: fetchHeight,
@@ -2933,7 +2905,11 @@ export class UntiledMode implements ZarrMode {
           sliceArgs[multiValueDims[i].dimIndex] = combo[i]
         }
 
-        const bandData = (await zarr.get(this.zarrArray, sliceArgs)) as {
+        const bandData = (await zarr.get(
+          this.zarrArray,
+          sliceArgs,
+          getOpts
+        )) as {
           data: ArrayLike<number>
         }
         for (let pixIdx = 0; pixIdx < fetchWidth * fetchHeight; pixIdx++) {
@@ -2942,8 +2918,6 @@ export class UntiledMode implements ZarrMode {
       }
 
       return {
-        type: 'bbox',
-        values: [],
         data: packedData,
         width: fetchWidth,
         height: fetchHeight,
@@ -2952,25 +2926,43 @@ export class UntiledMode implements ZarrMode {
         multiValueDimNames,
       }
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err
       console.error('Error fetching query data:', err)
       return null
     }
   }
 
   /**
-   * Extract a scalar value from zarr.get result (handles various return formats).
+   * Compute subset bounds from pixel bounds against the full mercator bounds.
    */
-  private extractScalarValue(result: unknown): number | null {
-    if (result && typeof result === 'object' && 'data' in result) {
-      const data = (result as { data: ArrayLike<number> }).data
-      return data[0] ?? (data as unknown as number)
-    } else if (typeof result === 'number') {
-      return result
-    } else if (ArrayBuffer.isView(result)) {
-      return (result as Float32Array)[0]
+  private computeSubsetBounds(pixelBounds: PixelRect): MercatorBounds {
+    const { minX, maxX, minY, maxY } = pixelBounds
+    const xRange = this.mercatorBounds!.x1 - this.mercatorBounds!.x0
+    const yRange = this.mercatorBounds!.y1 - this.mercatorBounds!.y0
+    const subsetBounds: MercatorBounds = {
+      x0: this.mercatorBounds!.x0 + (minX / this.width) * xRange,
+      x1: this.mercatorBounds!.x0 + (maxX / this.width) * xRange,
+      y0: this.mercatorBounds!.y0 + (minY / this.height) * yRange,
+      y1: this.mercatorBounds!.y0 + (maxY / this.height) * yRange,
     }
-    console.warn('Unexpected zarr.get result format:', result)
-    return null
+    if (
+      this.mercatorBounds!.latMin !== undefined &&
+      this.mercatorBounds!.latMax !== undefined
+    ) {
+      const latRange = this.mercatorBounds!.latMax - this.mercatorBounds!.latMin
+      if (this.latIsAscending) {
+        subsetBounds.latMin =
+          this.mercatorBounds!.latMin + (minY / this.height) * latRange
+        subsetBounds.latMax =
+          this.mercatorBounds!.latMin + (maxY / this.height) * latRange
+      } else {
+        subsetBounds.latMax =
+          this.mercatorBounds!.latMax - (minY / this.height) * latRange
+        subsetBounds.latMin =
+          this.mercatorBounds!.latMax - (maxY / this.height) * latRange
+      }
+    }
+    return subsetBounds
   }
 
   /**
@@ -2978,158 +2970,28 @@ export class UntiledMode implements ZarrMode {
    */
   async queryData(
     geometry: QueryGeometry,
-    selector?: Selector
+    selector?: Selector,
+    options?: QueryOptions
   ): Promise<QueryResult> {
-    if (!this.mercatorBounds) {
-      return {
-        [this.variable]: [],
-        dimensions: [],
-        coordinates: { lat: [], lon: [] },
-      }
-    }
+    const emptyResult = (): QueryResult => ({
+      [this.variable]: [],
+      dimensions: [],
+      coordinates: { lat: [], lon: [] },
+    })
+
+    if (!this.mercatorBounds) return emptyResult()
 
     const normalizedSelector = selector
       ? normalizeSelector(selector)
       : this.selector
 
     const desc = this.zarrStore.describe()
-    // Use per-level metadata if available (for heterogeneous pyramids)
     const currentLevel = this.levels[this.currentLevelIndex]
-    const scaleFactor = currentLevel?.scaleFactor ?? desc.scaleFactor
-    const addOffset = currentLevel?.addOffset ?? desc.addOffset
-    const fill_value = currentLevel?.fillValue ?? desc.fill_value
-
-    // Point geometries: use optimized single-chunk fetch
-    if (geometry.type === 'Point') {
-      const [lon, lat] = geometry.coordinates
-      const coords = { lat: [lat], lon: [lon] }
-
-      const sourceBounds = this.xyLimits
-        ? ([
-            this.xyLimits.xMin,
-            this.xyLimits.yMin,
-            this.xyLimits.xMax,
-            this.xyLimits.yMax,
-          ] as [number, number, number, number])
-        : null
-      const pixel = mercatorBoundsToPixel(
-        lon,
-        lat,
-        this.mercatorBounds,
-        this.width,
-        this.height,
-        this.crs ?? 'EPSG:4326',
-        this.latIsAscending,
-        this.proj4def,
-        sourceBounds,
-        this.cachedWGS84Transformer ?? undefined
-      )
-
-      if (!pixel) {
-        return {
-          [this.variable]: [],
-          dimensions: ['lat', 'lon'],
-          coordinates: coords,
-        }
-      }
-
-      // Fetch only the chunk(s) containing this point
-      const pointData = await this.fetchQueryData(normalizedSelector, {
-        type: 'point',
-        x: pixel.x,
-        y: pixel.y,
-      })
-
-      if (!pointData) {
-        return {
-          [this.variable]: [],
-          dimensions: ['lat', 'lon'],
-          coordinates: coords,
-        }
-      }
-
-      const { values: rawValues, channelLabels, multiValueDimNames } = pointData
-      const valuesNested = multiValueDimNames.length > 0
-      let values: number[] | Record<string | number, any> = valuesNested
-        ? {}
-        : []
-
-      for (let c = 0; c < rawValues.length; c++) {
-        let value = rawValues[c]
-
-        // Filter invalid values
-        if (value === undefined || value === null || !Number.isFinite(value)) {
-          continue
-        }
-        if (fill_value !== null && value === fill_value) {
-          continue
-        }
-
-        // Apply transforms
-        if (scaleFactor !== 1) value *= scaleFactor
-        if (addOffset !== 0) value += addOffset
-
-        if (valuesNested) {
-          const labels = channelLabels?.[c]
-          if (
-            labels &&
-            multiValueDimNames.length > 0 &&
-            labels.length === multiValueDimNames.length
-          ) {
-            values = setObjectValues(values as any, labels, value) as any
-          } else if (Array.isArray(values)) {
-            values.push(value)
-          }
-        } else if (Array.isArray(values)) {
-          values.push(value)
-        }
-      }
-
-      const dimensions = desc.dimensions
-      const mappedDimensions = dimensions.map((d) => {
-        const dimLower = d.toLowerCase()
-        if (['x', 'lon', 'longitude'].includes(dimLower)) return 'lon'
-        if (['y', 'lat', 'latitude'].includes(dimLower)) return 'lat'
-        return d
-      })
-
-      const outputDimensions = valuesNested ? mappedDimensions : ['lat', 'lon']
-      const resultCoordinates: {
-        lat: number[]
-        lon: number[]
-        [key: string]: (number | string)[]
-      } = {
-        lat: coords.lat,
-        lon: coords.lon,
-      }
-
-      if (valuesNested) {
-        for (const dim of dimensions) {
-          const dimLower = dim.toLowerCase()
-          if (
-            ['x', 'lon', 'longitude', 'y', 'lat', 'latitude'].includes(dimLower)
-          ) {
-            continue
-          }
-          const selSpec = normalizedSelector[dim]
-          if (selSpec && 'selected' in selSpec) {
-            const selected = selSpec.selected
-            const vals = Array.isArray(selected) ? selected : [selected]
-            resultCoordinates[dim] = vals as (number | string)[]
-          } else if (desc.coordinates[dim]) {
-            resultCoordinates[dim] = desc.coordinates[dim]
-          }
-        }
-      }
-
-      return {
-        [this.variable]: values as any,
-        dimensions: outputDimensions,
-        coordinates: resultCoordinates,
-      }
+    const transforms = {
+      scaleFactor: currentLevel?.scaleFactor ?? desc.scaleFactor,
+      addOffset: currentLevel?.addOffset ?? desc.addOffset,
+      fillValue: currentLevel?.fillValue ?? desc.fill_value,
     }
-
-    // Region queries: calculate pixel bounds and fetch only that subset
     const sourceBounds: [number, number, number, number] | null = this.xyLimits
       ? [
           this.xyLimits.xMin,
@@ -3138,120 +3000,244 @@ export class UntiledMode implements ZarrMode {
           this.xyLimits.yMax,
         ]
       : null
-    const pixelBounds = computePixelBoundsFromGeometry(
-      geometry,
+
+    // Closure for running a single pixel-bounds strip query.
+    // Captures request-scoped locals (not instance state) to avoid races
+    // when queryData is called concurrently on the same instance.
+    const runStrip = async (
+      geom: QueryGeometry,
+      pixelBounds: PixelRect,
+      opts?: QueryOptions
+    ): Promise<QueryResult | null> => {
+      const fetched = await this.fetchQueryData(
+        normalizedSelector,
+        pixelBounds,
+        opts?.signal
+      )
+      if (!fetched) return null
+
+      const subsetBounds = this.computeSubsetBounds(pixelBounds)
+
+      let subsetSourceBounds: [number, number, number, number] | null = null
+      if (this.proj4def && sourceBounds) {
+        const { minX, minY, maxX, maxY } = pixelBounds
+        const [xMin, yMin] = pixelToSourceCRS(
+          minX,
+          minY,
+          sourceBounds,
+          this.width,
+          this.height,
+          this.latIsAscending
+        )
+        const [xMax, yMax] = pixelToSourceCRS(
+          maxX,
+          maxY,
+          sourceBounds,
+          this.width,
+          this.height,
+          this.latIsAscending
+        )
+        subsetSourceBounds = [
+          Math.min(xMin, xMax),
+          Math.min(yMin, yMax),
+          Math.max(xMin, xMax),
+          Math.max(yMin, yMax),
+        ]
+      }
+
+      return queryRegionUntiled(
+        this.variable,
+        geom,
+        normalizedSelector,
+        fetched.data,
+        fetched.width,
+        fetched.height,
+        subsetBounds,
+        this.crs ?? 'EPSG:4326',
+        desc.dimensions,
+        desc.coordinates,
+        fetched.channels,
+        fetched.channelLabels,
+        fetched.multiValueDimNames,
+        this.latIsAscending,
+        transforms,
+        this.proj4def,
+        subsetSourceBounds,
+        opts,
+        desc.dimIndices
+      )
+    }
+
+    // Helper for the single-fetch path shared by proj4 and non-crossing cases
+    const singleFetch = async (geom: QueryGeometry): Promise<QueryResult> => {
+      const pixelBounds = computePixelBoundsFromGeometry(
+        geom,
+        this.mercatorBounds!,
+        this.width,
+        this.height,
+        this.crs ?? 'EPSG:4326',
+        this.latIsAscending,
+        this.proj4def,
+        sourceBounds,
+        this.cachedWGS84Transformer ?? undefined
+      )
+      if (!pixelBounds) return emptyResult()
+      const result = await runStrip(geom, pixelBounds, options)
+      return result ?? emptyResult()
+    }
+
+    // Proj4: no antimeridian preprocessing, just warn and use original geometry.
+    // Run preprocessQueryGeometry only for the bbox check — it correctly
+    // distinguishes true crossings from explicit-but-non-crossing coords
+    // (e.g., rect(200, 210) canonicalizes to [-160, -150], no crossing).
+    if (this.proj4def) {
+      const { bbox } = preprocessQueryGeometry(geometry)
+      if (bbox.crossesAntimeridian) {
+        if (!this._antimeridianWarnings.has('proj4-crossing')) {
+          this._antimeridianWarnings.add('proj4-crossing')
+          console.warn(
+            'Antimeridian-crossing polygon queries are not supported for proj4 projections; results may be incorrect'
+          )
+        }
+      }
+      return singleFetch(geometry)
+    }
+
+    // Standard CRS: preprocess (normalize, canonicalize, maybe clip)
+    const { geometry: processedGeometry, bbox: wrappedBbox } =
+      preprocessQueryGeometry(geometry)
+
+    // Non-crossing: use processedGeometry (may be canonicalized, e.g. [200,210] → [-160,-150])
+    if (!wrappedBbox.crossesAntimeridian) {
+      return singleFetch(processedGeometry)
+    }
+
+    // Crossing: raster extent guard (EPSG:4326 only — 3857 xyLimits are in meters)
+    if (
+      rasterExtentCrossesAntimeridian(this.crs ?? 'EPSG:4326', this.xyLimits)
+    ) {
+      if (!this._antimeridianWarnings.has('raster-extent-crossing')) {
+        this._antimeridianWarnings.add('raster-extent-crossing')
+        console.warn(
+          'Antimeridian-crossing polygon queries are not supported for rasters whose own extent crosses the antimeridian; results may be incorrect'
+        )
+      }
+      return singleFetch(geometry)
+    }
+
+    // Crossing: two-strip fetch
+    const spans = wrappedBboxToPixelSpans(
+      wrappedBbox,
       this.mercatorBounds,
       this.width,
       this.height,
       this.crs ?? 'EPSG:4326',
-      this.latIsAscending,
-      this.proj4def,
-      sourceBounds,
-      this.cachedWGS84Transformer ?? undefined
+      this.latIsAscending
     )
 
-    if (!pixelBounds) {
-      return {
-        [this.variable]: [],
-        dimensions: [],
-        coordinates: { lat: [], lon: [] },
-      }
-    }
+    const westResult = spans.west
+      ? await runStrip(processedGeometry, spans.west, options)
+      : null
+    const eastResult = spans.east
+      ? await runStrip(processedGeometry, spans.east, options)
+      : null
 
-    const fetched = await this.fetchQueryData(normalizedSelector, {
-      type: 'bbox',
-      ...pixelBounds,
-    })
-    if (!fetched) {
-      return {
-        [this.variable]: [],
-        dimensions: [],
-        coordinates: { lat: [], lon: [] },
-      }
+    // If either requested strip failed, return empty rather than partial data
+    if ((spans.west && !westResult) || (spans.east && !eastResult)) {
+      return emptyResult()
     }
+    if (!westResult && !eastResult) return emptyResult()
+    if (!westResult || !eastResult) return (westResult ?? eastResult)!
 
-    // Compute adjusted bounds for the subset
-    const { minX, maxX, minY, maxY } = pixelBounds
-    const xRange = this.mercatorBounds.x1 - this.mercatorBounds.x0
-    const yRange = this.mercatorBounds.y1 - this.mercatorBounds.y0
-    const subsetBounds: MercatorBounds = {
-      x0: this.mercatorBounds.x0 + (minX / this.width) * xRange,
-      x1: this.mercatorBounds.x0 + (maxX / this.width) * xRange,
-      y0: this.mercatorBounds.y0 + (minY / this.height) * yRange,
-      y1: this.mercatorBounds.y0 + (maxY / this.height) * yRange,
-    }
-    // Preserve lat bounds if present (for EPSG:4326)
-    if (
-      this.mercatorBounds.latMin !== undefined &&
-      this.mercatorBounds.latMax !== undefined
-    ) {
-      const latRange = this.mercatorBounds.latMax - this.mercatorBounds.latMin
-      if (this.latIsAscending) {
-        subsetBounds.latMin =
-          this.mercatorBounds.latMin + (minY / this.height) * latRange
-        subsetBounds.latMax =
-          this.mercatorBounds.latMin + (maxY / this.height) * latRange
-      } else {
-        subsetBounds.latMax =
-          this.mercatorBounds.latMax - (minY / this.height) * latRange
-        subsetBounds.latMin =
-          this.mercatorBounds.latMax - (maxY / this.height) * latRange
-      }
-    }
-
-    // For proj4 reprojection, compute subset bounds in source CRS
-    let subsetSourceBounds: [number, number, number, number] | null = null
-    if (this.proj4def && sourceBounds) {
-      // Convert subset pixel range to source CRS bounds using edge-based model.
-      // pixelToSourceCRS maps: pixel 0 → xMin (left edge), pixel width → xMax (right edge)
-      // Since maxX/maxY are exclusive, they map directly to the right/bottom edges.
-      const [xMin, yMin] = pixelToSourceCRS(
-        minX,
-        minY,
-        sourceBounds,
-        this.width,
-        this.height,
-        this.latIsAscending
-      )
-      const [xMax, yMax] = pixelToSourceCRS(
-        maxX, // exclusive end maps to right edge
-        maxY,
-        sourceBounds,
-        this.width,
-        this.height,
-        this.latIsAscending
-      )
-      // Create subset bounds in source CRS
-      subsetSourceBounds = [
-        Math.min(xMin, xMax),
-        Math.min(yMin, yMax),
-        Math.max(xMin, xMax),
-        Math.max(yMin, yMax),
-      ]
-    }
-
-    return queryRegionSingleImage(
-      this.variable,
-      geometry,
-      normalizedSelector,
-      fetched.data,
-      fetched.width,
-      fetched.height,
-      subsetBounds,
-      this.crs ?? 'EPSG:4326',
+    const { yDim, xDim } = findSpatialDimNames(
       desc.dimensions,
-      desc.coordinates,
-      fetched.channels,
-      fetched.channelLabels,
-      fetched.multiValueDimNames,
-      this.latIsAscending,
-      {
-        scaleFactor,
-        addOffset,
-        fillValue: fill_value,
-      },
-      this.proj4def,
-      subsetSourceBounds
+      false,
+      desc.dimIndices
     )
+    return mergeQueryResults(westResult, eastResult, this.variable, yDim, xDim)
   }
+}
+
+/**
+ * Merge two QueryResult objects from west and east strips.
+ *
+ * Ordering: west-strip pixels first, then east-strip pixels. This does NOT
+ * preserve row-major scan order. The QueryResult contract provides parallel
+ * coordinate arrays so consumers index by position, not implicit grid layout.
+ *
+ * Spatial coordinate arrays (yDim, xDim) are concatenated.
+ * Non-spatial coordinate arrays are taken from the first result unchanged.
+ */
+function mergeQueryResults(
+  a: QueryResult,
+  b: QueryResult,
+  variable: string,
+  yDim: string,
+  xDim: string
+): QueryResult {
+  const spatialKeys = new Set([yDim, xDim])
+
+  // Merge coordinates: concatenate spatial, take first for non-spatial
+  const coordinates: Record<string, (number | string)[]> = {}
+  for (const key of Object.keys(a.coordinates)) {
+    if (spatialKeys.has(key)) {
+      coordinates[key] = [...a.coordinates[key], ...b.coordinates[key]]
+    } else {
+      coordinates[key] = a.coordinates[key]
+    }
+  }
+
+  // Merge variable values
+  const aVals = a[variable] as QueryDataValues
+  const bVals = b[variable] as QueryDataValues
+
+  let merged: QueryDataValues
+  if (Array.isArray(aVals) && Array.isArray(bVals)) {
+    merged = [...aVals, ...bVals]
+  } else if (!Array.isArray(aVals) && !Array.isArray(bVals)) {
+    merged = mergeNestedValues(aVals as NestedValues, bVals as NestedValues)
+  } else {
+    merged = aVals // Mismatched types: take first
+  }
+
+  return {
+    [variable]: merged,
+    dimensions: a.dimensions,
+    coordinates,
+  }
+}
+
+/**
+ * Recursively merge two NestedValues objects by concatenating leaf arrays.
+ */
+function mergeNestedValues(a: NestedValues, b: NestedValues): NestedValues {
+  const result: NestedValues = {}
+  for (const key of Object.keys(a)) {
+    const aVal = a[key]
+    const bVal = b[key]
+    if (Array.isArray(aVal) && Array.isArray(bVal)) {
+      result[key] = [...aVal, ...bVal]
+    } else if (
+      aVal &&
+      bVal &&
+      !Array.isArray(aVal) &&
+      !Array.isArray(bVal) &&
+      typeof aVal === 'object' &&
+      typeof bVal === 'object'
+    ) {
+      result[key] = mergeNestedValues(
+        aVal as NestedValues,
+        bVal as NestedValues
+      )
+    } else {
+      result[key] = aVal
+    }
+  }
+  // Include keys only in b
+  for (const key of Object.keys(b)) {
+    if (!(key in result)) {
+      result[key] = b[key]
+    }
+  }
+  return result
 }

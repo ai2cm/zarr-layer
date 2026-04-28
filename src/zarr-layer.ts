@@ -38,7 +38,7 @@ import {
   isGlobeProjection as checkGlobeProjection,
 } from './map-utils'
 import { MAPBOX_IDENTITY_MATRIX } from './mapbox-utils'
-import type { QueryGeometry, QueryResult } from './query/types'
+import type { QueryGeometry, QueryOptions, QueryResult } from './query/types'
 import { SPATIAL_DIM_NAMES } from './constants'
 
 type MapboxInternals = {
@@ -174,7 +174,7 @@ export class ZarrLayer {
   private throttleMs: number
   private proj4: string | undefined
   private transformRequest: TransformRequest | undefined
-  private customStore: Readable<unknown> | undefined
+  private customStore: Readable | undefined
   private renderPoles: boolean
   private lastIsGlobe: boolean | null = null
   private usingDirectMapboxGlobePath: boolean = false
@@ -996,15 +996,16 @@ export class ZarrLayer {
    */
   async queryData(
     geometry: QueryGeometry,
-    selector?: Selector
+    selector?: Selector,
+    options?: QueryOptions
   ): Promise<QueryResult> {
     if (!this.mode?.queryData) {
       return {
         [this.variable]: [],
-        dimensions: ['lat', 'lon'],
-        coordinates: { lat: [], lon: [] },
+        dimensions: [],
+        coordinates: {},
       }
     }
-    return this.mode.queryData(geometry, selector)
+    return this.mode.queryData(geometry, selector, options)
   }
 }
