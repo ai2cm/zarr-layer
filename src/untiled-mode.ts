@@ -2741,39 +2741,66 @@ export class UntiledMode implements ZarrMode {
   async prefetchTimeSteps(
     timeIndices: number[],
     timeDimName: string,
-    signal: AbortSignal
+    signal: AbortSignal,
+    onIterationStart?: (timeIndex: number) => void,
+    onIterationEnd?: (timeIndex: number) => void
   ): Promise<void> {
     if (!this.zarrArray || !this.baseSliceArgsReady) return
 
+    // Compute the spatial extent the prefetch should cover. When the
+    // viewport has been rendered at least once, fetch only the chunks that
+    // intersect the currently visible regions (the same set fetchRegion
+    // would pull on a render). Otherwise fall back to the full extent.
+    const [regionH, regionW] = this.regionSize ?? [this.height, this.width]
+    const regions =
+      this.lastVisibleRegions.length > 0 &&
+      this.lastVisibleRegionsLevel === this.currentLevelIndex
+        ? this.lastVisibleRegions.map(({ regionX, regionY }) => ({
+            yStart: regionY * regionH,
+            yEnd: Math.min(regionY * regionH + regionH, this.height),
+            xStart: regionX * regionW,
+            xEnd: Math.min(regionX * regionW + regionW, this.width),
+          }))
+        : [{ yStart: 0, yEnd: this.height, xStart: 0, xEnd: this.width }]
+
+    const latIdx = this.dimIndices.lat?.index
+    const lonIdx = this.dimIndices.lon?.index
+
     for (const timeIndex of timeIndices) {
       if (signal.aborted) return
+      onIterationStart?.(timeIndex)
 
-      // Build a modified selector with this future time step
-      const prefetchSelector: NormalizedSelector = { ...this.selector }
-      prefetchSelector[timeDimName] = {
-        selected: timeIndex,
-        type: 'index' as const,
-      }
-
-      // Build slice args for the full spatial extent at this time step
-      const { sliceArgs } = await this.buildSliceArgsForSelector(
-        prefetchSelector,
-        {
-          includeSpatialSlices: true,
-          trackMultiValue: false,
-        }
-      )
-
-      if (signal.aborted) return
-
-      // zarr.get() decomposes into chunk fetches → CachingStore caches them
       try {
-        await zarr.get(this.zarrArray, sliceArgs, {
-          opts: { signal },
-        })
-      } catch (e) {
-        if ((e as Error).name === 'AbortError') return
-        // Swallow other errors for prefetch — non-critical
+        // Build base slice args with this future time step substituted.
+        // Spatial dims are placeholders here — we override them per region.
+        const prefetchSelector: NormalizedSelector = { ...this.selector }
+        prefetchSelector[timeDimName] = {
+          selected: timeIndex,
+          type: 'index' as const,
+        }
+        const { sliceArgs: baseSliceArgs } =
+          await this.buildSliceArgsForSelector(prefetchSelector, {
+            includeSpatialSlices: false,
+            trackMultiValue: false,
+          })
+
+        if (signal.aborted) return
+
+        for (const { yStart, yEnd, xStart, xEnd } of regions) {
+          if (signal.aborted) return
+          const sliceArgs = [...baseSliceArgs]
+          if (latIdx !== undefined) sliceArgs[latIdx] = zarr.slice(yStart, yEnd)
+          if (lonIdx !== undefined) sliceArgs[lonIdx] = zarr.slice(xStart, xEnd)
+
+          try {
+            await zarr.get(this.zarrArray, sliceArgs, { opts: { signal } })
+          } catch (e) {
+            if ((e as Error).name === 'AbortError') return
+            // Swallow other errors for prefetch — non-critical
+          }
+        }
+      } finally {
+        onIterationEnd?.(timeIndex)
       }
     }
   }

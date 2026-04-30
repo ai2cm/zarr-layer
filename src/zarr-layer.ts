@@ -180,8 +180,22 @@ export class ZarrLayer {
   private usingDirectMapboxGlobePath: boolean = false
   private maxChunkCacheBytes: number | undefined
   private prefetchController: AbortController | null = null
-  /** Tracks which time step indices have been fetched (for cache status). */
-  private cachedTimeSteps: Set<number> = new Set()
+  /**
+   * Map from time-step index to the set of CachingStore cache keys that
+   * comprise that step. Populated as fetches happen (prefetch + render).
+   * Cache status is derived by re-checking each key's residency in the
+   * CachingStore, so LRU evictions automatically downgrade a step's status.
+   */
+  private timestepKeys: Map<number, Set<string>> = new Map()
+  /**
+   * Set while a prefetch iteration is fetching for a specific time index.
+   * The continuously-active access listener attributes accesses to this
+   * value when set, otherwise to the layer's current `displayTime` selector
+   * (covering the render path where chunks are fetched on map frames).
+   */
+  private currentPrefetchTimeIdx: number | null = null
+  /** Disposer for the continuous CachingStore access listener. */
+  private removeAccessListener: (() => void) | null = null
   private mapboxDirectGlobePathAvailable: boolean = false
 
   private canUseMapboxDirectGlobePath(): boolean {
@@ -431,6 +445,10 @@ export class ZarrLayer {
     try {
       this.initError = null
       this.variable = variable
+      this.removeAccessListener?.()
+      this.removeAccessListener = null
+      this.timestepKeys.clear()
+      this.currentPrefetchTimeIdx = null
       if (this.zarrStore) {
         this.zarrStore.cleanup()
         this.zarrStore = null
@@ -454,6 +472,10 @@ export class ZarrLayer {
         this.mode.dispose(this.gl)
         this.mode = null
       }
+      this.removeAccessListener?.()
+      this.removeAccessListener = null
+      this.timestepKeys.clear()
+      this.currentPrefetchTimeIdx = null
       if (this.zarrStore) {
         this.zarrStore.cleanup()
         this.zarrStore = null
@@ -489,18 +511,6 @@ export class ZarrLayer {
       await this.mode.setSelector(this.normalizedSelector)
     }
 
-    // Mark the current time step as cached (its chunks are now in the CachingStore)
-    for (const [dimName, spec] of Object.entries(this.normalizedSelector)) {
-      const dimInfo = this.dimIndices[dimName]
-      if (
-        dimInfo &&
-        typeof spec.selected === 'number' &&
-        spec.type === 'index'
-      ) {
-        this.cachedTimeSteps.add(spec.selected)
-      }
-    }
-
     this.invalidate()
   }
 
@@ -515,8 +525,9 @@ export class ZarrLayer {
   prefetchTimeSteps(timeIndices: number[], timeDimName: string = 'time'): void {
     if (!this.mode?.prefetchTimeSteps) return
 
-    // Filter out already-cached steps
-    const needed = timeIndices.filter((idx) => !this.cachedTimeSteps.has(idx))
+    // Skip steps whose recorded chunks are still all resident in the cache.
+    const status = this.getCacheStatus(timeIndices)
+    const needed = timeIndices.filter((idx) => status[idx] !== 'cached')
     if (needed.length === 0) return
 
     // Cancel any previous prefetch
@@ -525,37 +536,171 @@ export class ZarrLayer {
 
     const signal = this.prefetchController.signal
 
-    // Fire-and-forget; mark each step as cached on completion
+    // Fire-and-forget. Iteration callbacks set currentPrefetchTimeIdx so the
+    // continuous CachingStore listener attributes accesses to the right step.
     this.mode
-      .prefetchTimeSteps(needed, timeDimName, signal)
-      .then(() => {
-        if (!signal.aborted) {
-          for (const idx of needed) this.cachedTimeSteps.add(idx)
+      .prefetchTimeSteps(
+        needed,
+        timeDimName,
+        signal,
+        (timeIdx) => {
+          this.currentPrefetchTimeIdx = timeIdx
+        },
+        () => {
+          this.currentPrefetchTimeIdx = null
         }
-      })
+      )
       .catch(() => {
-        // Aborted or failed — don't mark as cached
+        // Aborted or failed
+      })
+      .finally(() => {
+        this.currentPrefetchTimeIdx = null
       })
   }
 
+  /** Read the layer's currently-selected time index, if any. */
+  private getCurrentTimeIdx(): number | null {
+    const spec = this.normalizedSelector?.['time']
+    if (spec && spec.type === 'index' && typeof spec.selected === 'number') {
+      return spec.selected
+    }
+    return null
+  }
+
+  /** Record a chunk-key access for a given time step. */
+  private recordChunkAccess(timeIndex: number, cacheKey: string): void {
+    let keys = this.timestepKeys.get(timeIndex)
+    if (!keys) {
+      keys = new Set()
+      this.timestepKeys.set(timeIndex, keys)
+    }
+    keys.add(cacheKey)
+  }
+
   /**
-   * Check whether chunk data for a given time step index is cached.
-   * Used by animation loops to detect when buffering is needed.
+   * Check whether chunk data for a given time step index is currently
+   * resident in the chunk cache. Used by animation loops to detect buffering.
    */
   isTimeStepCached(timeIndex: number): boolean {
-    return this.cachedTimeSteps.has(timeIndex)
+    return this.getCacheStatus([timeIndex])[timeIndex] === 'cached'
   }
 
   /**
    * Get cache status for multiple time step indices.
-   * Returns a record mapping each time index to 'cached' or 'missing'.
+   * Returns 'cached' (all recorded chunks resident), 'partial' (some
+   * resident), or 'missing' (none resident or never fetched).
    */
-  getCacheStatus(timeIndices: number[]): Record<number, 'cached' | 'missing'> {
-    const result: Record<number, 'cached' | 'missing'> = {}
+  getCacheStatus(
+    timeIndices: number[]
+  ): Record<number, 'cached' | 'partial' | 'missing'> {
+    const result: Record<number, 'cached' | 'partial' | 'missing'> = {}
+    const cachingStore = this.zarrStore?.cachingStore ?? null
     for (const idx of timeIndices) {
-      result[idx] = this.cachedTimeSteps.has(idx) ? 'cached' : 'missing'
+      const keys = this.timestepKeys.get(idx)
+      if (!keys || keys.size === 0) {
+        result[idx] = 'missing'
+        continue
+      }
+      if (!cachingStore) {
+        // No byte cache configured — recorded keys are our only signal.
+        result[idx] = 'cached'
+        continue
+      }
+      let hits = 0
+      for (const key of keys) {
+        if (cachingStore.has(key)) hits++
+      }
+      if (hits === keys.size) result[idx] = 'cached'
+      else if (hits === 0) result[idx] = 'missing'
+      else result[idx] = 'partial'
     }
     return result
+  }
+
+  /**
+   * Average number of chunk keys recorded per time step. Returns 0 before
+   * any fetch has completed. Consumers (e.g. cache indicators) can use this
+   * to size segments so each segment represents a comparable amount of work
+   * across coarse (1 chunk/step) and high-res (many chunks/step) datasets.
+   */
+  getChunksPerTimestep(): number {
+    if (this.timestepKeys.size === 0) return 0
+    let total = 0
+    for (const keys of this.timestepKeys.values()) total += keys.size
+    return total / this.timestepKeys.size
+  }
+
+  /**
+   * Average bytes consumed per recorded time step, derived from the
+   * CachingStore's current residency. Returns null when there isn't enough
+   * data to estimate (e.g. before the first fetch resolves).
+   */
+  getEstimatedTimestepBytes(): number | null {
+    const cachingStore = this.zarrStore?.cachingStore ?? null
+    if (!cachingStore) return null
+    const chunksInCache = cachingStore.size
+    if (chunksInCache === 0 || this.timestepKeys.size === 0) return null
+    const avgChunkBytes = cachingStore.getTotalBytes() / chunksInCache
+    const avgChunksPerStep = this.getChunksPerTimestep()
+    if (avgChunksPerStep <= 0) return null
+    return avgChunkBytes * avgChunksPerStep
+  }
+
+  /**
+   * Number of *additional* time steps the chunk cache has room for beyond
+   * the currently-displayed one, leaving headroom (default 90%). Reserves
+   * one step's worth of bytes for the current selector so prefetching never
+   * evicts what the user is actively viewing.
+   *
+   * Returns null when the layer hasn't fetched anything yet (no per-step
+   * cost estimate). Callers should treat null as "skip prefetching" and let
+   * the next render produce an estimate that future calls can rely on.
+   */
+  getRecommendedPrefetchCount(safetyFactor: number = 0.9): number | null {
+    const cachingStore = this.zarrStore?.cachingStore ?? null
+    if (!cachingStore) return null
+    const perStep = this.getEstimatedTimestepBytes()
+    if (perStep === null || perStep <= 0) return null
+    const budget = cachingStore.maxBytes * safetyFactor - perStep
+    if (budget <= 0) return 0
+    return Math.floor(budget / perStep)
+  }
+
+  /**
+   * Diagnostic snapshot of the chunk cache state vs. recorded keys.
+   * Useful for tuning maxChunkCacheBytes when the indicator is stuck at
+   * 'partial' for a high-resolution dataset.
+   */
+  getCacheDebugInfo(): {
+    maxBytes: number | null
+    usedBytes: number | null
+    chunksInCache: number | null
+    timestepsRecorded: number
+    avgChunksPerTimestep: number
+    perTimestepHits: { timeIndex: number; recorded: number; hits: number }[]
+  } {
+    const cachingStore = this.zarrStore?.cachingStore ?? null
+    const perTimestepHits: {
+      timeIndex: number
+      recorded: number
+      hits: number
+    }[] = []
+    for (const [timeIndex, keys] of this.timestepKeys.entries()) {
+      let hits = 0
+      if (cachingStore) {
+        for (const key of keys) if (cachingStore.has(key)) hits++
+      }
+      perTimestepHits.push({ timeIndex, recorded: keys.size, hits })
+    }
+    perTimestepHits.sort((a, b) => a.timeIndex - b.timeIndex)
+    return {
+      maxBytes: cachingStore?.maxBytes ?? null,
+      usedBytes: cachingStore?.getTotalBytes() ?? null,
+      chunksInCache: cachingStore?.size ?? null,
+      timestepsRecorded: this.timestepKeys.size,
+      avgChunksPerTimestep: this.getChunksPerTimestep(),
+      perTimestepHits,
+    }
   }
 
   onAdd(
@@ -709,6 +854,20 @@ export class ZarrLayer {
       })
 
       await this.zarrStore.initialized
+
+      // Install a continuous access listener so chunks fetched during render
+      // frames (which happen asynchronously, not inside setSelector) are
+      // attributed to a time step. Prefetch iterations override the default
+      // attribution by setting currentPrefetchTimeIdx for their duration.
+      if (this.zarrStore.cachingStore) {
+        this.removeAccessListener?.()
+        this.removeAccessListener =
+          this.zarrStore.cachingStore.addAccessListener((cacheKey) => {
+            const timeIdx =
+              this.currentPrefetchTimeIdx ?? this.getCurrentTimeIdx()
+            if (timeIdx !== null) this.recordChunkAccess(timeIdx, cacheKey)
+          })
+      }
 
       const desc = this.zarrStore.describe()
 
@@ -964,6 +1123,9 @@ export class ZarrLayer {
 
     this.mode?.dispose(gl)
     this.mode = null
+
+    this.removeAccessListener?.()
+    this.removeAccessListener = null
 
     if (this.zarrStore) {
       this.zarrStore.cleanup()

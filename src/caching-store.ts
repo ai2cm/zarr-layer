@@ -16,11 +16,14 @@ interface CacheEntry {
   byteSize: number
 }
 
+export type AccessListener = (cacheKey: string) => void
+
 export class CachingStore implements AsyncReadable {
   private cache: Map<string, CacheEntry> = new Map()
   private totalBytes: number = 0
   readonly maxBytes: number
   private baseStore: AsyncReadable
+  private accessListeners: Set<AccessListener> = new Set()
 
   constructor(
     baseStore: AsyncReadable,
@@ -28,6 +31,25 @@ export class CachingStore implements AsyncReadable {
   ) {
     this.baseStore = baseStore
     this.maxBytes = maxBytes
+  }
+
+  /**
+   * Register a listener invoked with the cache key on every get/getRange call,
+   * after the entry has been resolved (whether served from cache or freshly
+   * fetched). Returns a disposer that removes the listener.
+   *
+   * Used by ZarrLayer to attribute fetched chunks to time-step indices for
+   * cache-status reporting that survives LRU eviction.
+   */
+  addAccessListener(fn: AccessListener): () => void {
+    this.accessListeners.add(fn)
+    return () => {
+      this.accessListeners.delete(fn)
+    }
+  }
+
+  private notifyAccess(cacheKey: string): void {
+    for (const fn of this.accessListeners) fn(cacheKey)
   }
 
   async get(
@@ -39,6 +61,7 @@ export class CachingStore implements AsyncReadable {
       // LRU: move to end of Map (most recently used)
       this.cache.delete(key)
       this.cache.set(key, cached)
+      this.notifyAccess(key)
       return cached.data
     }
 
@@ -48,6 +71,7 @@ export class CachingStore implements AsyncReadable {
       const entry: CacheEntry = { data: result, byteSize: result.byteLength }
       this.cache.set(key, entry)
       this.totalBytes += result.byteLength
+      this.notifyAccess(key)
     }
     return result
   }
@@ -64,6 +88,7 @@ export class CachingStore implements AsyncReadable {
     if (cached) {
       this.cache.delete(rangeKey)
       this.cache.set(rangeKey, cached)
+      this.notifyAccess(rangeKey)
       return cached.data
     }
 
@@ -73,6 +98,7 @@ export class CachingStore implements AsyncReadable {
       const entry: CacheEntry = { data: result, byteSize: result.byteLength }
       this.cache.set(rangeKey, entry)
       this.totalBytes += result.byteLength
+      this.notifyAccess(rangeKey)
     }
     return result
   }

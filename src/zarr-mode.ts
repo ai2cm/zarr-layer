@@ -105,6 +105,8 @@ export interface ZarrMode {
   prefetchTimeSteps?(
     timeIndices: number[],
     timeDimName: string,
-    signal: AbortSignal
+    signal: AbortSignal,
+    onIterationStart?: (timeIndex: number) => void,
+    onIterationEnd?: (timeIndex: number) => void
   ): Promise<void>
 }
