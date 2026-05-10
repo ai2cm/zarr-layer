@@ -81,26 +81,18 @@ export class CachingStore implements AsyncReadable {
     range: RangeQuery,
     opts?: GetOptions
   ): Promise<Uint8Array | undefined> {
-    // For sharded zarr v3, chunk reads may go through getRange.
-    // Cache with a composite key that includes the range.
-    const rangeKey = this.rangeKey(key, range)
-    const cached = this.cache.get(rangeKey)
-    if (cached) {
-      this.cache.delete(rangeKey)
-      this.cache.set(rangeKey, cached)
-      this.notifyAccess(rangeKey)
-      return cached.data
+    // Fetch the full file and slice in memory rather than issuing HTTP Range
+    // requests. Multi-hop proxy chains (jupyter-server-proxy) do not reliably
+    // forward Range headers, causing 416 errors for sharded zarr v3 reads.
+    // The full file is cached by get(), so all inner-chunk reads after the
+    // first hit the LRU cache without any additional network requests.
+    const full = await this.get(key, opts)
+    if (!full) return undefined
+    if ('suffixLength' in range) {
+      const start = full.length - range.suffixLength
+      return full.slice(start >= 0 ? start : 0)
     }
-
-    const result = await this.baseStore.getRange?.(key, range, opts)
-    if (result !== undefined) {
-      this.evictUntilFits(result.byteLength)
-      const entry: CacheEntry = { data: result, byteSize: result.byteLength }
-      this.cache.set(rangeKey, entry)
-      this.totalBytes += result.byteLength
-      this.notifyAccess(rangeKey)
-    }
-    return result
+    return full.slice(range.offset, range.offset + range.length)
   }
 
   /** Check if a key is in the cache. */
