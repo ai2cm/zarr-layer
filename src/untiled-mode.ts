@@ -2802,6 +2802,16 @@ export class UntiledMode implements ZarrMode {
       } finally {
         onIterationEnd?.(timeIndex)
       }
+
+      // Yield to the event loop between time steps so animation frames and
+      // setInterval callbacks can run without being starved by the prefetch loop.
+      if (!signal.aborted) {
+        await new Promise<void>((r) => {
+          const ch = new MessageChannel()
+          ch.port1.onmessage = () => r()
+          ch.port2.postMessage(0)
+        })
+      }
     }
   }
 
