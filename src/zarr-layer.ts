@@ -567,7 +567,19 @@ export class ZarrLayer {
     return null
   }
 
-  /** Record a chunk-key access for a given time step. */
+  /**
+   * Record a chunk-key access for a given time step.
+   *
+   * NOTE: accesses are keyed by time index alone. When the selector pages a
+   * non-time dimension (e.g. an ensemble `sample`/`member` axis), chunks for
+   * different members accumulate under the same time key. After switching
+   * members, `getCacheStatus` for a time step that is fully cached for the
+   * *current* member can therefore report `partial`, because the recorded key
+   * set still includes the previous member's chunks. This is cosmetic (affects
+   * the CacheIndicator only). A real fix would key attribution by
+   * `(time, member)` or clear `timestepKeys` on a non-time selector change —
+   * tracked as a follow-up (see tasks/16-main-map-ensemble-dimension.md).
+   */
   private recordChunkAccess(timeIndex: number, cacheKey: string): void {
     let keys = this.timestepKeys.get(timeIndex)
     if (!keys) {
