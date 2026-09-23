@@ -21,7 +21,7 @@ export type AccessListener = (cacheKey: string) => void
 export class CachingStore implements AsyncReadable {
   private cache: Map<string, CacheEntry> = new Map()
   private totalBytes: number = 0
-  readonly maxBytes: number
+  private _maxBytes: number
   private baseStore: AsyncReadable
   private accessListeners: Set<AccessListener> = new Set()
 
@@ -30,7 +30,32 @@ export class CachingStore implements AsyncReadable {
     maxBytes: number = 100 * 1024 * 1024 // 100 MB default
   ) {
     this.baseStore = baseStore
-    this.maxBytes = maxBytes
+    this._maxBytes = Math.max(0, maxBytes)
+  }
+
+  /** Current byte budget. */
+  get maxBytes(): number {
+    return this._maxBytes
+  }
+
+  /**
+   * Change the byte budget of a live cache.
+   *
+   * - Shrinking evicts least-recently-used entries immediately until the
+   *   cache fits the new budget.
+   * - Growing never evicts; the extra room is filled by subsequent fetches.
+   * - `0` evicts everything. The store keeps wrapping the base store, and (as
+   *   with any entry larger than the budget) the single most recent fetch is
+   *   still retained so `getRange` on a sharded file does not refetch the
+   *   whole shard for every inner chunk. Restoring a positive budget later
+   *   resumes normal caching, so `setMaxBytes(0)` followed by
+   *   `setMaxBytes(previous)` acts as a "clear cache".
+   */
+  setMaxBytes(bytes: number): void {
+    const next = Number.isFinite(bytes) ? Math.max(0, bytes) : 0
+    const shrinking = next < this._maxBytes
+    this._maxBytes = next
+    if (shrinking) this.evictUntilFits(0)
   }
 
   /**
@@ -129,7 +154,7 @@ export class CachingStore implements AsyncReadable {
   }
 
   private evictUntilFits(newBytes: number): void {
-    while (this.totalBytes + newBytes > this.maxBytes && this.cache.size > 0) {
+    while (this.totalBytes + newBytes > this._maxBytes && this.cache.size > 0) {
       const oldest = this.cache.keys().next().value
       if (!oldest) break
       const entry = this.cache.get(oldest)!

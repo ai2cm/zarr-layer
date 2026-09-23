@@ -336,6 +336,22 @@ export class ZarrStore {
     )
   }
 
+  /**
+   * Resize the chunk cache of a live store (see `CachingStore.setMaxBytes`).
+   *
+   * The value is also remembered, so calling this before `initialized`
+   * resolves configures the cache that initialization creates. Enabling the
+   * cache at runtime is NOT supported: a store initialized with
+   * `maxChunkCacheBytes: 0` has no `CachingStore` wrapper and this call is a
+   * no-op for it. Returns true when a live cache was resized.
+   */
+  setMaxChunkCacheBytes(bytes: number): boolean {
+    this.maxChunkCacheBytes = Math.max(0, bytes)
+    if (!this.cachingStore) return false
+    this.cachingStore.setMaxBytes(this.maxChunkCacheBytes)
+    return true
+  }
+
   cleanup() {
     this._arrayHandles.clear()
     this.store = null

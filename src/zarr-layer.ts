@@ -31,7 +31,7 @@ import type {
 } from './types'
 import type { ZarrMode, RenderContext } from './zarr-mode'
 import { TiledMode } from './tiled-mode'
-import { UntiledMode } from './untiled-mode'
+import { UntiledMode, normalizedCacheBytesFor } from './untiled-mode'
 import {
   computeWorldOffsets,
   resolveProjectionParams,
@@ -679,6 +679,29 @@ export class ZarrLayer {
   }
 
   /**
+   * Resize the chunk cache of a live layer. Shrinking evicts
+   * least-recently-used entries immediately; growing never evicts. Because
+   * `getRecommendedPrefetchCount` reads the live budget, the prefetch window
+   * follows the new size on its next call. `0` empties the cache (see
+   * `CachingStore.setMaxBytes`); restoring the previous value afterwards
+   * acts as "clear cache".
+   *
+   * Internal secondary caches (untiled mode's normalized-data cache) are
+   * rescaled with it, so this is the single memory knob for the layer.
+   *
+   * If called before the store is initialized the value is used when the
+   * cache is created. Enabling the cache at runtime on a layer constructed
+   * with `maxChunkCacheBytes: 0` is not supported (no-op).
+   */
+  setMaxChunkCacheBytes(bytes: number): void {
+    this.maxChunkCacheBytes = Math.max(0, bytes)
+    this.zarrStore?.setMaxChunkCacheBytes(this.maxChunkCacheBytes)
+    this.mode?.setNormalizedCacheBytes?.(
+      normalizedCacheBytesFor(this.maxChunkCacheBytes)
+    )
+  }
+
+  /**
    * Diagnostic snapshot of the chunk cache state vs. recorded keys.
    * Useful for tuning maxChunkCacheBytes when the indicator is stuck at
    * 'partial' for a high-resolution dataset.
@@ -833,7 +856,8 @@ export class ZarrLayer {
         this.normalizedSelector,
         this.invalidate,
         this.throttleMs,
-        this.fixedDataScale
+        this.fixedDataScale,
+        normalizedCacheBytesFor(this.maxChunkCacheBytes)
       )
     }
 

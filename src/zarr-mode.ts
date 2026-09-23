@@ -109,4 +109,8 @@ export interface ZarrMode {
     onIterationStart?: (timeIndex: number) => void,
     onIterationEnd?: (timeIndex: number) => void
   ): Promise<void>
+
+  // Internal: resize the normalized-data cache (UntiledMode only). Driven by
+  // ZarrLayer.setMaxChunkCacheBytes; not part of the public layer API.
+  setNormalizedCacheBytes?(bytes: number): void
 }
