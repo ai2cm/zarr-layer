@@ -6,7 +6,7 @@ import { PrefetchQueue } from '../src/prefetch-queue.ts'
 
 // Fake fetcher: each step resolves when the test calls finish(idx), or
 // rejects with AbortError when its signal aborts (like zarr.get).
-function harness({ notReadyFor = new Map() } = {}) {
+function harness({ notReadyFor = new Map(), maxRetries } = {}) {
   const cached = new Set()
   const log = []
   const open = new Map()
@@ -38,6 +38,7 @@ function harness({ notReadyFor = new Map() } = {}) {
     fetchStep,
     isCached: (i) => cached.has(i),
     retryDelayMs: 1,
+    maxRetries,
   })
   const tick = () => new Promise((r) => setTimeout(r, 0))
   const finish = async (idx) => {
@@ -67,7 +68,12 @@ test('fetches the window sequentially in priority order', async () => {
     'start 2',
     'done 2',
   ])
-  assert.deepEqual(h.queue.stats, { started: 3, completed: 3, aborted: 0 })
+  assert.deepEqual(h.queue.stats, {
+    started: 3,
+    completed: 3,
+    aborted: 0,
+    dropped: 0,
+  })
 })
 
 test('keeps the in-flight step when it is still wanted', async () => {
@@ -132,7 +138,12 @@ test('repeated identical windows do not restart anything', async () => {
   await h.finish(2)
   await h.finish(3)
   await h.queue.whenIdle()
-  assert.deepEqual(h.queue.stats, { started: 3, completed: 3, aborted: 0 })
+  assert.deepEqual(h.queue.stats, {
+    started: 3,
+    completed: 3,
+    aborted: 0,
+    dropped: 0,
+  })
 })
 
 test('changing the time dimension aborts the in-flight step', async () => {
@@ -195,4 +206,37 @@ test('holding a key: sliding windows extend instead of restarting', async () => 
   for (let i = 1; i <= 6; i++) assert.ok(h.cached.has(i), `step ${i} cached`)
   h.queue.clear()
   await h.queue.whenIdle()
+})
+
+test('re-wanting a step aborted by an earlier window re-queues it', async () => {
+  const h = harness()
+  h.queue.set([1])
+  await h.tick()
+  h.queue.set([3]) // aborts 1; its fetch has not settled yet
+  h.queue.set([1, 3]) // must not treat the aborted 1 as still in flight
+  assert.deepEqual(h.queue.pendingIndices, [1, 3])
+  await h.finish(1)
+  await h.finish(3)
+  await h.queue.whenIdle()
+  assert.ok(h.cached.has(1) && h.cached.has(3))
+  assert.deepEqual(h.log, [
+    'start 1',
+    'abort 1',
+    'start 1',
+    'done 1',
+    'start 3',
+    'done 3',
+  ])
+})
+
+test('a step that never becomes ready is counted as dropped, not completed', async () => {
+  const h = harness({ notReadyFor: new Map([[1, 99]]), maxRetries: 2 })
+  h.queue.set([1])
+  await h.queue.whenIdle()
+  assert.deepEqual(h.queue.stats, {
+    started: 1,
+    completed: 0,
+    aborted: 0,
+    dropped: 1,
+  })
 })

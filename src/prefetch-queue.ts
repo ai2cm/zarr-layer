@@ -49,6 +49,8 @@ export interface PrefetchQueueStats {
   completed: number
   /** In-flight steps aborted because a new window no longer wanted them. */
   aborted: number
+  /** Steps given up on after `maxRetries` "not ready" results. */
+  dropped: number
 }
 
 interface InFlight {
@@ -67,7 +69,12 @@ export class PrefetchQueue {
   private inFlight: InFlight | null = null
   private running: boolean = false
   private idleWaiters: Array<() => void> = []
-  readonly stats: PrefetchQueueStats = { started: 0, completed: 0, aborted: 0 }
+  readonly stats: PrefetchQueueStats = {
+    started: 0,
+    completed: 0,
+    aborted: 0,
+    dropped: 0,
+  }
 
   constructor(options: PrefetchQueueOptions) {
     this.fetchStep = options.fetchStep
@@ -87,8 +94,13 @@ export class PrefetchQueue {
     }
 
     const current = this.inFlight
+    // An in-flight step already aborted by an earlier set() is on its way
+    // out; it can't be kept, so a window that wants it again re-queues it.
     const keepInFlight =
-      current !== null && current.dim === timeDimName && seen.has(current.index)
+      current !== null &&
+      !current.controller.signal.aborted &&
+      current.dim === timeDimName &&
+      seen.has(current.index)
     if (current && !keepInFlight && !current.controller.signal.aborted) {
       current.controller.abort()
       this.stats.aborted++
@@ -136,18 +148,23 @@ export class PrefetchQueue {
         const dim = this.dim
         this.inFlight = { index, dim, controller }
         this.stats.started++
+        let dropped = false
         try {
           for (let attempt = 0; ; attempt++) {
             const result = await this.fetchStep(index, dim, controller.signal)
             if (result !== false || controller.signal.aborted) break
-            if (attempt >= this.maxRetries) break
+            if (attempt >= this.maxRetries) {
+              dropped = true
+              break
+            }
             await new Promise((r) => setTimeout(r, this.retryDelayMs))
             if (controller.signal.aborted) break
           }
         } catch {
           // Aborted or failed: prefetch is best-effort.
         } finally {
-          if (!controller.signal.aborted) this.stats.completed++
+          if (dropped) this.stats.dropped++
+          else if (!controller.signal.aborted) this.stats.completed++
           this.inFlight = null
         }
       }

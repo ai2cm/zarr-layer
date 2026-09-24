@@ -2801,7 +2801,8 @@ export class UntiledMode implements ZarrMode {
   ): Promise<boolean> {
     // false = not ready, nothing fetched; ZarrLayer's PrefetchQueue retries
     // the step. Not ready: no level array yet, slice args rebuilding after
-    // setSelector, or no visible-region pass for the current level yet.
+    // setSelector, or no visible-region pass for the current level yet
+    // (level mismatch or the -1 sentinel).
     // Prefetch only fetches the chunks intersecting the visible regions (the
     // same set fetchRegion pulls on a render); it no longer falls back to the
     // full level extent before the first render, which on a high-res store
@@ -2809,11 +2810,13 @@ export class UntiledMode implements ZarrMode {
     if (
       !this.zarrArray ||
       !this.baseSliceArgsReady ||
-      this.lastVisibleRegions.length === 0 ||
+      this.lastVisibleRegionsLevel === -1 ||
       this.lastVisibleRegionsLevel !== this.currentLevelIndex
     ) {
       return false
     }
+    // The pass ran and nothing is in view: nothing to fetch (done, no retry)
+    if (this.lastVisibleRegions.length === 0) return true
 
     const [regionH, regionW] = this.regionSize ?? [this.height, this.width]
     const regions = this.lastVisibleRegions.map(({ regionX, regionY }) => ({

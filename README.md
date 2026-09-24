@@ -180,6 +180,41 @@ Notes:
   reads do not refetch the whole shard per inner chunk. Calling
   `setMaxChunkCacheBytes(0)` again evicts it.
 
+**Incremental prefetch.** `prefetchTimeSteps(indices, timeDimName = 'time')`
+warms the chunk cache for other time steps in the background (untiled mode).
+The fork changes its semantics from "abort everything and restart":
+
+```ts
+// Each call is the complete wanted window, in priority order.
+layer.prefetchTimeSteps([11, 9, 12, 8])
+// Cursor moved: 11 keeps downloading if it was in flight; 9, 12, 8 stay
+// queued; 13 is added; anything queued but no longer listed is dropped.
+layer.prefetchTimeSteps([12, 10, 13, 9])
+```
+
+- Each call replaces the wanted set. Pass the whole window, not only the new
+  steps: queued steps missing from the latest list are dropped.
+- The step being fetched keeps running if it is still in the new list. It is
+  aborted only when it is no longer wanted or `timeDimName` changed (an aborted
+  fetch leaves nothing in the cache). Steps are fetched one at a time.
+- Steps already cached (`isTimeStepCached`) are skipped.
+- A step that cannot be fetched yet (level not loaded, slice args rebuilding
+  after `setSelector`, or no visible-region pass for the current level) is
+  retried every 100 ms, up to 100 times, then dropped.
+- Only the chunks intersecting the currently visible regions are fetched. The
+  fork no longer falls back to the full level extent before the first render;
+  if the pass found nothing in view, the step is a no-op.
+- `isTimeStepCached` / `getCacheStatus` answer for the current values of the
+  other non-spatial selector dims (e.g. the selected ensemble member): chunk
+  keys are recorded per time step _and_ selection. Switching to another member
+  reports its steps as `missing` until fetched; switching back to a member
+  whose chunks are still in the byte cache reports them as `cached` with no
+  refetch. `getCacheDebugInfo()`'s per-step fields cover the current selection.
+- A `setSelector` that changes any non-time dim clears the prefetch queue
+  (including the step in flight), since it was fetching for the old selection.
+- The call is a no-op until the layer has initialized (after `onAdd` finishes
+  loading metadata).
+
 ## selectors
 
 Selectors specify which slice of your multidimensional data to render. Dimensions not specified default to index 0.
