@@ -18,13 +18,18 @@ interface CacheEntry {
 
 export type AccessListener = (cacheKey: string) => void
 
+/** Default chunk-cache budget (100 MB), used when no valid budget is given. */
+export const DEFAULT_CHUNK_CACHE_BYTES = 100 * 1024 * 1024
+
 /**
- * Normalize a runtime cache budget: non-finite or non-positive values become
- * 0, fractional values are floored. Shared by every `setMax*Bytes` setter so
- * the layer, store and cache agree on the stored budget.
+ * Validate a cache budget. Returns the budget with fractions floored, or
+ * `null` when it is invalid (non-finite or negative). `0` is valid. Shared
+ * by the constructor options and every `setMax*Bytes` setter so they agree
+ * on what "invalid" means: constructors fall back to the default, setters
+ * ignore the value and keep the current budget.
  */
-export function normalizeCacheBytes(bytes: number): number {
-  return Number.isFinite(bytes) && bytes > 0 ? Math.floor(bytes) : 0
+export function validCacheBytes(bytes: number): number | null {
+  return Number.isFinite(bytes) && bytes >= 0 ? Math.floor(bytes) : null
 }
 
 export class CachingStore implements AsyncReadable {
@@ -36,10 +41,12 @@ export class CachingStore implements AsyncReadable {
 
   constructor(
     baseStore: AsyncReadable,
-    maxBytes: number = 100 * 1024 * 1024 // 100 MB default
+    maxBytes: number = DEFAULT_CHUNK_CACHE_BYTES
   ) {
     this.baseStore = baseStore
-    this._maxBytes = Math.max(0, maxBytes)
+    // Callers (ZarrStore) validate and warn; this only guards against an
+    // unbounded or NaN budget.
+    this._maxBytes = validCacheBytes(maxBytes) ?? DEFAULT_CHUNK_CACHE_BYTES
   }
 
   /** Current byte budget. */
@@ -48,8 +55,9 @@ export class CachingStore implements AsyncReadable {
   }
 
   /**
-   * Change the byte budget of a live cache. `bytes` is normalized with
-   * `normalizeCacheBytes` (non-finite or negative → 0, fractions floored).
+   * Change the byte budget of a live cache. Fractional values are floored;
+   * an invalid value (non-finite or negative, see `validCacheBytes`) is
+   * ignored with a warning and the current budget is kept.
    *
    * - Shrinking evicts least-recently-used entries immediately until the
    *   cache fits the new budget.
@@ -62,7 +70,14 @@ export class CachingStore implements AsyncReadable {
    *   `setMaxBytes(previous)` acts as a "clear cache".
    */
   setMaxBytes(bytes: number): void {
-    const next = normalizeCacheBytes(bytes)
+    const next = validCacheBytes(bytes)
+    if (next === null) {
+      console.warn(
+        `[zarr-layer] Ignoring invalid chunk cache budget ${bytes}; ` +
+          `keeping ${this._maxBytes} bytes.`
+      )
+      return
+    }
     const shrinking = next < this._maxBytes
     this._maxBytes = next
     // An explicit 0 always empties, including an entry retained while the

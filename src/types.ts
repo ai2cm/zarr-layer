@@ -154,7 +154,9 @@ export interface ZarrLayerOptions {
   /**
    * Maximum bytes for the chunk cache. The cache stores raw zarr chunk bytes
    * at the store level, so all modes (tiled, untiled, queries) benefit.
-   * Set to 0 to disable caching. Default: 100 MB.
+   * Set to 0 to disable caching. Default: 100 MB. Fractional values are
+   * floored (so values below 1 disable caching like 0); an invalid value
+   * (non-finite or negative) falls back to the default with a warning.
    * Can be resized on a live layer with `ZarrLayer.setMaxChunkCacheBytes`
    * (but not enabled at runtime if the layer was created with 0).
    */
