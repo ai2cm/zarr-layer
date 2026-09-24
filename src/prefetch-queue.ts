@@ -23,8 +23,8 @@
 
 /**
  * Fetch one time step. Resolve `false` when the step could not be attempted
- * yet (e.g. the mode is still initializing); the queue retries it after
- * `retryDelayMs` while it is still wanted. Any other resolution (or a
+ * yet (e.g. the mode is still initializing); the queue retries it, with
+ * backoff, for as long as it is still wanted. Any other resolution (or a
  * rejection) counts as done.
  */
 export type PrefetchStepFetcher = (
@@ -36,10 +36,15 @@ export type PrefetchStepFetcher = (
 export interface PrefetchQueueOptions {
   fetchStep: PrefetchStepFetcher
   isCached: (timeIndex: number) => boolean
-  /** Delay between retries of a step whose fetcher resolved `false`. */
+  /**
+   * First retry delay for a step whose fetcher resolved `false`; doubles on
+   * each further retry up to `maxRetryDelayMs`. There is no retry cap: a step
+   * is retried until it is fetched or a later set()/clear() drops it, so a
+   * layer that isn't ready yet (e.g. in a background tab where no render
+   * pass has run) still fills once it is.
+   */
   retryDelayMs?: number
-  /** Retries per step before it is dropped. */
-  maxRetries?: number
+  maxRetryDelayMs?: number
 }
 
 export interface PrefetchQueueStats {
@@ -49,8 +54,6 @@ export interface PrefetchQueueStats {
   completed: number
   /** In-flight steps aborted because a new window no longer wanted them. */
   aborted: number
-  /** Steps given up on after `maxRetries` "not ready" results. */
-  dropped: number
 }
 
 interface InFlight {
@@ -63,7 +66,7 @@ export class PrefetchQueue {
   private readonly fetchStep: PrefetchStepFetcher
   private readonly isCached: (timeIndex: number) => boolean
   private readonly retryDelayMs: number
-  private readonly maxRetries: number
+  private readonly maxRetryDelayMs: number
   private pending: number[] = []
   private dim: string = 'time'
   private inFlight: InFlight | null = null
@@ -73,14 +76,13 @@ export class PrefetchQueue {
     started: 0,
     completed: 0,
     aborted: 0,
-    dropped: 0,
   }
 
   constructor(options: PrefetchQueueOptions) {
     this.fetchStep = options.fetchStep
     this.isCached = options.isCached
     this.retryDelayMs = options.retryDelayMs ?? 100
-    this.maxRetries = options.maxRetries ?? 100
+    this.maxRetryDelayMs = options.maxRetryDelayMs ?? 1000
   }
 
   /** Replace the wanted window (priority order). See the class comment. */
@@ -138,6 +140,19 @@ export class PrefetchQueue {
     return new Promise((resolve) => this.idleWaiters.push(resolve))
   }
 
+  /** Wait `ms`, or less if `signal` aborts first. */
+  private sleep(ms: number, signal: AbortSignal): Promise<void> {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer)
+        signal.removeEventListener('abort', done)
+        resolve()
+      }
+      const timer = setTimeout(done, ms)
+      signal.addEventListener('abort', done, { once: true })
+    })
+  }
+
   private async pump(): Promise<void> {
     this.running = true
     try {
@@ -148,23 +163,19 @@ export class PrefetchQueue {
         const dim = this.dim
         this.inFlight = { index, dim, controller }
         this.stats.started++
-        let dropped = false
         try {
-          for (let attempt = 0; ; attempt++) {
+          let delay = this.retryDelayMs
+          for (;;) {
             const result = await this.fetchStep(index, dim, controller.signal)
             if (result !== false || controller.signal.aborted) break
-            if (attempt >= this.maxRetries) {
-              dropped = true
-              break
-            }
-            await new Promise((r) => setTimeout(r, this.retryDelayMs))
+            await this.sleep(delay, controller.signal)
             if (controller.signal.aborted) break
+            delay = Math.min(delay * 2, this.maxRetryDelayMs)
           }
         } catch {
           // Aborted or failed: prefetch is best-effort.
         } finally {
-          if (dropped) this.stats.dropped++
-          else if (!controller.signal.aborted) this.stats.completed++
+          if (!controller.signal.aborted) this.stats.completed++
           this.inFlight = null
         }
       }

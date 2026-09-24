@@ -6,7 +6,7 @@ import { PrefetchQueue } from '../src/prefetch-queue.ts'
 
 // Fake fetcher: each step resolves when the test calls finish(idx), or
 // rejects with AbortError when its signal aborts (like zarr.get).
-function harness({ notReadyFor = new Map(), maxRetries } = {}) {
+function harness({ notReadyFor = new Map(), maxRetryDelayMs } = {}) {
   const cached = new Set()
   const log = []
   const open = new Map()
@@ -38,7 +38,7 @@ function harness({ notReadyFor = new Map(), maxRetries } = {}) {
     fetchStep,
     isCached: (i) => cached.has(i),
     retryDelayMs: 1,
-    maxRetries,
+    maxRetryDelayMs,
   })
   const tick = () => new Promise((r) => setTimeout(r, 0))
   const finish = async (idx) => {
@@ -72,7 +72,6 @@ test('fetches the window sequentially in priority order', async () => {
     started: 3,
     completed: 3,
     aborted: 0,
-    dropped: 0,
   })
 })
 
@@ -142,7 +141,6 @@ test('repeated identical windows do not restart anything', async () => {
     started: 3,
     completed: 3,
     aborted: 0,
-    dropped: 0,
   })
 })
 
@@ -229,14 +227,33 @@ test('re-wanting a step aborted by an earlier window re-queues it', async () => 
   ])
 })
 
-test('a step that never becomes ready is counted as dropped, not completed', async () => {
-  const h = harness({ notReadyFor: new Map([[1, 99]]), maxRetries: 2 })
+test('a still-wanted step that is not ready is retried until it is fetched (no cap)', async () => {
+  // 150 "not ready" results: more than the old 100-retry cap
+  const h = harness({ notReadyFor: new Map([[1, 150]]), maxRetryDelayMs: 1 })
   h.queue.set([1])
+  const deadline = Date.now() + 5000
+  while (h.log.filter((l) => l === 'notready 1').length < 150) {
+    assert.ok(Date.now() < deadline, 'step stopped retrying')
+    await new Promise((r) => setTimeout(r, 5))
+  }
+  await h.finish(1)
   await h.queue.whenIdle()
-  assert.deepEqual(h.queue.stats, {
-    started: 1,
-    completed: 0,
-    aborted: 0,
-    dropped: 1,
+  assert.ok(h.cached.has(1))
+  assert.deepEqual(h.queue.stats, { started: 1, completed: 1, aborted: 0 })
+})
+
+test('a not-ready step stops retrying once a new window drops it', async () => {
+  const h = harness({
+    notReadyFor: new Map([[1, Infinity]]),
+    maxRetryDelayMs: 1,
   })
+  h.queue.set([1])
+  await new Promise((r) => setTimeout(r, 20))
+  h.queue.set([2])
+  await h.finish(2)
+  await h.queue.whenIdle()
+  const retries = h.log.filter((l) => l === 'notready 1').length
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(h.log.filter((l) => l === 'notready 1').length, retries)
+  assert.ok(h.cached.has(2))
 })

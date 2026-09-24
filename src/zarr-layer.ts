@@ -5,7 +5,7 @@
  * Implements CustomLayerInterface for direct WebGL rendering.
  */
 
-import type { Readable } from '@zarrita/storage'
+import type { GetOptions, Readable } from '@zarrita/storage'
 import {
   loadDimensionValues,
   getBands,
@@ -216,15 +216,20 @@ export class ZarrLayer {
    */
   private timestepKeys: Map<string, StepKeys> = new Map()
   /**
-   * Set while a prefetch iteration is fetching a specific step. The
-   * continuously-active access listener attributes accesses to it when set,
-   * otherwise to the layer's current time index and selection (covering the
-   * render path where chunks are fetched on map frames). The selection is
-   * captured when the iteration starts, so chunks of a step still landing
-   * after a selector change are recorded for the selection they belong to.
+   * Prefetch requests in flight, keyed by the AbortSignal the queue created
+   * for the step. zarrita forwards that same signal to every store.get /
+   * getRange of the request, so the access listener can attribute each
+   * access to the request that made it: accesses carrying a registered
+   * signal belong to that prefetch step; all others (render fetches) belong
+   * to the displayed time index and current selection. Per request, not a
+   * global "currently prefetching" flag, so a render during a prefetch is
+   * never credited to the prefetched step. The selection is captured when
+   * the step starts.
    */
-  private currentPrefetchStep: { timeIndex: number; selection: string } | null =
-    null
+  private prefetchSignals: WeakMap<
+    AbortSignal,
+    { timeIndex: number; selection: string }
+  > = new WeakMap()
   /** Memoized currentSelection(); reset when the selector or time dim changes. */
   private selectionCache: string | null = null
   /** Disposer for the continuous CachingStore access listener. */
@@ -496,7 +501,6 @@ export class ZarrLayer {
       this.removeAccessListener = null
       this.prefetchQueue.clear()
       this.timestepKeys.clear()
-      this.currentPrefetchStep = null
       if (this.zarrStore) {
         this.zarrStore.cleanup()
         this.zarrStore = null
@@ -524,7 +528,6 @@ export class ZarrLayer {
       this.removeAccessListener = null
       this.prefetchQueue.clear()
       this.timestepKeys.clear()
-      this.currentPrefetchStep = null
       if (this.zarrStore) {
         this.zarrStore.cleanup()
         this.zarrStore = null
@@ -619,33 +622,28 @@ export class ZarrLayer {
 
   /**
    * Queue primitive: fetch one step through the current mode. Resolves false
-   * when the mode cannot prefetch yet (so the queue retries it).
+   * when the step can't be fetched yet (so the queue retries it): while
+   * metadata is loading (initial add, or setVariable, where the old mode is
+   * still installed until the new one is built) or when the mode says so.
    */
   private async prefetchOneStep(
     timeIdx: number,
     timeDimName: string,
     signal: AbortSignal
   ): Promise<boolean> {
+    if (this.metadataLoading) return false
     const mode = this.mode
     if (!mode?.prefetchTimeSteps) return true
-    const selection = this.currentSelection()
-    // Iteration callbacks set currentPrefetchStep so the continuous
-    // CachingStore listener attributes accesses to the right step.
-    const done = await mode.prefetchTimeSteps(
-      [timeIdx],
-      timeDimName,
-      signal,
-      (idx) => {
-        this.currentPrefetchStep = { timeIndex: idx, selection }
-      },
-      (idx) => {
-        const step = this.currentPrefetchStep
-        if (step && step.timeIndex === idx && step.selection === selection) {
-          this.currentPrefetchStep = null
-        }
-      }
-    )
-    return done !== false
+    this.prefetchSignals.set(signal, {
+      timeIndex: timeIdx,
+      selection: this.currentSelection(),
+    })
+    try {
+      const done = await mode.prefetchTimeSteps([timeIdx], timeDimName, signal)
+      return done !== false
+    } finally {
+      this.prefetchSignals.delete(signal)
+    }
   }
 
   /** Read the layer's currently-selected time index, if any. */
@@ -657,9 +655,14 @@ export class ZarrLayer {
     return null
   }
 
-  /** CachingStore access listener: attribute a chunk key to a step. */
-  private attributeChunkAccess(cacheKey: string): void {
-    const step = this.currentPrefetchStep
+  /**
+   * CachingStore access listener: attribute a chunk key to the prefetch step
+   * whose request made the access (by its signal), else to the displayed step.
+   */
+  private attributeChunkAccess(cacheKey: string, opts?: GetOptions): void {
+    const step = opts?.signal
+      ? this.prefetchSignals.get(opts.signal)
+      : undefined
     if (step) {
       this.recordChunkAccess(step.timeIndex, step.selection, cacheKey)
       return
@@ -1020,12 +1023,12 @@ export class ZarrLayer {
       // Install a continuous access listener so chunks fetched during render
       // frames (which happen asynchronously, not inside setSelector) are
       // attributed to a time step. Prefetch iterations override the default
-      // attribution by setting currentPrefetchStep for their duration.
+      // attribution per request (see prefetchSignals).
       if (this.zarrStore.cachingStore) {
         this.removeAccessListener?.()
         this.removeAccessListener =
-          this.zarrStore.cachingStore.addAccessListener((cacheKey) => {
-            this.attributeChunkAccess(cacheKey)
+          this.zarrStore.cachingStore.addAccessListener((cacheKey, opts) => {
+            this.attributeChunkAccess(cacheKey, opts)
           })
       }
 

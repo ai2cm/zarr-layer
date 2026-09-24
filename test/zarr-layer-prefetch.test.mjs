@@ -41,20 +41,21 @@ function fakeLayer({ chunksFor = (m, t) => [`m${m}/t${t}`] } = {}) {
     prefetchTimeSteps(indices, dim, signal, onStart, onEnd) {
       const idx = indices[0]
       const member = layer.normalizedSelector.member.selected
-      onStart(idx)
+      onStart?.(idx)
       return new Promise((resolve) => {
         const entry = { idx, member, signal, aborted: false }
+        // Like zarrita: every store access of this request carries its signal
         entry.release = () => {
           for (const key of chunksFor(member, idx)) {
             resident.add(key)
-            layer.attributeChunkAccess(key)
+            layer.attributeChunkAccess(key, { signal })
           }
-          onEnd(idx)
+          onEnd?.(idx)
           resolve(true)
         }
         signal.addEventListener('abort', () => {
           entry.aborted = true
-          onEnd(idx)
+          onEnd?.(idx)
           resolve(true)
         })
         fetches.push(entry)
@@ -121,6 +122,8 @@ test('time-only selector change keeps state and the queue', async () => {
   await layer.setSelector({ time: 5, member: 0 })
   assert.equal(layer.isTimeStepCached(2), true)
   assert.equal(fetches.at(-1).aborted, false)
+  assert.equal(fetches.at(-1).idx, 4)
+  assert.deepEqual(layer.prefetchQueue.pendingIndices, [5])
 })
 
 test('member change aborts the in-flight step and drops the queue', async () => {
@@ -151,6 +154,44 @@ test('getCacheDebugInfo: byte fields from the cache, step fields for the current
     { timeIndex: 1, recorded: 1, hits: 1 },
   ])
   assert.equal(info.avgChunksPerTimestep, 1)
+})
+
+test('a render access during an in-flight prefetch is recorded under the displayed step', async () => {
+  const { layer, fetches, resident } = fakeLayer()
+  // Displayed step: time index 0 (index selectors drive render attribution)
+  await layer.setSelector({ time: { selected: 0, type: 'index' }, member: 0 })
+  layer.prefetchTimeSteps([7])
+  await tick()
+  assert.equal(fetches.length, 1)
+  // The map renders the displayed step (time 0) with its own request signal
+  resident.add('m0/t0')
+  layer.attributeChunkAccess('m0/t0', { signal: new AbortController().signal })
+  // ...and an access without options (e.g. a metadata read)
+  layer.attributeChunkAccess('m0/t0')
+  fetches[0].release()
+  await tick()
+  assert.equal(layer.isTimeStepCached(0), true, 'displayed step recorded')
+  const recorded = layer.getCacheDebugInfo().perTimestepHits
+  assert.deepEqual(recorded, [
+    { timeIndex: 0, recorded: 1, hits: 1 },
+    { timeIndex: 7, recorded: 1, hits: 1 },
+  ])
+  // Evicting the displayed step's chunk must not downgrade step 7
+  resident.delete('m0/t0')
+  assert.equal(layer.isTimeStepCached(7), true)
+})
+
+test('prefetch waits while metadata loads (setVariable) and then fetches', async () => {
+  const { layer, fetches } = fakeLayer()
+  layer.metadataLoading = true // setVariable in progress; old mode still set
+  layer.prefetchTimeSteps([2])
+  await new Promise((r) => setTimeout(r, 30))
+  assert.equal(fetches.length, 0, 'must not fetch through the old mode')
+  layer.metadataLoading = false
+  await new Promise((r) => setTimeout(r, 250))
+  assert.equal(fetches.length, 1)
+  assert.equal(fetches[0].idx, 2)
+  fetches[0].release()
 })
 
 // UntiledMode.prefetchTimeSteps readiness contract, on a minimal fake `this`

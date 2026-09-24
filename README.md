@@ -198,9 +198,11 @@ layer.prefetchTimeSteps([12, 10, 13, 9])
   aborted only when it is no longer wanted or `timeDimName` changed (an aborted
   fetch leaves nothing in the cache). Steps are fetched one at a time.
 - Steps already cached (`isTimeStepCached`) are skipped.
-- A step that cannot be fetched yet (level not loaded, slice args rebuilding
-  after `setSelector`, or no visible-region pass for the current level) is
-  retried every 100 ms, up to 100 times, then dropped.
+- A step that cannot be fetched yet (metadata loading, including during
+  `setVariable`; level not loaded; slice args rebuilding after `setSelector`;
+  or no visible-region pass for the current level, e.g. a layer in a
+  background tab) is retried with backoff (100 ms doubling to 1 s) for as long
+  as it is still wanted. A later call that no longer lists it drops it.
 - Only the chunks intersecting the currently visible regions are fetched. The
   fork no longer falls back to the full level extent before the first render;
   if the pass found nothing in view, the step is a no-op.
@@ -210,6 +212,9 @@ layer.prefetchTimeSteps([12, 10, 13, 9])
   reports its steps as `missing` until fetched; switching back to a member
   whose chunks are still in the byte cache reports them as `cached` with no
   refetch. `getCacheDebugInfo()`'s per-step fields cover the current selection.
+  Chunk accesses are attributed per request: those made by a prefetch step
+  (recognized by its request's `AbortSignal`) count for that step, everything
+  else (render fetches) for the displayed step.
 - A `setSelector` that changes any non-time dim clears the prefetch queue
   (including the step in flight), since it was fetching for the old selection.
 - The call is a no-op until the layer has initialized (after `onAdd` finishes
