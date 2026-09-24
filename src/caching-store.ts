@@ -16,7 +16,11 @@ interface CacheEntry {
   byteSize: number
 }
 
-export type AccessListener = (cacheKey: string) => void
+/**
+ * Called on every access with the cache key and the caller's options (as
+ * passed by zarrita: `{ signal }`), so listeners can tell requests apart.
+ */
+export type AccessListener = (cacheKey: string, opts?: GetOptions) => void
 
 /** Default chunk-cache budget (100 MB), used when no valid budget is given. */
 export const DEFAULT_CHUNK_CACHE_BYTES = 100 * 1024 * 1024
@@ -100,8 +104,8 @@ export class CachingStore implements AsyncReadable {
     }
   }
 
-  private notifyAccess(cacheKey: string): void {
-    for (const fn of this.accessListeners) fn(cacheKey)
+  private notifyAccess(cacheKey: string, opts?: GetOptions): void {
+    for (const fn of this.accessListeners) fn(cacheKey, opts)
   }
 
   async get(
@@ -113,7 +117,7 @@ export class CachingStore implements AsyncReadable {
       // LRU: move to end of Map (most recently used)
       this.cache.delete(key)
       this.cache.set(key, cached)
-      this.notifyAccess(key)
+      this.notifyAccess(key, opts)
       return cached.data
     }
 
@@ -123,7 +127,7 @@ export class CachingStore implements AsyncReadable {
       const entry: CacheEntry = { data: result, byteSize: result.byteLength }
       this.cache.set(key, entry)
       this.totalBytes += result.byteLength
-      this.notifyAccess(key)
+      this.notifyAccess(key, opts)
     }
     return result
   }

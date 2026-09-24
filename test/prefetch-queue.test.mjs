@@ -1,0 +1,259 @@
+// Unit tests for the incremental prefetch queue.
+// Run: node --test test/ (Node >= 23.6 strips the TypeScript types natively).
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { PrefetchQueue } from '../src/prefetch-queue.ts'
+
+// Fake fetcher: each step resolves when the test calls finish(idx), or
+// rejects with AbortError when its signal aborts (like zarr.get).
+function harness({ notReadyFor = new Map(), maxRetryDelayMs } = {}) {
+  const cached = new Set()
+  const log = []
+  const open = new Map()
+  const fetchStep = (idx, dim, signal) =>
+    new Promise((resolve, reject) => {
+      log.push(`start ${idx}${dim === 'time' ? '' : ':' + dim}`)
+      const left = notReadyFor.get(idx) ?? 0
+      if (left > 0) {
+        notReadyFor.set(idx, left - 1)
+        log.push(`notready ${idx}`)
+        resolve(false)
+        return
+      }
+      signal.addEventListener('abort', () => {
+        log.push(`abort ${idx}`)
+        open.delete(idx)
+        const err = new Error('aborted')
+        err.name = 'AbortError'
+        reject(err)
+      })
+      open.set(idx, () => {
+        cached.add(idx)
+        log.push(`done ${idx}`)
+        open.delete(idx)
+        resolve(true)
+      })
+    })
+  const queue = new PrefetchQueue({
+    fetchStep,
+    isCached: (i) => cached.has(i),
+    retryDelayMs: 1,
+    maxRetryDelayMs,
+  })
+  const tick = () => new Promise((r) => setTimeout(r, 0))
+  const finish = async (idx) => {
+    await tick()
+    assert.ok(
+      open.has(idx),
+      `step ${idx} not in flight (log: ${log.join(', ')})`
+    )
+    open.get(idx)()
+    await tick()
+  }
+  return { queue, cached, log, finish, tick }
+}
+
+test('fetches the window sequentially in priority order', async () => {
+  const h = harness()
+  h.queue.set([3, 1, 2])
+  await h.finish(3)
+  await h.finish(1)
+  await h.finish(2)
+  await h.queue.whenIdle()
+  assert.deepEqual(h.log, [
+    'start 3',
+    'done 3',
+    'start 1',
+    'done 1',
+    'start 2',
+    'done 2',
+  ])
+  assert.deepEqual(h.queue.stats, {
+    started: 3,
+    completed: 3,
+    aborted: 0,
+  })
+})
+
+test('keeps the in-flight step when it is still wanted', async () => {
+  const h = harness()
+  h.queue.set([1, 2, 3])
+  await h.tick()
+  assert.equal(h.queue.inFlightIndex, 1)
+  // Cursor moved: the new window still contains 1
+  h.queue.set([2, 1, 4])
+  assert.equal(h.queue.inFlightIndex, 1)
+  assert.deepEqual(h.queue.pendingIndices, [2, 4])
+  await h.finish(1)
+  await h.finish(2)
+  await h.finish(4)
+  await h.queue.whenIdle()
+  assert.ok(!h.log.includes('abort 1'))
+  assert.ok(!h.log.includes('start 3'), 'dropped step 3 must not be fetched')
+  assert.equal(h.queue.stats.aborted, 0)
+})
+
+test('aborts the in-flight step only when no longer wanted, then continues', async () => {
+  const h = harness()
+  h.queue.set([1, 2])
+  await h.tick()
+  h.queue.set([5, 6])
+  await h.tick()
+  assert.ok(h.log.includes('abort 1'))
+  assert.equal(h.queue.inFlightIndex, 5)
+  await h.finish(5)
+  await h.finish(6)
+  await h.queue.whenIdle()
+  assert.deepEqual(h.log, [
+    'start 1',
+    'abort 1',
+    'start 5',
+    'done 5',
+    'start 6',
+    'done 6',
+  ])
+  assert.equal(h.queue.stats.aborted, 1)
+})
+
+test('skips cached, duplicate and invalid indices', async () => {
+  const h = harness()
+  h.cached.add(2)
+  h.queue.set([1, 2, 1, 3, -1, 2.5])
+  await h.tick()
+  assert.equal(h.queue.inFlightIndex, 1)
+  assert.deepEqual(h.queue.pendingIndices, [3])
+  await h.finish(1)
+  await h.finish(3)
+  await h.queue.whenIdle()
+  assert.equal(h.queue.stats.started, 2)
+})
+
+test('repeated identical windows do not restart anything', async () => {
+  const h = harness()
+  h.queue.set([1, 2, 3])
+  await h.tick()
+  for (let i = 0; i < 10; i++) h.queue.set([1, 2, 3])
+  await h.finish(1)
+  await h.finish(2)
+  await h.finish(3)
+  await h.queue.whenIdle()
+  assert.deepEqual(h.queue.stats, {
+    started: 3,
+    completed: 3,
+    aborted: 0,
+  })
+})
+
+test('changing the time dimension aborts the in-flight step', async () => {
+  const h = harness()
+  h.queue.set([1], 'time')
+  await h.tick()
+  h.queue.set([1], 'valid_time')
+  await h.tick()
+  assert.ok(h.log.includes('abort 1'))
+  await h.finish(1)
+  await h.queue.whenIdle()
+  assert.deepEqual(h.log, [
+    'start 1',
+    'abort 1',
+    'start 1:valid_time',
+    'done 1',
+  ])
+})
+
+test('retries a step whose fetcher is not ready yet', async () => {
+  const h = harness({ notReadyFor: new Map([[1, 2]]) })
+  h.queue.set([1])
+  await new Promise((r) => setTimeout(r, 20))
+  await h.finish(1)
+  await h.queue.whenIdle()
+  assert.deepEqual(h.log, [
+    'start 1',
+    'notready 1',
+    'start 1',
+    'notready 1',
+    'start 1',
+    'done 1',
+  ])
+  assert.equal(h.queue.stats.started, 1)
+})
+
+test('clear() aborts in flight and drops pending', async () => {
+  const h = harness()
+  h.queue.set([1, 2, 3])
+  await h.tick()
+  h.queue.clear()
+  await h.queue.whenIdle()
+  assert.deepEqual(h.log, ['start 1', 'abort 1'])
+  assert.equal(h.queue.inFlightIndex, null)
+})
+
+test('holding a key: sliding windows extend instead of restarting', async () => {
+  // Simulate a forward window of 4 that slides by one step per move while
+  // each step takes one "finish" to complete: no in-flight abort ever.
+  const h = harness()
+  let cursor = 0
+  const windowAt = (c) => [c + 1, c + 2, c + 3, c + 4]
+  h.queue.set(windowAt(cursor))
+  for (let move = 0; move < 6; move++) {
+    await h.finish(h.queue.inFlightIndex)
+    cursor++
+    h.queue.set(windowAt(cursor))
+  }
+  assert.equal(h.queue.stats.aborted, 0)
+  for (let i = 1; i <= 6; i++) assert.ok(h.cached.has(i), `step ${i} cached`)
+  h.queue.clear()
+  await h.queue.whenIdle()
+})
+
+test('re-wanting a step aborted by an earlier window re-queues it', async () => {
+  const h = harness()
+  h.queue.set([1])
+  await h.tick()
+  h.queue.set([3]) // aborts 1; its fetch has not settled yet
+  h.queue.set([1, 3]) // must not treat the aborted 1 as still in flight
+  assert.deepEqual(h.queue.pendingIndices, [1, 3])
+  await h.finish(1)
+  await h.finish(3)
+  await h.queue.whenIdle()
+  assert.ok(h.cached.has(1) && h.cached.has(3))
+  assert.deepEqual(h.log, [
+    'start 1',
+    'abort 1',
+    'start 1',
+    'done 1',
+    'start 3',
+    'done 3',
+  ])
+})
+
+test('a still-wanted step that is not ready is retried until it is fetched (no cap)', async () => {
+  // 150 "not ready" results: more than the old 100-retry cap
+  const h = harness({ notReadyFor: new Map([[1, 150]]), maxRetryDelayMs: 1 })
+  h.queue.set([1])
+  const deadline = Date.now() + 5000
+  while (h.log.filter((l) => l === 'notready 1').length < 150) {
+    assert.ok(Date.now() < deadline, 'step stopped retrying')
+    await new Promise((r) => setTimeout(r, 5))
+  }
+  await h.finish(1)
+  await h.queue.whenIdle()
+  assert.ok(h.cached.has(1))
+  assert.deepEqual(h.queue.stats, { started: 1, completed: 1, aborted: 0 })
+})
+
+test('a not-ready step stops retrying once a new window drops it', async () => {
+  const h = harness({
+    notReadyFor: new Map([[1, Infinity]]),
+    maxRetryDelayMs: 1,
+  })
+  h.queue.set([1])
+  await new Promise((r) => setTimeout(r, 20))
+  h.queue.set([2])
+  await h.finish(2)
+  await h.queue.whenIdle()
+  const retries = h.log.filter((l) => l === 'notready 1').length
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(h.log.filter((l) => l === 'notready 1').length, retries)
+  assert.ok(h.cached.has(2))
+})

@@ -2795,66 +2795,70 @@ export class UntiledMode implements ZarrMode {
   async prefetchTimeSteps(
     timeIndices: number[],
     timeDimName: string,
-    signal: AbortSignal,
-    onIterationStart?: (timeIndex: number) => void,
-    onIterationEnd?: (timeIndex: number) => void
-  ): Promise<void> {
-    if (!this.zarrArray || !this.baseSliceArgsReady) return
+    signal: AbortSignal
+  ): Promise<boolean> {
+    // false = not ready, nothing fetched; ZarrLayer's PrefetchQueue retries
+    // the step. Not ready: no level array yet, slice args rebuilding after
+    // setSelector, or no visible-region pass for the current level yet
+    // (level mismatch or the -1 sentinel).
+    // Prefetch only fetches the chunks intersecting the visible regions (the
+    // same set fetchRegion pulls on a render); it no longer falls back to the
+    // full level extent before the first render, which on a high-res store
+    // (e.g. a zoomed-in inset) would fetch far more than is ever shown.
+    if (
+      !this.zarrArray ||
+      !this.baseSliceArgsReady ||
+      this.lastVisibleRegionsLevel === -1 ||
+      this.lastVisibleRegionsLevel !== this.currentLevelIndex
+    ) {
+      return false
+    }
+    // The pass ran and nothing is in view: nothing to fetch (done, no retry)
+    if (this.lastVisibleRegions.length === 0) return true
 
-    // Compute the spatial extent the prefetch should cover. When the
-    // viewport has been rendered at least once, fetch only the chunks that
-    // intersect the currently visible regions (the same set fetchRegion
-    // would pull on a render). Otherwise fall back to the full extent.
     const [regionH, regionW] = this.regionSize ?? [this.height, this.width]
-    const regions =
-      this.lastVisibleRegions.length > 0 &&
-      this.lastVisibleRegionsLevel === this.currentLevelIndex
-        ? this.lastVisibleRegions.map(({ regionX, regionY }) => ({
-            yStart: regionY * regionH,
-            yEnd: Math.min(regionY * regionH + regionH, this.height),
-            xStart: regionX * regionW,
-            xEnd: Math.min(regionX * regionW + regionW, this.width),
-          }))
-        : [{ yStart: 0, yEnd: this.height, xStart: 0, xEnd: this.width }]
+    const regions = this.lastVisibleRegions.map(({ regionX, regionY }) => ({
+      yStart: regionY * regionH,
+      yEnd: Math.min(regionY * regionH + regionH, this.height),
+      xStart: regionX * regionW,
+      xEnd: Math.min(regionX * regionW + regionW, this.width),
+    }))
 
     const latIdx = this.dimIndices.lat?.index
     const lonIdx = this.dimIndices.lon?.index
 
     for (const timeIndex of timeIndices) {
-      if (signal.aborted) return
-      onIterationStart?.(timeIndex)
+      if (signal.aborted) return true
 
-      try {
-        // Build base slice args with this future time step substituted.
-        // Spatial dims are placeholders here — we override them per region.
-        const prefetchSelector: NormalizedSelector = { ...this.selector }
-        prefetchSelector[timeDimName] = {
-          selected: timeIndex,
-          type: 'index' as const,
+      // Build base slice args with this future time step substituted.
+      // Spatial dims are placeholders here — we override them per region.
+      const prefetchSelector: NormalizedSelector = { ...this.selector }
+      prefetchSelector[timeDimName] = {
+        selected: timeIndex,
+        type: 'index' as const,
+      }
+      const { sliceArgs: baseSliceArgs } = await this.buildSliceArgsForSelector(
+        prefetchSelector,
+        {
+          includeSpatialSlices: false,
+          trackMultiValue: false,
         }
-        const { sliceArgs: baseSliceArgs } =
-          await this.buildSliceArgsForSelector(prefetchSelector, {
-            includeSpatialSlices: false,
-            trackMultiValue: false,
-          })
+      )
 
-        if (signal.aborted) return
+      if (signal.aborted) return true
 
-        for (const { yStart, yEnd, xStart, xEnd } of regions) {
-          if (signal.aborted) return
-          const sliceArgs = [...baseSliceArgs]
-          if (latIdx !== undefined) sliceArgs[latIdx] = zarr.slice(yStart, yEnd)
-          if (lonIdx !== undefined) sliceArgs[lonIdx] = zarr.slice(xStart, xEnd)
+      for (const { yStart, yEnd, xStart, xEnd } of regions) {
+        if (signal.aborted) return true
+        const sliceArgs = [...baseSliceArgs]
+        if (latIdx !== undefined) sliceArgs[latIdx] = zarr.slice(yStart, yEnd)
+        if (lonIdx !== undefined) sliceArgs[lonIdx] = zarr.slice(xStart, xEnd)
 
-          try {
-            await zarr.get(this.zarrArray, sliceArgs, { opts: { signal } })
-          } catch (e) {
-            if ((e as Error).name === 'AbortError') return
-            // Swallow other errors for prefetch — non-critical
-          }
+        try {
+          await zarr.get(this.zarrArray, sliceArgs, { opts: { signal } })
+        } catch (e) {
+          if ((e as Error).name === 'AbortError') return true
+          // Swallow other errors for prefetch — non-critical
         }
-      } finally {
-        onIterationEnd?.(timeIndex)
       }
 
       // Yield to the event loop between time steps so animation frames and
@@ -2867,6 +2871,7 @@ export class UntiledMode implements ZarrMode {
         })
       }
     }
+    return true
   }
 
   private emitLoadingState(): void {
