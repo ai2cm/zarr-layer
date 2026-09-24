@@ -31,7 +31,8 @@ import type {
 } from './types'
 import type { ZarrMode, RenderContext } from './zarr-mode'
 import { TiledMode } from './tiled-mode'
-import { UntiledMode } from './untiled-mode'
+import { UntiledMode, normalizedCacheBytesFor } from './untiled-mode'
+import { normalizeCacheBytes } from './caching-store'
 import {
   computeWorldOffsets,
   resolveProjectionParams,
@@ -179,6 +180,12 @@ export class ZarrLayer {
   private lastIsGlobe: boolean | null = null
   private usingDirectMapboxGlobePath: boolean = false
   private maxChunkCacheBytes: number | undefined
+  /**
+   * Whether the chunk cache exists at all. Fixed at construction (same rule
+   * as upstream: unset or > 0), so runtime resizes (including to 0) never
+   * enable or disable caching across `setVariable` or remove/re-add.
+   */
+  private readonly chunkCacheEnabled: boolean
   private prefetchController: AbortController | null = null
   /**
    * Map from time-step index to the set of CachingStore cache keys that
@@ -381,6 +388,8 @@ export class ZarrLayer {
     this.customStore = store
     this.renderPoles = renderPoles
     this.maxChunkCacheBytes = maxChunkCacheBytes
+    this.chunkCacheEnabled =
+      maxChunkCacheBytes === undefined || maxChunkCacheBytes > 0
   }
 
   private emitLoadingState(): void {
@@ -679,6 +688,35 @@ export class ZarrLayer {
   }
 
   /**
+   * Resize the chunk cache of a live layer. Shrinking evicts
+   * least-recently-used entries immediately; growing never evicts. Because
+   * `getRecommendedPrefetchCount` reads the live budget, the prefetch window
+   * follows the new size on its next call. `0` empties the cache (see
+   * `CachingStore.setMaxBytes`); restoring the previous value afterwards
+   * acts as "clear cache".
+   *
+   * Internal secondary caches (untiled mode's normalized-data cache) are
+   * rescaled with it, so this is the single memory knob for the layer.
+   *
+   * If called before the store is initialized the value is used when the
+   * cache is created. Whether the cache exists is fixed at construction: on
+   * a layer constructed with `maxChunkCacheBytes: 0` this is a no-op, and a
+   * budget of 0 keeps an empty cache in place (also across `setVariable` or
+   * remove/re-add) so a later positive budget resumes caching.
+   *
+   * Non-finite or negative values are treated as `0` and fractional values
+   * are floored, before the value is stored or forwarded.
+   */
+  setMaxChunkCacheBytes(bytes: number): void {
+    if (!this.chunkCacheEnabled) return
+    this.maxChunkCacheBytes = normalizeCacheBytes(bytes)
+    this.zarrStore?.setMaxChunkCacheBytes(this.maxChunkCacheBytes)
+    this.mode?.setNormalizedCacheBytes?.(
+      normalizedCacheBytesFor(this.maxChunkCacheBytes)
+    )
+  }
+
+  /**
    * Diagnostic snapshot of the chunk cache state vs. recorded keys.
    * Useful for tuning maxChunkCacheBytes when the indicator is stuck at
    * 'partial' for a high-resolution dataset.
@@ -833,7 +871,8 @@ export class ZarrLayer {
         this.normalizedSelector,
         this.invalidate,
         this.throttleMs,
-        this.fixedDataScale
+        this.fixedDataScale,
+        normalizedCacheBytesFor(this.maxChunkCacheBytes)
       )
     }
 
@@ -863,6 +902,7 @@ export class ZarrLayer {
         transformRequest: this.transformRequest,
         customStore: this.customStore,
         maxChunkCacheBytes: this.maxChunkCacheBytes,
+        chunkCacheEnabled: this.chunkCacheEnabled,
       })
 
       await this.zarrStore.initialized

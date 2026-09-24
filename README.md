@@ -129,6 +129,52 @@ layer.setVariable('precipitation') // async - reloads metadata
 layer.setUniforms({ u_weight: 1.5 }) // no-op unless layer has customFrag
 ```
 
+### fork-specific API (ace-viz)
+
+These methods exist in the ace-viz fork only.
+
+**Cache sizing.** `maxChunkCacheBytes` (default `100 MB`, `0` disables) is the
+single memory knob per layer. It sizes the chunk cache and, in untiled mode,
+an internal secondary cache of decoded region data that is derived from it
+(currently 40% of the chunk budget; 200 MB when the chunk budget is unset or
+`0`). Approximate JS memory per untiled layer, plus GPU textures for the
+visible regions:
+
+- positive budget: about 1.4× `maxChunkCacheBytes`
+- unset: 100 MB chunk cache + 200 MB decoded cache (about 300 MB)
+- `0`: no chunk cache (or, at runtime, an emptied one) + 200 MB decoded cache
+
+```ts
+// Resize a live layer; shrinking evicts LRU entries immediately, growing never evicts.
+layer.setMaxChunkCacheBytes(1024 * 1024 * 1024)
+
+// "Clear cache": set to 0 (empties the chunk cache) then restore the budget.
+layer.setMaxChunkCacheBytes(0)
+layer.setMaxChunkCacheBytes(previous)
+
+layer.getCacheDebugInfo() // { maxBytes, usedBytes, chunksInCache, ... } (chunk cache)
+```
+
+Notes:
+
+- `setMaxChunkCacheBytes` treats non-finite or negative values as `0` and
+  floors fractional values.
+- `setMaxChunkCacheBytes(0)` empties the chunk cache only; the decoded cache
+  falls back to its 200 MB default rather than being emptied.
+- `getRecommendedPrefetchCount()` reads the live chunk budget, so the prefetch
+  window grows/shrinks with `setMaxChunkCacheBytes`.
+- Whether the chunk cache exists is fixed at construction and survives
+  `setVariable` and remove/re-add. A layer constructed with
+  `maxChunkCacheBytes: 0` cannot enable it at runtime (the setter is a no-op
+  for it); on any other layer a runtime budget of `0` keeps an empty cache in
+  place, so restoring a budget later resumes caching. On layers with caching
+  enabled, calls made before the layer is added to a map are remembered and
+  applied when the store is created.
+- With a budget of `0` on a live cache, the most recent fetch is still
+  retained (same as any entry larger than the budget) so sharded `getRange`
+  reads do not refetch the whole shard per inner chunk. Calling
+  `setMaxChunkCacheBytes(0)` again evicts it.
+
 ## selectors
 
 Selectors specify which slice of your multidimensional data to render. Dimensions not specified default to index 0.

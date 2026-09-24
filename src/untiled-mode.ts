@@ -9,6 +9,7 @@
  */
 
 import * as zarr from 'zarrita'
+import { normalizeCacheBytes } from './caching-store'
 import {
   WEB_MERCATOR_EXTENT,
   MIN_SUBDIVISIONS,
@@ -159,6 +160,31 @@ const MAX_CACHED_REGIONS = 128
  */
 const DEFAULT_NORMALIZED_CACHE_BYTES = 200 * 1024 * 1024
 
+/**
+ * Normalized-cache budget as a fraction of the chunk-cache budget. The
+ * normalized cache is an internal detail (there is no public option for it);
+ * it is sized from `maxChunkCacheBytes` so a single knob scales both. 0.4
+ * matches the 200 MB default alongside a 500 MB chunk budget.
+ */
+const NORMALIZED_CACHE_RATIO = 0.4
+
+/**
+ * Derive the normalized-cache budget from the chunk-cache budget. Falls back
+ * to the 200 MB default when the chunk budget is unset, 0 (chunk caching
+ * disabled) or non-finite, preserving the previous behaviour for those configurations.
+ */
+export function normalizedCacheBytesFor(
+  maxChunkCacheBytes: number | undefined
+): number {
+  if (
+    maxChunkCacheBytes === undefined ||
+    !(Number.isFinite(maxChunkCacheBytes) && maxChunkCacheBytes > 0)
+  ) {
+    return DEFAULT_NORMALIZED_CACHE_BYTES
+  }
+  return Math.round(maxChunkCacheBytes * NORMALIZED_CACHE_RATIO)
+}
+
 /** Entry in the normalized data cache */
 interface NormalizedCacheEntry {
   /** Interleaved multi-band data ready for texImage2D */
@@ -180,10 +206,37 @@ interface NormalizedCacheEntry {
 class NormalizedDataCache {
   private cache: Map<string, NormalizedCacheEntry> = new Map()
   private totalBytes: number = 0
-  readonly maxBytes: number
+  private _maxBytes: number
 
   constructor(maxBytes: number = DEFAULT_NORMALIZED_CACHE_BYTES) {
-    this.maxBytes = maxBytes
+    this._maxBytes = Math.max(0, maxBytes)
+  }
+
+  get maxBytes(): number {
+    return this._maxBytes
+  }
+
+  /**
+   * Change the byte budget. Shrinking evicts LRU entries immediately; growing
+   * never evicts. `0` empties the cache (subsequent puts keep at most the most
+   * recent entry, matching the existing oversize-entry behaviour of put()).
+   */
+  setMaxBytes(bytes: number): void {
+    const next = normalizeCacheBytes(bytes)
+    const shrinking = next < this._maxBytes
+    this._maxBytes = next
+    // An explicit 0 always empties, including an entry retained while the
+    // budget was already 0.
+    if (shrinking || next === 0) this.evictUntilFits(0)
+  }
+
+  private evictUntilFits(newBytes: number): void {
+    while (this.totalBytes + newBytes > this._maxBytes && this.cache.size > 0) {
+      const oldest = this.cache.keys().next().value!
+      const evicted = this.cache.get(oldest)!
+      this.totalBytes -= evicted.byteSize
+      this.cache.delete(oldest)
+    }
   }
 
   /** Build a cache key from a region key and a selector hash */
@@ -212,15 +265,7 @@ class NormalizedDataCache {
     }
 
     // Evict until there's room
-    while (
-      this.totalBytes + entry.byteSize > this.maxBytes &&
-      this.cache.size > 0
-    ) {
-      const oldest = this.cache.keys().next().value!
-      const evicted = this.cache.get(oldest)!
-      this.totalBytes -= evicted.byteSize
-      this.cache.delete(oldest)
-    }
+    this.evictUntilFits(entry.byteSize)
 
     this.cache.set(key, entry)
     this.totalBytes += entry.byteSize
@@ -355,7 +400,7 @@ export class UntiledMode implements ZarrMode {
 
   // Normalized data cache: stores post-normalization Float32Arrays keyed by
   // regionKey + selectorHash for instant GPU re-upload on time step revisits
-  private normalizedCache: NormalizedDataCache = new NormalizedDataCache()
+  private normalizedCache: NormalizedDataCache
   // Stable hash of the current selector (for cache keying, survives back-and-forth)
   private currentSelectorHash: string = ''
 
@@ -365,8 +410,10 @@ export class UntiledMode implements ZarrMode {
     selector: NormalizedSelector,
     invalidate: () => void,
     throttleMs: number = 100,
-    fixedDataScale: number = 1
+    fixedDataScale: number = 1,
+    maxNormalizedCacheBytes: number = DEFAULT_NORMALIZED_CACHE_BYTES
   ) {
+    this.normalizedCache = new NormalizedDataCache(maxNormalizedCacheBytes)
     this.zarrStore = store
     this.variable = variable
     this.selector = selector
@@ -375,6 +422,11 @@ export class UntiledMode implements ZarrMode {
     this.throttleMs = throttleMs
     this.fixedDataScale = fixedDataScale
     this.currentSelectorHash = this.computeSelectorHash(selector)
+  }
+
+  /** Internal: resize the normalized data cache; shrinking evicts immediately. */
+  setNormalizedCacheBytes(bytes: number): void {
+    this.normalizedCache.setMaxBytes(bytes)
   }
 
   async initialize(): Promise<void> {
