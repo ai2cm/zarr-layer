@@ -204,6 +204,7 @@ export class ZarrLayer {
     fetchStep: (timeIdx, timeDimName, signal) =>
       this.prefetchOneStep(timeIdx, timeDimName, signal),
     isCached: (timeIdx) => this.isTimeStepCached(timeIdx),
+    onBusyChange: () => this.emitLoadingState(),
   })
   /**
    * CachingStore cache keys per step, where a step is a time index *plus*
@@ -441,6 +442,7 @@ export class ZarrLayer {
       loading: this.metadataLoading || this.chunksLoading,
       metadata: this.metadataLoading,
       chunks: this.chunksLoading,
+      prefetching: this.prefetchQueue.busy,
       error: this.initError,
     })
   }

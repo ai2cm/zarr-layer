@@ -55,9 +55,18 @@ export interface DimIndicesProps {
 }
 
 export interface LoadingState {
+  /** `metadata || chunks`. Prefetch activity is not included. */
   loading: boolean
   metadata: boolean
+  /** Data for the current view is loading (render-driven fetches only). */
   chunks: boolean
+  /**
+   * Background prefetch (`prefetchTimeSteps`) has outstanding work: a step in
+   * flight, or waiting to be retried until the layer can fetch it. Reported
+   * separately from `chunks`, so it never changes `loading`. Set by
+   * `ZarrLayer`; absent from mode-internal states.
+   */
+  prefetching?: boolean
   error?: Error | null
 }
 

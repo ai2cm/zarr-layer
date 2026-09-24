@@ -6,7 +6,11 @@ import { PrefetchQueue } from '../src/prefetch-queue.ts'
 
 // Fake fetcher: each step resolves when the test calls finish(idx), or
 // rejects with AbortError when its signal aborts (like zarr.get).
-function harness({ notReadyFor = new Map(), maxRetryDelayMs } = {}) {
+function harness({
+  notReadyFor = new Map(),
+  maxRetryDelayMs,
+  onBusyChange,
+} = {}) {
   const cached = new Set()
   const log = []
   const open = new Map()
@@ -39,6 +43,7 @@ function harness({ notReadyFor = new Map(), maxRetryDelayMs } = {}) {
     isCached: (i) => cached.has(i),
     retryDelayMs: 1,
     maxRetryDelayMs,
+    onBusyChange,
   })
   const tick = () => new Promise((r) => setTimeout(r, 0))
   const finish = async (idx) => {
@@ -256,4 +261,47 @@ test('a not-ready step stops retrying once a new window drops it', async () => {
   await new Promise((r) => setTimeout(r, 20))
   assert.equal(h.log.filter((l) => l === 'notready 1').length, retries)
   assert.ok(h.cached.has(2))
+})
+
+test('busy: true from the first step until the queue drains, one change each way', async () => {
+  const changes = []
+  const h = harness({ onBusyChange: (b) => changes.push(b) })
+  assert.equal(h.queue.busy, false)
+  h.queue.set([])
+  assert.deepEqual(changes, [], 'an empty window never starts the pump')
+  h.queue.set([1, 2])
+  assert.equal(h.queue.busy, true)
+  await h.finish(1)
+  // A new window while busy extends the same busy period
+  h.queue.set([2, 3])
+  await h.finish(2)
+  await h.finish(3)
+  await h.queue.whenIdle()
+  assert.equal(h.queue.busy, false)
+  assert.deepEqual(changes, [true, false])
+
+  h.queue.set([4])
+  h.queue.clear()
+  await h.queue.whenIdle()
+  assert.equal(h.queue.busy, false)
+  assert.deepEqual(changes, [true, false, true, false], 'clear() ends it')
+})
+
+test('busy stays true while a not-ready step waits to retry', async () => {
+  const changes = []
+  const h = harness({
+    notReadyFor: new Map([[1, 3]]),
+    onBusyChange: (b) => changes.push(b),
+  })
+  h.queue.set([1])
+  await h.tick()
+  assert.equal(h.queue.busy, true)
+  // Three not-ready attempts, then the fourth start stays in flight
+  while (h.log.filter((l) => l === 'start 1').length < 4) {
+    assert.equal(h.queue.busy, true)
+    await new Promise((r) => setTimeout(r, 2))
+  }
+  await h.finish(1)
+  await h.queue.whenIdle()
+  assert.deepEqual(changes, [true, false])
 })

@@ -46,6 +46,11 @@ export interface PrefetchQueueOptions {
    */
   retryDelayMs?: number
   maxRetryDelayMs?: number
+  /**
+   * Called when `busy` changes: true when the queue starts working through
+   * steps, false once nothing is in flight or pending.
+   */
+  onBusyChange?: (busy: boolean) => void
 }
 
 export interface PrefetchQueueStats {
@@ -68,6 +73,7 @@ export class PrefetchQueue {
   private readonly isCached: (timeIndex: number) => boolean
   private readonly retryDelayMs: number
   private readonly maxRetryDelayMs: number
+  private readonly onBusyChange: ((busy: boolean) => void) | undefined
   private pending: number[] = []
   private dim: string = 'time'
   private inFlight: InFlight | null = null
@@ -84,6 +90,7 @@ export class PrefetchQueue {
     this.isCached = options.isCached
     this.retryDelayMs = options.retryDelayMs ?? 100
     this.maxRetryDelayMs = options.maxRetryDelayMs ?? 1000
+    this.onBusyChange = options.onBusyChange
   }
 
   /** Replace the wanted window (priority order). See the class comment. */
@@ -135,6 +142,11 @@ export class PrefetchQueue {
     return [...this.pending]
   }
 
+  /** True while a step is in flight (or waiting to retry) or pending. */
+  get busy(): boolean {
+    return this.running
+  }
+
   /** Resolves once the queue has nothing in flight and nothing pending. */
   whenIdle(): Promise<void> {
     if (!this.running) return Promise.resolve()
@@ -156,6 +168,7 @@ export class PrefetchQueue {
 
   private async pump(): Promise<void> {
     this.running = true
+    this.onBusyChange?.(true)
     try {
       while (this.pending.length > 0) {
         const index = this.pending.shift()!
@@ -182,6 +195,7 @@ export class PrefetchQueue {
       }
     } finally {
       this.running = false
+      this.onBusyChange?.(false)
       const waiters = this.idleWaiters
       this.idleWaiters = []
       for (const w of waiters) w()
