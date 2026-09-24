@@ -32,7 +32,7 @@ import type {
 import type { ZarrMode, RenderContext } from './zarr-mode'
 import { TiledMode } from './tiled-mode'
 import { UntiledMode, normalizedCacheBytesFor } from './untiled-mode'
-import { normalizeCacheBytes } from './caching-store'
+import { DEFAULT_CHUNK_CACHE_BYTES, validCacheBytes } from './caching-store'
 import {
   computeWorldOffsets,
   resolveProjectionParams,
@@ -181,8 +181,8 @@ export class ZarrLayer {
   private usingDirectMapboxGlobePath: boolean = false
   private maxChunkCacheBytes: number | undefined
   /**
-   * Whether the chunk cache exists at all. Fixed at construction (same rule
-   * as upstream: unset or > 0), so runtime resizes (including to 0) never
+   * Whether the chunk cache exists at all. Fixed at construction (unset or
+   * a budget > 0 after validation), so runtime resizes (including to 0) never
    * enable or disable caching across `setVariable` or remove/re-add.
    */
   private readonly chunkCacheEnabled: boolean
@@ -387,9 +387,21 @@ export class ZarrLayer {
     this.transformRequest = transformRequest
     this.customStore = store
     this.renderPoles = renderPoles
-    this.maxChunkCacheBytes = maxChunkCacheBytes
-    this.chunkCacheEnabled =
-      maxChunkCacheBytes === undefined || maxChunkCacheBytes > 0
+    // An invalid budget behaves exactly like an unset one (100 MB chunk
+    // cache, default decoded-cache budget).
+    let chunkBudget =
+      maxChunkCacheBytes === undefined
+        ? undefined
+        : validCacheBytes(maxChunkCacheBytes)
+    if (chunkBudget === null) {
+      console.warn(
+        `[ZarrLayer] Invalid maxChunkCacheBytes ${maxChunkCacheBytes}; ` +
+          `using the default of ${DEFAULT_CHUNK_CACHE_BYTES} bytes.`
+      )
+      chunkBudget = undefined
+    }
+    this.maxChunkCacheBytes = chunkBudget
+    this.chunkCacheEnabled = chunkBudget === undefined || chunkBudget > 0
   }
 
   private emitLoadingState(): void {
@@ -704,12 +716,20 @@ export class ZarrLayer {
    * budget of 0 keeps an empty cache in place (also across `setVariable` or
    * remove/re-add) so a later positive budget resumes caching.
    *
-   * Non-finite or negative values are treated as `0` and fractional values
-   * are floored, before the value is stored or forwarded.
+   * Fractional values are floored. An invalid value (non-finite or
+   * negative) is ignored with a warning and the current budget is kept.
    */
   setMaxChunkCacheBytes(bytes: number): void {
+    const valid = validCacheBytes(bytes)
+    if (valid === null) {
+      console.warn(
+        `[ZarrLayer] Ignoring invalid chunk cache budget ${bytes}; ` +
+          `keeping the current budget.`
+      )
+      return
+    }
     if (!this.chunkCacheEnabled) return
-    this.maxChunkCacheBytes = normalizeCacheBytes(bytes)
+    this.maxChunkCacheBytes = valid
     this.zarrStore?.setMaxChunkCacheBytes(this.maxChunkCacheBytes)
     this.mode?.setNormalizedCacheBytes?.(
       normalizedCacheBytesFor(this.maxChunkCacheBytes)

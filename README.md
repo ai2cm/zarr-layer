@@ -157,8 +157,13 @@ layer.getCacheDebugInfo() // { maxBytes, usedBytes, chunksInCache, ... } (chunk 
 
 Notes:
 
-- `setMaxChunkCacheBytes` treats non-finite or negative values as `0` and
-  floors fractional values.
+- Budgets are validated the same way in the constructor and the setter:
+  fractional values are floored (a constructor value below 1 therefore
+  disables caching like `0`), and an invalid value (non-finite, such as
+  `Infinity` or `NaN`, or negative) triggers a `console.warn`. An invalid
+  `maxChunkCacheBytes` option behaves as if it were unset (100 MB chunk cache,
+  200 MB decoded cache); an invalid `setMaxChunkCacheBytes` call is ignored
+  and the current budget is kept. There is no unbounded cache.
 - `setMaxChunkCacheBytes(0)` empties the chunk cache only; the decoded cache
   falls back to its 200 MB default rather than being emptied.
 - `getRecommendedPrefetchCount()` reads the live chunk budget, so the prefetch

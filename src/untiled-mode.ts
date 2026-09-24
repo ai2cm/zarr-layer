@@ -9,7 +9,7 @@
  */
 
 import * as zarr from 'zarrita'
-import { normalizeCacheBytes } from './caching-store'
+import { validCacheBytes } from './caching-store'
 import {
   WEB_MERCATOR_EXTENT,
   MIN_SUBDIVISIONS,
@@ -209,7 +209,7 @@ class NormalizedDataCache {
   private _maxBytes: number
 
   constructor(maxBytes: number = DEFAULT_NORMALIZED_CACHE_BYTES) {
-    this._maxBytes = Math.max(0, maxBytes)
+    this._maxBytes = validCacheBytes(maxBytes) ?? DEFAULT_NORMALIZED_CACHE_BYTES
   }
 
   get maxBytes(): number {
@@ -222,7 +222,9 @@ class NormalizedDataCache {
    * recent entry, matching the existing oversize-entry behaviour of put()).
    */
   setMaxBytes(bytes: number): void {
-    const next = normalizeCacheBytes(bytes)
+    const next = validCacheBytes(bytes)
+    // Driven only by normalizedCacheBytesFor, which is always finite.
+    if (next === null) return
     const shrinking = next < this._maxBytes
     this._maxBytes = next
     // An explicit 0 always empties, including an entry retained while the

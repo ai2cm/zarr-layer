@@ -1,6 +1,10 @@
 import * as zarr from 'zarrita'
 import type { Readable, AsyncReadable } from '@zarrita/storage'
-import { CachingStore, normalizeCacheBytes } from './caching-store'
+import {
+  CachingStore,
+  DEFAULT_CHUNK_CACHE_BYTES,
+  validCacheBytes,
+} from './caching-store'
 import type {
   Bounds,
   SpatialDimensions,
@@ -67,7 +71,11 @@ interface ZarrStoreOptions {
   transformRequest?: TransformRequest
   /** Custom store to use instead of FetchStore. When provided, source becomes optional. */
   customStore?: Readable | AsyncReadable
-  /** Maximum bytes for chunk cache. Set to 0 to disable caching. Default: 100 MB. */
+  /**
+   * Maximum bytes for chunk cache. Set to 0 to disable caching. Default:
+   * 100 MB. Fractions are floored; an invalid value (non-finite or negative)
+   * falls back to the default with a warning.
+   */
   maxChunkCacheBytes?: number
   /**
    * Internal: whether to wrap the store in a CachingStore, independent of the
@@ -180,7 +188,7 @@ export class ZarrStore {
   proj4: string | null = null
   private _crsFromMetadata: boolean = false // Track if CRS was explicitly set from metadata
   private _crsOverride: boolean = false // Track if CRS was explicitly set by user
-  private maxChunkCacheBytes: number = 100 * 1024 * 1024 // 100 MB default
+  private maxChunkCacheBytes: number = DEFAULT_CHUNK_CACHE_BYTES
   private chunkCacheEnabled: boolean
   /** The caching store wrapper, if chunk caching is enabled. */
   cachingStore: CachingStore | null = null
@@ -253,7 +261,15 @@ export class ZarrStore {
     this.transformRequest = transformRequest
     this.customStore = customStore
     if (maxChunkCacheBytes !== undefined) {
-      this.maxChunkCacheBytes = maxChunkCacheBytes
+      const valid = validCacheBytes(maxChunkCacheBytes)
+      if (valid === null) {
+        console.warn(
+          `[zarr-layer] Invalid maxChunkCacheBytes ${maxChunkCacheBytes}; ` +
+            `using the default of ${DEFAULT_CHUNK_CACHE_BYTES} bytes.`
+        )
+      } else {
+        this.maxChunkCacheBytes = valid
+      }
     }
     this.chunkCacheEnabled = chunkCacheEnabled ?? this.maxChunkCacheBytes > 0
 
@@ -348,8 +364,9 @@ export class ZarrStore {
 
   /**
    * Resize the chunk cache of a live store (see `CachingStore.setMaxBytes`).
-   * `bytes` is normalized with `normalizeCacheBytes` (non-finite or negative
-   * → 0, fractions floored) before it is remembered or forwarded.
+   * Fractional values are floored; an invalid value (non-finite or negative,
+   * see `validCacheBytes`) is ignored with a warning, keeping the current
+   * budget, and returns false.
    *
    * The value is also remembered, so calling this before `initialized`
    * resolves sets the budget of the cache that initialization creates. It
@@ -359,7 +376,15 @@ export class ZarrStore {
    * Returns true when a live cache was resized.
    */
   setMaxChunkCacheBytes(bytes: number): boolean {
-    this.maxChunkCacheBytes = normalizeCacheBytes(bytes)
+    const valid = validCacheBytes(bytes)
+    if (valid === null) {
+      console.warn(
+        `[zarr-layer] Ignoring invalid chunk cache budget ${bytes}; ` +
+          `keeping ${this.maxChunkCacheBytes} bytes.`
+      )
+      return false
+    }
+    this.maxChunkCacheBytes = valid
     if (!this.cachingStore) return false
     this.cachingStore.setMaxBytes(this.maxChunkCacheBytes)
     return true
