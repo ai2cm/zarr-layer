@@ -163,12 +163,17 @@ Notes:
   falls back to its 200 MB default rather than being emptied.
 - `getRecommendedPrefetchCount()` reads the live chunk budget, so the prefetch
   window grows/shrinks with `setMaxChunkCacheBytes`.
-- A layer constructed with `maxChunkCacheBytes: 0` cannot enable the chunk
-  cache at runtime; the setter is a no-op for it. Calls made before the layer
-  is added to a map are remembered and applied when the store is created.
+- Whether the chunk cache exists is fixed at construction and survives
+  `setVariable` and remove/re-add. A layer constructed with
+  `maxChunkCacheBytes: 0` cannot enable it at runtime (the setter is a no-op
+  for it); on any other layer a runtime budget of `0` keeps an empty cache in
+  place, so restoring a budget later resumes caching. On layers with caching
+  enabled, calls made before the layer is added to a map are remembered and
+  applied when the store is created.
 - With a budget of `0` on a live cache, the most recent fetch is still
   retained (same as any entry larger than the budget) so sharded `getRange`
-  reads do not refetch the whole shard per inner chunk.
+  reads do not refetch the whole shard per inner chunk. Calling
+  `setMaxChunkCacheBytes(0)` again evicts it.
 
 ## selectors
 

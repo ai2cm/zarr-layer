@@ -69,6 +69,13 @@ interface ZarrStoreOptions {
   customStore?: Readable | AsyncReadable
   /** Maximum bytes for chunk cache. Set to 0 to disable caching. Default: 100 MB. */
   maxChunkCacheBytes?: number
+  /**
+   * Internal: whether to wrap the store in a CachingStore, independent of the
+   * current budget (a live layer may have resized its budget to 0 and must
+   * keep an empty cache across reinitialization). Defaults to
+   * `maxChunkCacheBytes > 0`.
+   */
+  chunkCacheEnabled?: boolean
 }
 
 interface StoreDescription {
@@ -174,6 +181,7 @@ export class ZarrStore {
   private _crsFromMetadata: boolean = false // Track if CRS was explicitly set from metadata
   private _crsOverride: boolean = false // Track if CRS was explicitly set by user
   private maxChunkCacheBytes: number = 100 * 1024 * 1024 // 100 MB default
+  private chunkCacheEnabled: boolean
   /** The caching store wrapper, if chunk caching is enabled. */
   cachingStore: CachingStore | null = null
 
@@ -211,6 +219,7 @@ export class ZarrStore {
     transformRequest,
     customStore,
     maxChunkCacheBytes,
+    chunkCacheEnabled,
   }: ZarrStoreOptions) {
     if (!source && !customStore) {
       throw new Error('source is required when customStore is not provided')
@@ -246,6 +255,7 @@ export class ZarrStore {
     if (maxChunkCacheBytes !== undefined) {
       this.maxChunkCacheBytes = maxChunkCacheBytes
     }
+    this.chunkCacheEnabled = chunkCacheEnabled ?? this.maxChunkCacheBytes > 0
 
     this.initialized = this._initialize()
   }
@@ -300,7 +310,7 @@ export class ZarrStore {
     }
 
     // Wrap with CachingStore for chunk-level caching (unless disabled)
-    if (this.maxChunkCacheBytes > 0) {
+    if (this.chunkCacheEnabled) {
       this.cachingStore = new CachingStore(
         this.store as AsyncReadable,
         this.maxChunkCacheBytes
@@ -342,10 +352,11 @@ export class ZarrStore {
    * → 0, fractions floored) before it is remembered or forwarded.
    *
    * The value is also remembered, so calling this before `initialized`
-   * resolves configures the cache that initialization creates. Enabling the
-   * cache at runtime is NOT supported: a store initialized with
-   * `maxChunkCacheBytes: 0` has no `CachingStore` wrapper and this call is a
-   * no-op for it. Returns true when a live cache was resized.
+   * resolves sets the budget of the cache that initialization creates. It
+   * only changes the budget: whether a `CachingStore` wrapper exists is fixed
+   * at construction (`chunkCacheEnabled`), so a store created with caching
+   * disabled stays uncached and one resized to 0 keeps an empty cache.
+   * Returns true when a live cache was resized.
    */
   setMaxChunkCacheBytes(bytes: number): boolean {
     this.maxChunkCacheBytes = normalizeCacheBytes(bytes)

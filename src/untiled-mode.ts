@@ -225,7 +225,9 @@ class NormalizedDataCache {
     const next = normalizeCacheBytes(bytes)
     const shrinking = next < this._maxBytes
     this._maxBytes = next
-    if (shrinking) this.evictUntilFits(0)
+    // An explicit 0 always empties, including an entry retained while the
+    // budget was already 0.
+    if (shrinking || next === 0) this.evictUntilFits(0)
   }
 
   private evictUntilFits(newBytes: number): void {
