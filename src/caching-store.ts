@@ -18,6 +18,15 @@ interface CacheEntry {
 
 export type AccessListener = (cacheKey: string) => void
 
+/**
+ * Normalize a runtime cache budget: non-finite or non-positive values become
+ * 0, fractional values are floored. Shared by every `setMax*Bytes` setter so
+ * the layer, store and cache agree on the stored budget.
+ */
+export function normalizeCacheBytes(bytes: number): number {
+  return Number.isFinite(bytes) && bytes > 0 ? Math.floor(bytes) : 0
+}
+
 export class CachingStore implements AsyncReadable {
   private cache: Map<string, CacheEntry> = new Map()
   private totalBytes: number = 0
@@ -39,7 +48,8 @@ export class CachingStore implements AsyncReadable {
   }
 
   /**
-   * Change the byte budget of a live cache.
+   * Change the byte budget of a live cache. `bytes` is normalized with
+   * `normalizeCacheBytes` (non-finite or negative → 0, fractions floored).
    *
    * - Shrinking evicts least-recently-used entries immediately until the
    *   cache fits the new budget.
@@ -52,7 +62,7 @@ export class CachingStore implements AsyncReadable {
    *   `setMaxBytes(previous)` acts as a "clear cache".
    */
   setMaxBytes(bytes: number): void {
-    const next = Number.isFinite(bytes) ? Math.max(0, bytes) : 0
+    const next = normalizeCacheBytes(bytes)
     const shrinking = next < this._maxBytes
     this._maxBytes = next
     if (shrinking) this.evictUntilFits(0)

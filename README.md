@@ -137,14 +137,18 @@ These methods exist in the ace-viz fork only.
 single memory knob per layer. It sizes the chunk cache and, in untiled mode,
 an internal secondary cache of decoded region data that is derived from it
 (currently 40% of the chunk budget; 200 MB when the chunk budget is unset or
-`0`). Budget roughly 1.4× `maxChunkCacheBytes` of JS memory per untiled layer,
-plus GPU textures for the visible regions.
+`0`). Approximate JS memory per untiled layer, plus GPU textures for the
+visible regions:
+
+- positive budget: about 1.4× `maxChunkCacheBytes`
+- unset: 100 MB chunk cache + 200 MB decoded cache (about 300 MB)
+- `0`: no chunk cache (or, at runtime, an emptied one) + 200 MB decoded cache
 
 ```ts
 // Resize a live layer; shrinking evicts LRU entries immediately, growing never evicts.
 layer.setMaxChunkCacheBytes(1024 * 1024 * 1024)
 
-// "Clear cache": set to 0 (evicts everything) then restore the budget.
+// "Clear cache": set to 0 (empties the chunk cache) then restore the budget.
 layer.setMaxChunkCacheBytes(0)
 layer.setMaxChunkCacheBytes(previous)
 
@@ -153,6 +157,10 @@ layer.getCacheDebugInfo() // { maxBytes, usedBytes, chunksInCache, ... } (chunk 
 
 Notes:
 
+- `setMaxChunkCacheBytes` treats non-finite or negative values as `0` and
+  floors fractional values.
+- `setMaxChunkCacheBytes(0)` empties the chunk cache only; the decoded cache
+  falls back to its 200 MB default rather than being emptied.
 - `getRecommendedPrefetchCount()` reads the live chunk budget, so the prefetch
   window grows/shrinks with `setMaxChunkCacheBytes`.
 - A layer constructed with `maxChunkCacheBytes: 0` cannot enable the chunk

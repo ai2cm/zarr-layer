@@ -1,6 +1,6 @@
 import * as zarr from 'zarrita'
 import type { Readable, AsyncReadable } from '@zarrita/storage'
-import { CachingStore } from './caching-store'
+import { CachingStore, normalizeCacheBytes } from './caching-store'
 import type {
   Bounds,
   SpatialDimensions,
@@ -338,6 +338,8 @@ export class ZarrStore {
 
   /**
    * Resize the chunk cache of a live store (see `CachingStore.setMaxBytes`).
+   * `bytes` is normalized with `normalizeCacheBytes` (non-finite or negative
+   * → 0, fractions floored) before it is remembered or forwarded.
    *
    * The value is also remembered, so calling this before `initialized`
    * resolves configures the cache that initialization creates. Enabling the
@@ -346,7 +348,7 @@ export class ZarrStore {
    * no-op for it. Returns true when a live cache was resized.
    */
   setMaxChunkCacheBytes(bytes: number): boolean {
-    this.maxChunkCacheBytes = Math.max(0, bytes)
+    this.maxChunkCacheBytes = normalizeCacheBytes(bytes)
     if (!this.cachingStore) return false
     this.cachingStore.setMaxBytes(this.maxChunkCacheBytes)
     return true

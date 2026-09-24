@@ -32,6 +32,7 @@ import type {
 import type { ZarrMode, RenderContext } from './zarr-mode'
 import { TiledMode } from './tiled-mode'
 import { UntiledMode, normalizedCacheBytesFor } from './untiled-mode'
+import { normalizeCacheBytes } from './caching-store'
 import {
   computeWorldOffsets,
   resolveProjectionParams,
@@ -692,9 +693,12 @@ export class ZarrLayer {
    * If called before the store is initialized the value is used when the
    * cache is created. Enabling the cache at runtime on a layer constructed
    * with `maxChunkCacheBytes: 0` is not supported (no-op).
+   *
+   * Non-finite or negative values are treated as `0` and fractional values
+   * are floored, before the value is stored or forwarded.
    */
   setMaxChunkCacheBytes(bytes: number): void {
-    this.maxChunkCacheBytes = Math.max(0, bytes)
+    this.maxChunkCacheBytes = normalizeCacheBytes(bytes)
     this.zarrStore?.setMaxChunkCacheBytes(this.maxChunkCacheBytes)
     this.mode?.setNormalizedCacheBytes?.(
       normalizedCacheBytesFor(this.maxChunkCacheBytes)

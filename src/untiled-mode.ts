@@ -9,6 +9,7 @@
  */
 
 import * as zarr from 'zarrita'
+import { normalizeCacheBytes } from './caching-store'
 import {
   WEB_MERCATOR_EXTENT,
   MIN_SUBDIVISIONS,
@@ -169,13 +170,16 @@ const NORMALIZED_CACHE_RATIO = 0.4
 
 /**
  * Derive the normalized-cache budget from the chunk-cache budget. Falls back
- * to the 200 MB default when the chunk budget is unset or 0 (chunk caching
- * disabled), preserving the previous behaviour for those configurations.
+ * to the 200 MB default when the chunk budget is unset, 0 (chunk caching
+ * disabled) or non-finite, preserving the previous behaviour for those configurations.
  */
 export function normalizedCacheBytesFor(
   maxChunkCacheBytes: number | undefined
 ): number {
-  if (maxChunkCacheBytes === undefined || !(maxChunkCacheBytes > 0)) {
+  if (
+    maxChunkCacheBytes === undefined ||
+    !(Number.isFinite(maxChunkCacheBytes) && maxChunkCacheBytes > 0)
+  ) {
     return DEFAULT_NORMALIZED_CACHE_BYTES
   }
   return Math.round(maxChunkCacheBytes * NORMALIZED_CACHE_RATIO)
@@ -218,7 +222,7 @@ class NormalizedDataCache {
    * recent entry, matching the existing oversize-entry behaviour of put()).
    */
   setMaxBytes(bytes: number): void {
-    const next = Number.isFinite(bytes) ? Math.max(0, bytes) : 0
+    const next = normalizeCacheBytes(bytes)
     const shrinking = next < this._maxBytes
     this._maxBytes = next
     if (shrinking) this.evictUntilFits(0)
