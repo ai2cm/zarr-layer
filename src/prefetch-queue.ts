@@ -73,7 +73,7 @@ export class PrefetchQueue {
     this.fetchStep = options.fetchStep
     this.isCached = options.isCached
     this.retryDelayMs = options.retryDelayMs ?? 100
-    this.maxRetries = options.maxRetries ?? 30
+    this.maxRetries = options.maxRetries ?? 100
   }
 
   /** Replace the wanted window (priority order). See the class comment. */

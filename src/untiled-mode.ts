@@ -2799,25 +2799,29 @@ export class UntiledMode implements ZarrMode {
     onIterationStart?: (timeIndex: number) => void,
     onIterationEnd?: (timeIndex: number) => void
   ): Promise<boolean> {
-    // false = not ready (e.g. slice args rebuilding after setSelector);
-    // ZarrLayer's PrefetchQueue retries the step.
-    if (!this.zarrArray || !this.baseSliceArgsReady) return false
+    // false = not ready, nothing fetched; ZarrLayer's PrefetchQueue retries
+    // the step. Not ready: no level array yet, slice args rebuilding after
+    // setSelector, or no visible-region pass for the current level yet.
+    // Prefetch only fetches the chunks intersecting the visible regions (the
+    // same set fetchRegion pulls on a render); it no longer falls back to the
+    // full level extent before the first render, which on a high-res store
+    // (e.g. a zoomed-in inset) would fetch far more than is ever shown.
+    if (
+      !this.zarrArray ||
+      !this.baseSliceArgsReady ||
+      this.lastVisibleRegions.length === 0 ||
+      this.lastVisibleRegionsLevel !== this.currentLevelIndex
+    ) {
+      return false
+    }
 
-    // Compute the spatial extent the prefetch should cover. When the
-    // viewport has been rendered at least once, fetch only the chunks that
-    // intersect the currently visible regions (the same set fetchRegion
-    // would pull on a render). Otherwise fall back to the full extent.
     const [regionH, regionW] = this.regionSize ?? [this.height, this.width]
-    const regions =
-      this.lastVisibleRegions.length > 0 &&
-      this.lastVisibleRegionsLevel === this.currentLevelIndex
-        ? this.lastVisibleRegions.map(({ regionX, regionY }) => ({
-            yStart: regionY * regionH,
-            yEnd: Math.min(regionY * regionH + regionH, this.height),
-            xStart: regionX * regionW,
-            xEnd: Math.min(regionX * regionW + regionW, this.width),
-          }))
-        : [{ yStart: 0, yEnd: this.height, xStart: 0, xEnd: this.width }]
+    const regions = this.lastVisibleRegions.map(({ regionX, regionY }) => ({
+      yStart: regionY * regionH,
+      yEnd: Math.min(regionY * regionH + regionH, this.height),
+      xStart: regionX * regionW,
+      xEnd: Math.min(regionX * regionW + regionW, this.width),
+    }))
 
     const latIdx = this.dimIndices.lat?.index
     const lonIdx = this.dimIndices.lon?.index
