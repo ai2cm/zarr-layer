@@ -2795,9 +2795,7 @@ export class UntiledMode implements ZarrMode {
   async prefetchTimeSteps(
     timeIndices: number[],
     timeDimName: string,
-    signal: AbortSignal,
-    onIterationStart?: (timeIndex: number) => void,
-    onIterationEnd?: (timeIndex: number) => void
+    signal: AbortSignal
   ): Promise<boolean> {
     // false = not ready, nothing fetched; ZarrLayer's PrefetchQueue retries
     // the step. Not ready: no level array yet, slice args rebuilding after
@@ -2831,39 +2829,36 @@ export class UntiledMode implements ZarrMode {
 
     for (const timeIndex of timeIndices) {
       if (signal.aborted) return true
-      onIterationStart?.(timeIndex)
 
-      try {
-        // Build base slice args with this future time step substituted.
-        // Spatial dims are placeholders here — we override them per region.
-        const prefetchSelector: NormalizedSelector = { ...this.selector }
-        prefetchSelector[timeDimName] = {
-          selected: timeIndex,
-          type: 'index' as const,
+      // Build base slice args with this future time step substituted.
+      // Spatial dims are placeholders here — we override them per region.
+      const prefetchSelector: NormalizedSelector = { ...this.selector }
+      prefetchSelector[timeDimName] = {
+        selected: timeIndex,
+        type: 'index' as const,
+      }
+      const { sliceArgs: baseSliceArgs } = await this.buildSliceArgsForSelector(
+        prefetchSelector,
+        {
+          includeSpatialSlices: false,
+          trackMultiValue: false,
         }
-        const { sliceArgs: baseSliceArgs } =
-          await this.buildSliceArgsForSelector(prefetchSelector, {
-            includeSpatialSlices: false,
-            trackMultiValue: false,
-          })
+      )
 
+      if (signal.aborted) return true
+
+      for (const { yStart, yEnd, xStart, xEnd } of regions) {
         if (signal.aborted) return true
+        const sliceArgs = [...baseSliceArgs]
+        if (latIdx !== undefined) sliceArgs[latIdx] = zarr.slice(yStart, yEnd)
+        if (lonIdx !== undefined) sliceArgs[lonIdx] = zarr.slice(xStart, xEnd)
 
-        for (const { yStart, yEnd, xStart, xEnd } of regions) {
-          if (signal.aborted) return true
-          const sliceArgs = [...baseSliceArgs]
-          if (latIdx !== undefined) sliceArgs[latIdx] = zarr.slice(yStart, yEnd)
-          if (lonIdx !== undefined) sliceArgs[lonIdx] = zarr.slice(xStart, xEnd)
-
-          try {
-            await zarr.get(this.zarrArray, sliceArgs, { opts: { signal } })
-          } catch (e) {
-            if ((e as Error).name === 'AbortError') return true
-            // Swallow other errors for prefetch — non-critical
-          }
+        try {
+          await zarr.get(this.zarrArray, sliceArgs, { opts: { signal } })
+        } catch (e) {
+          if ((e as Error).name === 'AbortError') return true
+          // Swallow other errors for prefetch — non-critical
         }
-      } finally {
-        onIterationEnd?.(timeIndex)
       }
 
       // Yield to the event loop between time steps so animation frames and

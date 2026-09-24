@@ -105,9 +105,7 @@ export interface ZarrMode {
   prefetchTimeSteps?(
     timeIndices: number[],
     timeDimName: string,
-    signal: AbortSignal,
-    onIterationStart?: (timeIndex: number) => void,
-    onIterationEnd?: (timeIndex: number) => void
+    signal: AbortSignal
   ): Promise<boolean | void> // false = not ready yet, nothing fetched
 
   // Internal: resize the normalized-data cache (UntiledMode only). Driven by

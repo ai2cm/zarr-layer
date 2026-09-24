@@ -38,10 +38,9 @@ function fakeLayer({ chunksFor = (m, t) => [`m${m}/t${t}`] } = {}) {
   layer.mode = {
     setSelector: async () => {},
     dispose() {},
-    prefetchTimeSteps(indices, dim, signal, onStart, onEnd) {
+    prefetchTimeSteps(indices, dim, signal) {
       const idx = indices[0]
       const member = layer.normalizedSelector.member.selected
-      onStart?.(idx)
       return new Promise((resolve) => {
         const entry = { idx, member, signal, aborted: false }
         // Like zarrita: every store access of this request carries its signal
@@ -50,12 +49,10 @@ function fakeLayer({ chunksFor = (m, t) => [`m${m}/t${t}`] } = {}) {
             resident.add(key)
             layer.attributeChunkAccess(key, { signal })
           }
-          onEnd?.(idx)
           resolve(true)
         }
         signal.addEventListener('abort', () => {
           entry.aborted = true
-          onEnd?.(idx)
           resolve(true)
         })
         fetches.push(entry)

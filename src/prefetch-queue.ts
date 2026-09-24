@@ -13,8 +13,9 @@
  *     already cached, so stale steps from an old window are dropped.
  *
  * Steps are fetched strictly one at a time: after an abort the queue waits for
- * the aborted fetch to settle before starting the next one, so per-step
- * attribution callbacks never overlap.
+ * the aborted fetch to settle before starting the next one, so an aborted step
+ * never competes with the next one for bandwidth. (Cache attribution does not
+ * depend on this: ZarrLayer attributes each access by its request's signal.)
  *
  * No policy lives here (direction, horizon, debounce): callers decide which
  * window they want. The per-step fetch is injected (`fetchStep`), so this
