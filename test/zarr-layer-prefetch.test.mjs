@@ -14,8 +14,12 @@ const tick = () => new Promise((r) => setTimeout(r, 0))
 // (or aborted). On release it "reads" the step's chunks through the layer's
 // access attribution, like CachingStore's listener does: `chunksFor(member,
 // idx)` names them (default one chunk per member and step).
-function fakeLayer({ chunksFor = (m, t) => [`m${m}/t${t}`] } = {}) {
+function fakeLayer({
+  chunksFor = (m, t) => [`m${m}/t${t}`],
+  onLoadingStateChange,
+} = {}) {
   const layer = new ZarrLayer({
+    onLoadingStateChange,
     id: 'test',
     source: 'http://example.invalid/store.zarr',
     variable: 'v',
@@ -189,6 +193,56 @@ test('prefetch waits while metadata loads (setVariable) and then fetches', async
   assert.equal(fetches.length, 1)
   assert.equal(fetches[0].idx, 2)
   fetches[0].release()
+})
+
+test('onLoadingStateChange reports prefetch activity as `prefetching`, separate from loading/chunks', async () => {
+  const states = []
+  const { layer, fetches } = fakeLayer({
+    onLoadingStateChange: (s) => states.push({ ...s }),
+  })
+  layer.prefetchTimeSteps([1, 2])
+  await tick()
+  assert.deepEqual(states.at(-1), {
+    loading: false,
+    metadata: false,
+    chunks: false,
+    prefetching: true,
+    error: null,
+  })
+  fetches[0].release()
+  await tick()
+  fetches[1].release()
+  await tick()
+  assert.deepEqual(states.at(-1), {
+    loading: false,
+    metadata: false,
+    chunks: false,
+    prefetching: false,
+    error: null,
+  })
+  assert.deepEqual(
+    states.map((s) => s.prefetching),
+    [true, false],
+    'one emission per busy change'
+  )
+
+  // Render-driven chunk loading during a prefetch: chunks drives loading,
+  // prefetching does not
+  layer.prefetchTimeSteps([3])
+  await tick()
+  layer.handleChunkLoadingChange({ loading: true, chunks: true })
+  assert.deepEqual(
+    [states.at(-1).loading, states.at(-1).chunks, states.at(-1).prefetching],
+    [true, true, true]
+  )
+  layer.handleChunkLoadingChange({ loading: false, chunks: false })
+  assert.deepEqual(
+    [states.at(-1).loading, states.at(-1).chunks, states.at(-1).prefetching],
+    [false, false, true]
+  )
+  layer.prefetchQueue.clear()
+  await layer.prefetchQueue.whenIdle()
+  assert.equal(states.at(-1).prefetching, false)
 })
 
 // UntiledMode.prefetchTimeSteps readiness contract, on a minimal fake `this`
