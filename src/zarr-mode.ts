@@ -108,7 +108,7 @@ export interface ZarrMode {
     signal: AbortSignal,
     onIterationStart?: (timeIndex: number) => void,
     onIterationEnd?: (timeIndex: number) => void
-  ): Promise<void>
+  ): Promise<boolean | void> // false = not ready yet, nothing fetched
 
   // Internal: resize the normalized-data cache (UntiledMode only). Driven by
   // ZarrLayer.setMaxChunkCacheBytes; not part of the public layer API.

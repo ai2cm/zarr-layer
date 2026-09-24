@@ -41,6 +41,7 @@ import {
 import { MAPBOX_IDENTITY_MATRIX } from './mapbox-utils'
 import type { QueryGeometry, QueryOptions, QueryResult } from './query/types'
 import { SPATIAL_DIM_NAMES } from './constants'
+import { PrefetchQueue } from './prefetch-queue'
 
 type MapboxInternals = {
   transform?: {
@@ -186,7 +187,15 @@ export class ZarrLayer {
    * enable or disable caching across `setVariable` or remove/re-add.
    */
   private readonly chunkCacheEnabled: boolean
-  private prefetchController: AbortController | null = null
+  /**
+   * Incremental prefetch queue (see prefetch-queue.ts). Each step is fetched
+   * through the mode's one-step `prefetchTimeSteps` primitive.
+   */
+  private readonly prefetchQueue: PrefetchQueue = new PrefetchQueue({
+    fetchStep: (timeIdx, timeDimName, signal) =>
+      this.prefetchOneStep(timeIdx, timeDimName, signal),
+    isCached: (timeIdx) => this.isTimeStepCached(timeIdx),
+  })
   /**
    * Map from time-step index to the set of CachingStore cache keys that
    * comprise that step. Populated as fetches happen (prefetch + render).
@@ -468,6 +477,7 @@ export class ZarrLayer {
       this.variable = variable
       this.removeAccessListener?.()
       this.removeAccessListener = null
+      this.prefetchQueue.clear()
       this.timestepKeys.clear()
       this.currentPrefetchTimeIdx = null
       if (this.zarrStore) {
@@ -495,6 +505,7 @@ export class ZarrLayer {
       }
       this.removeAccessListener?.()
       this.removeAccessListener = null
+      this.prefetchQueue.clear()
       this.timestepKeys.clear()
       this.currentPrefetchTimeIdx = null
       if (this.zarrStore) {
@@ -540,43 +551,46 @@ export class ZarrLayer {
    * Populates the chunk cache in the background so that future
    * setSelector() calls for these time steps are instant.
    *
+   * Incremental: each call replaces the wanted window (in priority order).
+   * The step currently being fetched keeps running if it is still in the new
+   * list and is aborted only if it is not; queued steps no longer listed are
+   * dropped, and cached steps are skipped. Steps are fetched one at a time.
+   *
    * @param timeIndices - Array of time step indices to pre-fetch
    * @param timeDimName - Name of the time dimension (default: 'time')
    */
   prefetchTimeSteps(timeIndices: number[], timeDimName: string = 'time'): void {
     if (!this.mode?.prefetchTimeSteps) return
+    this.prefetchQueue.set(timeIndices, timeDimName)
+  }
 
-    // Skip steps whose recorded chunks are still all resident in the cache.
-    const status = this.getCacheStatus(timeIndices)
-    const needed = timeIndices.filter((idx) => status[idx] !== 'cached')
-    if (needed.length === 0) return
-
-    // Cancel any previous prefetch
-    this.prefetchController?.abort()
-    this.prefetchController = new AbortController()
-
-    const signal = this.prefetchController.signal
-
-    // Fire-and-forget. Iteration callbacks set currentPrefetchTimeIdx so the
-    // continuous CachingStore listener attributes accesses to the right step.
-    this.mode
-      .prefetchTimeSteps(
-        needed,
-        timeDimName,
-        signal,
-        (timeIdx) => {
-          this.currentPrefetchTimeIdx = timeIdx
-        },
-        () => {
+  /**
+   * Queue primitive: fetch one step through the current mode. Resolves false
+   * when the mode cannot prefetch yet (so the queue retries it).
+   */
+  private async prefetchOneStep(
+    timeIdx: number,
+    timeDimName: string,
+    signal: AbortSignal
+  ): Promise<boolean> {
+    const mode = this.mode
+    if (!mode?.prefetchTimeSteps) return true
+    // Iteration callbacks set currentPrefetchTimeIdx so the continuous
+    // CachingStore listener attributes accesses to the right step.
+    const done = await mode.prefetchTimeSteps(
+      [timeIdx],
+      timeDimName,
+      signal,
+      (idx) => {
+        this.currentPrefetchTimeIdx = idx
+      },
+      (idx) => {
+        if (this.currentPrefetchTimeIdx === idx) {
           this.currentPrefetchTimeIdx = null
         }
-      )
-      .catch(() => {
-        // Aborted or failed
-      })
-      .finally(() => {
-        this.currentPrefetchTimeIdx = null
-      })
+      }
+    )
+    return done !== false
   }
 
   /** Read the layer's currently-selected time index, if any. */
@@ -1193,6 +1207,7 @@ export class ZarrLayer {
 
     this.colormap.dispose(gl)
 
+    this.prefetchQueue.clear()
     this.mode?.dispose(gl)
     this.mode = null
 

@@ -2798,8 +2798,10 @@ export class UntiledMode implements ZarrMode {
     signal: AbortSignal,
     onIterationStart?: (timeIndex: number) => void,
     onIterationEnd?: (timeIndex: number) => void
-  ): Promise<void> {
-    if (!this.zarrArray || !this.baseSliceArgsReady) return
+  ): Promise<boolean> {
+    // false = not ready (e.g. slice args rebuilding after setSelector);
+    // ZarrLayer's PrefetchQueue retries the step.
+    if (!this.zarrArray || !this.baseSliceArgsReady) return false
 
     // Compute the spatial extent the prefetch should cover. When the
     // viewport has been rendered at least once, fetch only the chunks that
@@ -2821,7 +2823,7 @@ export class UntiledMode implements ZarrMode {
     const lonIdx = this.dimIndices.lon?.index
 
     for (const timeIndex of timeIndices) {
-      if (signal.aborted) return
+      if (signal.aborted) return true
       onIterationStart?.(timeIndex)
 
       try {
@@ -2838,10 +2840,10 @@ export class UntiledMode implements ZarrMode {
             trackMultiValue: false,
           })
 
-        if (signal.aborted) return
+        if (signal.aborted) return true
 
         for (const { yStart, yEnd, xStart, xEnd } of regions) {
-          if (signal.aborted) return
+          if (signal.aborted) return true
           const sliceArgs = [...baseSliceArgs]
           if (latIdx !== undefined) sliceArgs[latIdx] = zarr.slice(yStart, yEnd)
           if (lonIdx !== undefined) sliceArgs[lonIdx] = zarr.slice(xStart, xEnd)
@@ -2849,7 +2851,7 @@ export class UntiledMode implements ZarrMode {
           try {
             await zarr.get(this.zarrArray, sliceArgs, { opts: { signal } })
           } catch (e) {
-            if ((e as Error).name === 'AbortError') return
+            if ((e as Error).name === 'AbortError') return true
             // Swallow other errors for prefetch — non-critical
           }
         }
@@ -2867,6 +2869,7 @@ export class UntiledMode implements ZarrMode {
         })
       }
     }
+    return true
   }
 
   private emitLoadingState(): void {
