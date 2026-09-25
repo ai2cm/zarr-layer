@@ -179,7 +179,9 @@ export interface ZarrLayerOptions {
   prefetchConcurrency?: number
   /**
    * Maximum prefetch chunk requests in flight across all prefetch steps.
-   * Render fetches are not counted or limited, so prefetch can't starve them.
+   * Render fetches don't count toward this cap. The browser's own limits still
+   * apply to both: on HTTP/1.1 hosts, about 6 connections per host are
+   * shared by render and prefetch requests (HTTP/2 hosts multiplex).
    * Default: 12. Validated like `prefetchConcurrency`.
    */
   prefetchMaxRequests?: number

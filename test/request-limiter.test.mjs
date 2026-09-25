@@ -107,3 +107,24 @@ test('max must be >= 1', () => {
   assert.throws(() => new RequestLimiter(NaN), RangeError)
   assert.equal(new RequestLimiter(2.7).max, 2)
 })
+
+test('chunkQueue.onIdle waits for every task even after one rejects, then rejects with that error', async () => {
+  const limiter = new RequestLimiter(1)
+  const g = gated()
+  const q = limiter.chunkQueue()
+  q.add(async () => {
+    throw new Error('503')
+  })
+  q.add(g.task('b')) // queued behind the failing task
+  let settled = false
+  const idle = q.onIdle().finally(() => {
+    settled = true
+  })
+  idle.catch(() => {})
+  await tick()
+  assert.deepEqual(g.started, ['b'])
+  assert.equal(settled, false, 'must not settle while b is still running')
+  await g.release('b')
+  await assert.rejects(idle, /503/)
+  assert.equal(limiter.active, 0)
+})

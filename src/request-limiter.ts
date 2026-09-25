@@ -10,7 +10,7 @@
  *
  * `chunkQueue()` adapts it to zarrita's `createQueue` option (`zarr.get`
  * calls `add` once per chunk), so the cap counts chunk requests, not
- * regions.
+ * regions. Its `onIdle` waits for every task, even after one fails.
  */
 
 /**
@@ -126,7 +126,16 @@ export class RequestLimiter {
       add: (fn) => {
         promises.push(this.run(fn, options))
       },
-      onIdle: () => Promise.all(promises),
+      // Settle every task before reporting, even after one fails: a task
+      // still queued in the limiter must not run after zarr.get (and so the
+      // prefetch step) has returned, when its accesses could no longer be
+      // attributed to the step and the step's slot would already be free.
+      onIdle: () =>
+        Promise.allSettled(promises).then((results) => {
+          const failed = results.find((r) => r.status === 'rejected')
+          if (failed) throw (failed as PromiseRejectedResult).reason
+          return results.map(() => undefined)
+        }),
     }
   }
 

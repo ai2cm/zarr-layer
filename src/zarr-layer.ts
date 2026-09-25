@@ -213,9 +213,9 @@ export class ZarrLayer {
   private readonly prefetchQueue: PrefetchQueue
   /**
    * Cap on prefetch chunk requests in flight across all prefetch steps
-   * (`prefetchMaxRequests`), so background prefetch can't take all the
-   * bandwidth from render fetches, which don't go through it. Earlier-started
-   * (higher-priority) steps get free slots first.
+   * (`prefetchMaxRequests`). Render fetches don't go through it (on HTTP/1.1
+   * hosts both still share the browser's ~6 connections per host).
+   * Earlier-started (higher-priority) steps get free slots first.
    */
   private readonly prefetchLimiter: RequestLimiter
   /**

@@ -203,8 +203,10 @@ layer.prefetchTimeSteps([12, 10, 13, 9])
   the visible regions are fetched concurrently (up to 8 at once).
 - `prefetchMaxRequests` (default 12) caps the prefetch chunk requests in flight
   across all steps of the layer; earlier-started steps get free slots first.
-  Render fetches don't count toward it, so prefetch can't take every request
-  slot from the map. `prefetchConcurrency: 1` restores sequential prefetch.
+  Render fetches don't count toward it. The browser's limits still apply to
+  both: on an HTTP/1.1 host, render and prefetch share about 6 connections
+  per host (the Hugging Face CDN is HTTP/2, which multiplexes).
+  `prefetchConcurrency: 1` restores sequential prefetch.
 - Steps already cached (`isTimeStepCached`) are skipped.
 - A step that cannot be fetched yet (metadata loading, including during
   `setVariable`; level not loaded; slice args rebuilding after `setSelector`;

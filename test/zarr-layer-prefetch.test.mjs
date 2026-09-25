@@ -590,3 +590,37 @@ test('UntiledMode primitive: an abort mid-step starts no further regions', async
   assert.equal(await run, true)
   assert.ok(stats.chunkGets <= 8, `${stats.chunkGets} chunk reads`)
 })
+
+test('a failed chunk does not end the step early: no access is attributed after its primitive settles', async () => {
+  const { layer } = fakeLayer({ layerOptions: { prefetchMaxRequests: 1 } })
+  await layer.setSelector({ time: { selected: 0, type: 'index' }, member: 0 })
+  let primitiveSettled = false
+  const lateAccesses = []
+  layer.mode.prefetchTimeSteps = async (indices, dim, signal, options) => {
+    // Like zarr.get over one region with two chunks, under a cap of 1:
+    // the first chunk fails (e.g. a 5xx), the second waits for its slot.
+    const queue = options.createQueue()
+    queue.add(async () => {
+      throw new Error('503')
+    })
+    queue.add(async () => {
+      await new Promise((r) => setTimeout(r, 5)) // network time
+      if (primitiveSettled) lateAccesses.push('k2')
+      layer.attributeChunkAccess('k2', { signal })
+    })
+    try {
+      await queue.onIdle()
+    } catch {
+      // the region's error is swallowed, as in UntiledMode
+    }
+    primitiveSettled = true
+    return true
+  }
+  layer.prefetchTimeSteps([3])
+  await layer.prefetchQueue.whenIdle()
+  await new Promise((r) => setTimeout(r, 10))
+  assert.deepEqual(lateAccesses, [])
+  const sel = layer.currentSelection()
+  assert.ok(layer.timestepKeys.get(`3|${sel}`)?.keys.has('k2'))
+  assert.equal(layer.timestepKeys.get(`0|${sel}`), undefined)
+})
