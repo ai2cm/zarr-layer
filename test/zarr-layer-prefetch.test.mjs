@@ -17,8 +17,10 @@ const tick = () => new Promise((r) => setTimeout(r, 0))
 function fakeLayer({
   chunksFor = (m, t) => [`m${m}/t${t}`],
   onLoadingStateChange,
+  layerOptions = {},
 } = {}) {
   const layer = new ZarrLayer({
+    ...layerOptions,
     onLoadingStateChange,
     id: 'test',
     source: 'http://example.invalid/store.zarr',
@@ -42,11 +44,11 @@ function fakeLayer({
   layer.mode = {
     setSelector: async () => {},
     dispose() {},
-    prefetchTimeSteps(indices, dim, signal) {
+    prefetchTimeSteps(indices, dim, signal, options) {
       const idx = indices[0]
       const member = layer.normalizedSelector.member.selected
       return new Promise((resolve) => {
-        const entry = { idx, member, signal, aborted: false }
+        const entry = { idx, member, signal, options, aborted: false }
         // Like zarrita: every store access of this request carries its signal
         entry.release = () => {
           for (const key of chunksFor(member, idx)) {
@@ -115,29 +117,38 @@ test('chunks shared by members are recorded per member; eviction downgrades both
   assert.equal(layer.isTimeStepCached(3), false)
 })
 
+// Task 30: steps run concurrently (default 4), so these use more steps than
+// slots to still cover the queued (not yet started) part of the window.
 test('time-only selector change keeps state and the queue', async () => {
   const { layer, fetches, fetchStep } = fakeLayer()
   await fetchStep(2)
-  layer.prefetchTimeSteps([4, 5])
+  layer.prefetchTimeSteps([4, 5, 6, 7, 8])
   await tick()
   await layer.setSelector({ time: 5, member: 0 })
   assert.equal(layer.isTimeStepCached(2), true)
-  assert.equal(fetches.at(-1).aborted, false)
-  assert.equal(fetches.at(-1).idx, 4)
-  assert.deepEqual(layer.prefetchQueue.pendingIndices, [5])
+  assert.deepEqual(
+    fetches.slice(1).map((f) => [f.idx, f.aborted]),
+    [
+      [4, false],
+      [5, false],
+      [6, false],
+      [7, false],
+    ]
+  )
+  assert.deepEqual(layer.prefetchQueue.pendingIndices, [8])
 })
 
-test('member change aborts the in-flight step and drops the queue', async () => {
+test('member change aborts every in-flight step and drops the queue', async () => {
   const { layer, fetches } = fakeLayer()
-  layer.prefetchTimeSteps([3, 4])
+  layer.prefetchTimeSteps([3, 4, 5, 6, 7])
   await tick()
-  assert.equal(fetches.length, 1)
-  assert.equal(fetches[0].member, 0)
+  assert.equal(fetches.length, 4)
+  assert.ok(fetches.every((f) => f.member === 0))
 
   await layer.setSelector({ time: 0, member: 1 })
   await tick()
-  assert.equal(fetches[0].aborted, true)
-  assert.equal(fetches.length, 1, 'step 4 (old member) must not start')
+  assert.ok(fetches.every((f) => f.aborted))
+  assert.equal(fetches.length, 4, 'step 7 (old member) must not start')
 })
 
 test('getCacheDebugInfo: byte fields from the cache, step fields for the current member', async () => {
@@ -298,4 +309,284 @@ test('UntiledMode primitive: a completed pass with nothing visible is a done no-
   )
   assert.equal(result, true)
   assert.deepEqual(started, [])
+})
+
+// ---- Task 30: concurrent steps, shared request cap ----
+
+test('prefetchConcurrency: at most that many steps in flight; default 4; invalid warns', async () => {
+  const two = fakeLayer({ layerOptions: { prefetchConcurrency: 2 } })
+  two.layer.prefetchTimeSteps([1, 2, 3, 4, 5])
+  await tick()
+  assert.deepEqual(
+    two.fetches.map((f) => f.idx),
+    [1, 2]
+  )
+  two.fetches[1].release()
+  await tick()
+  assert.deepEqual(
+    two.fetches.map((f) => f.idx),
+    [1, 2, 3]
+  )
+  two.layer.prefetchQueue.clear()
+
+  const def = fakeLayer()
+  def.layer.prefetchTimeSteps([1, 2, 3, 4, 5, 6])
+  await tick()
+  assert.equal(def.fetches.length, 4)
+  def.layer.prefetchQueue.clear()
+
+  const warnings = []
+  const warn = console.warn
+  console.warn = (msg) => warnings.push(String(msg))
+  try {
+    const bad = fakeLayer({
+      layerOptions: { prefetchConcurrency: 0, prefetchMaxRequests: NaN },
+    })
+    assert.equal(bad.layer.prefetchQueue.maxConcurrentSteps, 4)
+    assert.equal(bad.layer.prefetchLimiter.max, 12)
+  } finally {
+    console.warn = warn
+  }
+  assert.equal(warnings.length, 2)
+  assert.match(warnings[0], /prefetchConcurrency/)
+  assert.match(warnings[1], /prefetchMaxRequests/)
+})
+
+// A mode whose step fetch pushes `chunksPerStep` chunk tasks through the
+// createQueue the layer passes (like zarr.get does), each held until released.
+function capLayer({ maxRequests, chunksPerStep }) {
+  const { layer } = fakeLayer({
+    layerOptions: { prefetchMaxRequests: maxRequests },
+  })
+  const running = [] // { step, n, release }
+  const live = { now: 0, peak: 0 }
+  layer.mode.prefetchTimeSteps = async (indices, dim, signal, options) => {
+    const step = indices[0]
+    const queue = options.createQueue()
+    for (let n = 0; n < chunksPerStep; n++) {
+      queue.add(
+        () =>
+          new Promise((resolve, reject) => {
+            live.now++
+            live.peak = Math.max(live.peak, live.now)
+            const entry = { step, n }
+            entry.release = () => {
+              live.now--
+              running.splice(running.indexOf(entry), 1)
+              resolve()
+            }
+            signal.addEventListener('abort', () => {
+              if (!running.includes(entry)) return
+              live.now--
+              running.splice(running.indexOf(entry), 1)
+              const err = new Error('aborted')
+              err.name = 'AbortError'
+              reject(err)
+            })
+            running.push(entry)
+          })
+      )
+    }
+    try {
+      await queue.onIdle()
+    } catch (e) {
+      if (e.name !== 'AbortError') throw e
+    }
+    return true
+  }
+  return { layer, running, live }
+}
+
+test('the prefetch request cap holds across all in-flight steps; earlier steps get slots first', async () => {
+  const { layer, running, live } = capLayer({
+    maxRequests: 3,
+    chunksPerStep: 4,
+  })
+  layer.prefetchTimeSteps([10, 11, 12, 13])
+  await tick()
+  assert.equal(layer.prefetchQueue.inFlightIndices.length, 4, '4 steps')
+  assert.deepEqual(
+    running.map((r) => r.step),
+    [10, 10, 10],
+    'only 3 chunk requests, all for the first step'
+  )
+  running[0].release()
+  await tick()
+  assert.deepEqual(
+    running.map((r) => r.step),
+    [10, 10, 10],
+    "step 10's last chunk before any of step 11's"
+  )
+  const order = []
+  while (running.length > 0) {
+    assert.ok(live.now <= 3)
+    order.push(running[0].step)
+    running[0].release()
+    await tick()
+  }
+  await layer.prefetchQueue.whenIdle()
+  assert.equal(live.peak, 3)
+  // Remaining chunks drained step by step, in priority order
+  assert.deepEqual(
+    order,
+    [...order].sort((a, b) => a - b)
+  )
+  assert.equal(layer.prefetchLimiter.active, 0)
+})
+
+test('aborting a step frees its queued and running request slots for the kept steps', async () => {
+  const { layer, running } = capLayer({ maxRequests: 2, chunksPerStep: 3 })
+  layer.prefetchTimeSteps([1, 2])
+  await tick()
+  assert.deepEqual(
+    running.map((r) => r.step),
+    [1, 1]
+  )
+  layer.prefetchTimeSteps([2]) // drops step 1
+  await tick()
+  assert.deepEqual(
+    running.map((r) => r.step),
+    [2, 2]
+  )
+  assert.equal(layer.prefetchLimiter.pending, 1, "step 2's third chunk waits")
+  while (running.length > 0) {
+    running[0].release()
+    await tick()
+  }
+  await layer.prefetchQueue.whenIdle()
+  assert.equal(layer.prefetchLimiter.pending, 0)
+  assert.equal(layer.prefetchLimiter.active, 0)
+})
+
+test('attribution with interleaved accesses from several concurrent steps', async () => {
+  const { layer, fetches, resident } = fakeLayer()
+  await layer.setSelector({ time: { selected: 0, type: 'index' }, member: 0 })
+  layer.prefetchTimeSteps([4, 5, 6, 7])
+  await tick()
+  assert.equal(fetches.length, 4)
+  const byIdx = Object.fromEntries(fetches.map((f) => [f.idx, f]))
+  const access = (key, signal) => {
+    resident.add(key)
+    layer.attributeChunkAccess(key, signal ? { signal } : undefined)
+  }
+  // Interleaved: steps' accesses mixed with each other and with a render
+  access('k6a', byIdx[6].signal)
+  access('k4a', byIdx[4].signal)
+  access('render', new AbortController().signal)
+  access('k7a', byIdx[7].signal)
+  access('k6b', byIdx[6].signal)
+  access('k5a', byIdx[5].signal)
+  access('k4b', byIdx[4].signal)
+  // Step 4 finishes first; the others keep attributing correctly
+  byIdx[4].release()
+  await tick()
+  access('k5b', byIdx[5].signal)
+  access('k7b', byIdx[7].signal)
+  for (const idx of [5, 6, 7]) byIdx[idx].release()
+  await tick()
+  const hits = Object.fromEntries(
+    layer
+      .getCacheDebugInfo()
+      .perTimestepHits.map((h) => [h.timeIndex, h.recorded])
+  )
+  // Each step: its own two keys plus the fake mode's release chunk (m0/tN)
+  assert.deepEqual(hits, { 0: 1, 4: 3, 5: 3, 6: 3, 7: 3 })
+  const keysOf = (t) =>
+    [...layer.timestepKeys.get(`${t}|${layer.currentSelection()}`).keys].sort()
+  assert.deepEqual(keysOf(0), ['render'])
+  assert.deepEqual(keysOf(4), ['k4a', 'k4b', 'm0/t4'])
+  assert.deepEqual(keysOf(5), ['k5a', 'k5b', 'm0/t5'])
+  assert.deepEqual(keysOf(6), ['k6a', 'k6b', 'm0/t6'])
+  assert.deepEqual(keysOf(7), ['k7a', 'k7b', 'm0/t7'])
+})
+
+// UntiledMode primitive against a real zarrita array whose chunk reads are
+// slow, to observe how many chunk requests one step has open at once.
+const zarr = await import('zarrita')
+const { RequestLimiter } = await loadSrc('src/request-limiter.ts')
+
+async function slowArray({ size = 40, chunk = 10 } = {}) {
+  const files = new Map()
+  const stats = { live: 0, peak: 0, chunkGets: 0 }
+  const store = {
+    async get(key) {
+      if (key.endsWith('zarr.json')) return files.get(key)
+      stats.chunkGets++
+      stats.live++
+      stats.peak = Math.max(stats.peak, stats.live)
+      await new Promise((r) => setTimeout(r, 3))
+      stats.live--
+      return undefined // missing chunk: fill value
+    },
+    async set(key, value) {
+      files.set(key, value)
+    },
+  }
+  const arr = await zarr.create(zarr.root(store).resolve('v'), {
+    shape: [4, size, size],
+    chunkShape: [1, chunk, chunk],
+    dtype: 'float32',
+  })
+  return { arr, stats }
+}
+
+function regionState(arr, { size, region }) {
+  const n = size / region
+  const regions = []
+  for (let y = 0; y < n; y++)
+    for (let x = 0; x < n; x++) regions.push({ regionX: x, regionY: y })
+  return modeState({
+    zarrArray: arr,
+    lastVisibleRegions: regions,
+    regionSize: [region, region],
+    height: size,
+    width: size,
+    dimIndices: { lat: { index: 1 }, lon: { index: 2 } },
+    buildSliceArgsForSelector: async () => ({ sliceArgs: [1, null, null] }),
+  })
+}
+
+test('UntiledMode primitive: a step fetches its regions concurrently, at most 8 at once', async () => {
+  const { arr, stats } = await slowArray({ size: 40, chunk: 10 })
+  const state = regionState(arr, { size: 40, region: 10 }) // 16 regions
+  const result = await UntiledMode.prototype.prefetchTimeSteps.call(
+    state,
+    [1],
+    'time',
+    new AbortController().signal
+  )
+  assert.equal(result, true)
+  assert.equal(stats.chunkGets, 16)
+  assert.equal(stats.peak, 8)
+})
+
+test('UntiledMode primitive: createQueue caps chunk requests, also within multi-chunk regions', async () => {
+  const { arr, stats } = await slowArray({ size: 40, chunk: 10 })
+  const state = regionState(arr, { size: 40, region: 20 }) // 4 regions x 4 chunks
+  const limiter = new RequestLimiter(3)
+  await UntiledMode.prototype.prefetchTimeSteps.call(
+    state,
+    [1],
+    'time',
+    new AbortController().signal,
+    { createQueue: () => limiter.chunkQueue() }
+  )
+  assert.equal(stats.chunkGets, 16)
+  assert.equal(stats.peak, 3)
+})
+
+test('UntiledMode primitive: an abort mid-step starts no further regions', async () => {
+  const { arr, stats } = await slowArray({ size: 40, chunk: 10 })
+  const state = regionState(arr, { size: 40, region: 10 })
+  const controller = new AbortController()
+  const run = UntiledMode.prototype.prefetchTimeSteps.call(
+    state,
+    [1],
+    'time',
+    controller.signal
+  )
+  await new Promise((r) => setTimeout(r, 1))
+  controller.abort()
+  assert.equal(await run, true)
+  assert.ok(stats.chunkGets <= 8, `${stats.chunkGets} chunk reads`)
 })

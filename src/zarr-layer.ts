@@ -41,7 +41,16 @@ import {
 import { MAPBOX_IDENTITY_MATRIX } from './mapbox-utils'
 import type { QueryGeometry, QueryOptions, QueryResult } from './query/types'
 import { SPATIAL_DIM_NAMES } from './constants'
-import { PrefetchQueue } from './prefetch-queue'
+import {
+  DEFAULT_PREFETCH_CONCURRENCY,
+  PrefetchQueue,
+  normalizeConcurrency,
+  type PrefetchStepInfo,
+} from './prefetch-queue'
+import {
+  DEFAULT_PREFETCH_MAX_REQUESTS,
+  RequestLimiter,
+} from './request-limiter'
 
 type MapboxInternals = {
   transform?: {
@@ -194,18 +203,21 @@ export class ZarrLayer {
    * enable or disable caching across `setVariable` or remove/re-add.
    */
   private readonly chunkCacheEnabled: boolean
-  /**
-   * Incremental prefetch queue (see prefetch-queue.ts). Each step is fetched
-   * through the mode's one-step `prefetchTimeSteps` primitive.
-   */
   /** Time dim of the last prefetchTimeSteps call ('time' until then). */
   private prefetchTimeDimName: string = 'time'
-  private readonly prefetchQueue: PrefetchQueue = new PrefetchQueue({
-    fetchStep: (timeIdx, timeDimName, signal) =>
-      this.prefetchOneStep(timeIdx, timeDimName, signal),
-    isCached: (timeIdx) => this.isTimeStepCached(timeIdx),
-    onBusyChange: () => this.emitLoadingState(),
-  })
+  /**
+   * Incremental prefetch queue (see prefetch-queue.ts): up to
+   * `prefetchConcurrency` steps in flight, each fetched through the mode's
+   * one-step `prefetchTimeSteps` primitive.
+   */
+  private readonly prefetchQueue: PrefetchQueue
+  /**
+   * Cap on prefetch chunk requests in flight across all prefetch steps
+   * (`prefetchMaxRequests`), so background prefetch can't take all the
+   * bandwidth from render fetches, which don't go through it. Earlier-started
+   * (higher-priority) steps get free slots first.
+   */
+  private readonly prefetchLimiter: RequestLimiter
   /**
    * CachingStore cache keys per step, where a step is a time index *plus*
    * the values of the other non-spatial selector dims (the "selection", e.g.
@@ -352,6 +364,8 @@ export class ZarrLayer {
     store,
     renderPoles = false,
     maxChunkCacheBytes,
+    prefetchConcurrency,
+    prefetchMaxRequests,
   }: ZarrLayerOptions) {
     if (!id) {
       throw new Error('[ZarrLayer] id is required')
@@ -434,6 +448,31 @@ export class ZarrLayer {
     }
     this.maxChunkCacheBytes = chunkBudget
     this.chunkCacheEnabled = chunkBudget === undefined || chunkBudget > 0
+
+    const steps = normalizeConcurrency(
+      prefetchConcurrency,
+      DEFAULT_PREFETCH_CONCURRENCY
+    )
+    const requests = normalizeConcurrency(
+      prefetchMaxRequests,
+      DEFAULT_PREFETCH_MAX_REQUESTS
+    )
+    for (const [name, value, used] of [
+      ['prefetchConcurrency', prefetchConcurrency, steps],
+      ['prefetchMaxRequests', prefetchMaxRequests, requests],
+    ] as const) {
+      if (value !== undefined && Math.floor(value) !== used) {
+        console.warn(`[ZarrLayer] Invalid ${name} ${value}; using ${used}.`)
+      }
+    }
+    this.prefetchLimiter = new RequestLimiter(requests)
+    this.prefetchQueue = new PrefetchQueue({
+      fetchStep: (timeIdx, timeDimName, signal, info) =>
+        this.prefetchOneStep(timeIdx, timeDimName, signal, info),
+      isCached: (timeIdx) => this.isTimeStepCached(timeIdx),
+      onBusyChange: () => this.emitLoadingState(),
+      maxConcurrentSteps: steps,
+    })
   }
 
   private emitLoadingState(): void {
@@ -584,9 +623,11 @@ export class ZarrLayer {
    * setSelector() calls for these time steps are instant.
    *
    * Incremental: each call replaces the wanted window (in priority order).
-   * The step currently being fetched keeps running if it is still in the new
-   * list and is aborted only if it is not; queued steps no longer listed are
-   * dropped, and cached steps are skipped. Steps are fetched one at a time.
+   * Steps being fetched keep running if they are still in the new list and
+   * are aborted only if they are not; queued steps no longer listed are
+   * dropped, and cached steps are skipped. Up to `prefetchConcurrency` steps
+   * (default 4) are fetched at once, with at most `prefetchMaxRequests`
+   * chunk requests (default 12) in flight across them.
    *
    * @param timeIndices - Array of time step indices to pre-fetch
    * @param timeDimName - Name of the time dimension (default: 'time')
@@ -631,17 +672,28 @@ export class ZarrLayer {
   private async prefetchOneStep(
     timeIdx: number,
     timeDimName: string,
-    signal: AbortSignal
+    signal: AbortSignal,
+    info: PrefetchStepInfo
   ): Promise<boolean> {
     if (this.metadataLoading) return false
     const mode = this.mode
     if (!mode?.prefetchTimeSteps) return true
+    // One signal per step, so with several steps in flight each access is
+    // still attributed to the step whose request made it.
     this.prefetchSignals.set(signal, {
       timeIndex: timeIdx,
       selection: this.currentSelection(),
     })
+    const limiterOptions = { priority: info.seq, signal }
     try {
-      const done = await mode.prefetchTimeSteps([timeIdx], timeDimName, signal)
+      const done = await mode.prefetchTimeSteps(
+        [timeIdx],
+        timeDimName,
+        signal,
+        {
+          createQueue: () => this.prefetchLimiter.chunkQueue(limiterOptions),
+        }
+      )
       return done !== false
     } finally {
       this.prefetchSignals.delete(signal)

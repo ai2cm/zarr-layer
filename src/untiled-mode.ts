@@ -21,6 +21,7 @@ import type {
   RenderContext,
   TileId,
   RegionRenderState,
+  PrefetchFetchOptions,
 } from './zarr-mode'
 import type {
   QueryGeometry,
@@ -151,6 +152,14 @@ type LevelMeta = {
 
 /** Maximum number of regions to keep in cache (LRU eviction) */
 const MAX_CACHED_REGIONS = 128
+
+/**
+ * Visible regions of one prefetch step fetched at once. The layer-wide
+ * prefetch request cap (ZarrLayer, across all steps in flight) still bounds
+ * the actual chunk requests; this only bounds the `zarr.get` calls a single
+ * step has open. (The render path uses 32.)
+ */
+export const PREFETCH_REGION_CONCURRENCY = 8
 
 /**
  * Default byte budget for the normalized data cache (200 MB).
@@ -2795,7 +2804,8 @@ export class UntiledMode implements ZarrMode {
   async prefetchTimeSteps(
     timeIndices: number[],
     timeDimName: string,
-    signal: AbortSignal
+    signal: AbortSignal,
+    options: PrefetchFetchOptions = {}
   ): Promise<boolean> {
     // false = not ready, nothing fetched; ZarrLayer's PrefetchQueue retries
     // the step. Not ready: no level array yet, slice args rebuilding after
@@ -2826,6 +2836,8 @@ export class UntiledMode implements ZarrMode {
 
     const latIdx = this.dimIndices.lat?.index
     const lonIdx = this.dimIndices.lon?.index
+    // Level array at the start of the step (the regions above are for it)
+    const array = this.zarrArray
 
     for (const timeIndex of timeIndices) {
       if (signal.aborted) return true
@@ -2847,26 +2859,45 @@ export class UntiledMode implements ZarrMode {
 
       if (signal.aborted) return true
 
-      for (const { yStart, yEnd, xStart, xEnd } of regions) {
-        if (signal.aborted) return true
-        const sliceArgs = [...baseSliceArgs]
-        if (latIdx !== undefined) sliceArgs[latIdx] = zarr.slice(yStart, yEnd)
-        if (lonIdx !== undefined) sliceArgs[lonIdx] = zarr.slice(xStart, xEnd)
-
-        try {
-          await zarr.get(this.zarrArray, sliceArgs, { opts: { signal } })
-        } catch (e) {
-          if ((e as Error).name === 'AbortError') return true
-          // Swallow other errors for prefetch — non-critical
+      // Fetch the step's regions concurrently (at most
+      // PREFETCH_REGION_CONCURRENCY open at once); each chunk fetch also
+      // goes through options.createQueue (the layer's shared request cap).
+      const queue = [...regions]
+      let aborted = false
+      const worker = async () => {
+        while (queue.length > 0 && !aborted && !signal.aborted) {
+          const { yStart, yEnd, xStart, xEnd } = queue.shift()!
+          const sliceArgs = [...baseSliceArgs]
+          if (latIdx !== undefined) sliceArgs[latIdx] = zarr.slice(yStart, yEnd)
+          if (lonIdx !== undefined) sliceArgs[lonIdx] = zarr.slice(xStart, xEnd)
+          try {
+            await zarr.get(array, sliceArgs, {
+              opts: { signal },
+              createQueue: options.createQueue,
+            })
+          } catch (e) {
+            if ((e as Error).name === 'AbortError') aborted = true
+            // Swallow other errors for prefetch — non-critical
+          }
         }
       }
+      await Promise.all(
+        Array.from(
+          { length: Math.min(PREFETCH_REGION_CONCURRENCY, queue.length) },
+          worker
+        )
+      )
+      if (aborted || signal.aborted) return true
 
       // Yield to the event loop between time steps so animation frames and
       // setInterval callbacks can run without being starved by the prefetch loop.
       if (!signal.aborted) {
         await new Promise<void>((r) => {
           const ch = new MessageChannel()
-          ch.port1.onmessage = () => r()
+          ch.port1.onmessage = () => {
+            ch.port1.close() // an open port keeps a Node event loop alive
+            r()
+          }
           ch.port2.postMessage(0)
         })
       }

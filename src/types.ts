@@ -170,6 +170,19 @@ export interface ZarrLayerOptions {
    * (but not enabled at runtime if the layer was created with 0).
    */
   maxChunkCacheBytes?: number
+  /**
+   * Prefetch time steps (`prefetchTimeSteps`) in flight at once. Default: 4
+   * (one day of 6-hourly data). Steps start in window order; `1` restores
+   * strictly sequential prefetch. Fractional values are floored; an invalid
+   * value (non-finite or below 1) uses the default with a warning.
+   */
+  prefetchConcurrency?: number
+  /**
+   * Maximum prefetch chunk requests in flight across all prefetch steps.
+   * Render fetches are not counted or limited, so prefetch can't starve them.
+   * Default: 12. Validated like `prefetchConcurrency`.
+   */
+  prefetchMaxRequests?: number
 }
 
 export type CRS = 'EPSG:4326' | 'EPSG:3857'
