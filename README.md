@@ -194,9 +194,19 @@ layer.prefetchTimeSteps([12, 10, 13, 9])
 
 - Each call replaces the wanted set. Pass the whole window, not only the new
   steps: queued steps missing from the latest list are dropped.
-- The step being fetched keeps running if it is still in the new list. It is
-  aborted only when it is no longer wanted or `timeDimName` changed (an aborted
-  fetch leaves nothing in the cache). Steps are fetched one at a time.
+- Steps being fetched keep running if they are still in the new list. A step
+  is aborted only when it is no longer wanted or `timeDimName` changed (an
+  aborted fetch leaves nothing in the cache).
+- Up to `prefetchConcurrency` steps (constructor option, default 4: one day of
+  6-hourly data) are fetched at once, started in window order as slots free
+  up; an aborted step holds its slot until its fetch settles. Within a step,
+  the visible regions are fetched concurrently (up to 8 at once).
+- `prefetchMaxRequests` (default 12) caps the prefetch chunk requests in flight
+  across all steps of the layer; earlier-started steps get free slots first.
+  Render fetches don't count toward it. The browser's limits still apply to
+  both: on an HTTP/1.1 host, render and prefetch share about 6 connections
+  per host (the Hugging Face CDN is HTTP/2, which multiplexes).
+  `prefetchConcurrency: 1` restores sequential prefetch.
 - Steps already cached (`isTimeStepCached`) are skipped.
 - A step that cannot be fetched yet (metadata loading, including during
   `setVariable`; level not loaded; slice args rebuilding after `setSelector`;

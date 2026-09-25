@@ -15,6 +15,7 @@ import type {
 } from './renderer-types'
 import type { ZarrRenderer } from './zarr-renderer'
 import type { QueryGeometry, QueryOptions, QueryResult } from './query/types'
+import type { ChunkQueueLike } from './request-limiter'
 
 export interface RenderContext {
   gl: WebGL2RenderingContext
@@ -74,6 +75,16 @@ export interface RegionRenderState {
   wgs84Bounds?: import('./map-utils').Wgs84Bounds
 }
 
+/** Per-step options ZarrLayer passes to `prefetchTimeSteps`. */
+export interface PrefetchFetchOptions {
+  /**
+   * Chunk queue factory for each `zarr.get` of the step (zarrita's
+   * `createQueue`): ZarrLayer routes every chunk fetch through the layer's
+   * shared prefetch request cap. Default: zarrita's unbounded queue.
+   */
+  createQueue?: () => ChunkQueueLike
+}
+
 export interface ZarrMode {
   isMultiscale: boolean
   initialize(): Promise<void>
@@ -105,7 +116,8 @@ export interface ZarrMode {
   prefetchTimeSteps?(
     timeIndices: number[],
     timeDimName: string,
-    signal: AbortSignal
+    signal: AbortSignal,
+    options?: PrefetchFetchOptions
   ): Promise<boolean | void> // false = not ready yet, nothing fetched
 
   // Internal: resize the normalized-data cache (UntiledMode only). Driven by
