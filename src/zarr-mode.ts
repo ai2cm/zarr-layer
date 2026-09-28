@@ -87,7 +87,8 @@ export interface PrefetchFetchOptions {
    * Called when a chunk fetch of the step fails with an error other than an
    * abort (the mode still resolves the step as done, so it is not retried).
    * ZarrLayer then leaves the step out of the per-step byte estimate, since
-   * it read only part of its chunks.
+   * it read only part of its chunks (a chunk that fails on every step keeps
+   * the estimate null).
    */
   onFetchError?: () => void
 }

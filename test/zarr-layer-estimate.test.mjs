@@ -244,6 +244,23 @@ test('a prefetch step with a failed chunk fetch does not count', async () => {
   assert.equal(layer.getEstimatedTimestepBytes(), 2000)
 })
 
+test('the estimate follows a change of view: it averages the most recent steps', async () => {
+  // Steps 0-19 measured zoomed out (1000 B), then 20-35 zoomed in (5000 B)
+  const sizes = {}
+  for (let t = 0; t < 36; t++) sizes[`/v/c/${t}`] = t < 20 ? 1000 : 5000
+  const { layer, fetchStep } = estimateLayer({
+    sizes,
+    keysFor: (m, t) => [`/v/c/${t}`],
+    maxBytes: 1_000_000,
+  })
+  for (let t = 0; t < 20; t++) await fetchStep(t)
+  assert.equal(layer.getEstimatedTimestepBytes(), 1000)
+  for (let t = 20; t < 28; t++) await fetchStep(t)
+  assert.equal(layer.getEstimatedTimestepBytes(), 3000) // 8 old, 8 new
+  for (let t = 28; t < 36; t++) await fetchStep(t)
+  assert.equal(layer.getEstimatedTimestepBytes(), 5000)
+})
+
 test('two steps sharing a shard, both in flight, split it once both land', async () => {
   const sizes = { '/v/c/0': 2000 }
   const { layer, fetches } = estimateLayer({

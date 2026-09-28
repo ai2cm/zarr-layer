@@ -40,7 +40,7 @@ import {
 } from './map-utils'
 import { MAPBOX_IDENTITY_MATRIX } from './mapbox-utils'
 import type { QueryGeometry, QueryOptions, QueryResult } from './query/types'
-import { SPATIAL_DIM_NAMES } from './constants'
+import { ESTIMATE_RECENT_STEPS, SPATIAL_DIM_NAMES } from './constants'
 import {
   DEFAULT_PREFETCH_CONCURRENCY,
   PrefetchQueue,
@@ -117,6 +117,8 @@ interface StepKeys {
    * step may be a partial set.
    */
   measuredKeys: Set<string> | null
+  /** Order in which `measuredKeys` was set (higher = more recent). */
+  measuredSeq: number
 }
 
 export class ZarrLayer {
@@ -245,6 +247,8 @@ export class ZarrLayer {
    * timestepKeys.
    */
   private keyBytes: Map<string, number> = new Map()
+  /** Counter for StepKeys.measuredSeq. */
+  private measureCount: number = 0
   /**
    * Prefetch requests in flight, keyed by the AbortSignal the queue created
    * for the step. zarrita forwards that same signal to every store.get /
@@ -722,7 +726,10 @@ export class ZarrLayer {
       // full key set.
       if (done !== false && !signal.aborted && !failed && keys.size > 0) {
         const entry = this.timestepKeys.get(this.stepKey(timeIdx, selection))
-        if (entry) entry.measuredKeys = keys
+        if (entry) {
+          entry.measuredKeys = keys
+          entry.measuredSeq = ++this.measureCount
+        }
       }
       return done !== false
     } finally {
@@ -767,7 +774,13 @@ export class ZarrLayer {
     const key = this.stepKey(timeIndex, selection)
     let entry = this.timestepKeys.get(key)
     if (!entry) {
-      entry = { timeIndex, selection, keys: new Set(), measuredKeys: null }
+      entry = {
+        timeIndex,
+        selection,
+        keys: new Set(),
+        measuredKeys: null,
+        measuredSeq: 0,
+      }
       this.timestepKeys.set(key, entry)
     }
     entry.keys.add(cacheKey)
@@ -843,9 +856,10 @@ export class ZarrLayer {
 
   /**
    * Average chunk-cache bytes one time step of the current selection costs,
-   * measured from the steps' own keys: the average, over steps with a
-   * completed prefetch, of the byte sizes of the keys that step's latest
-   * completed prefetch read (see `StepKeys.measuredKeys`). A cache entry
+   * measured from the steps' own keys: the average, over the most recently
+   * measured steps (up to 16, so it follows a zoom or pan), of the byte
+   * sizes of the keys each step's latest completed prefetch read (see
+   * `StepKeys.measuredKeys`). A cache entry
    * read by k such steps (e.g. a shard holding several time steps) counts
    * 1/k towards each. Entries no prefetch read (metadata, coordinate arrays,
    * render reads) do not count. Sizes are remembered when a key is
@@ -857,21 +871,28 @@ export class ZarrLayer {
    * Until a shard's neighbouring steps are measured, its whole size counts
    * towards the one step that read it, so the early estimate errs high.
    *
+   * If one chunk fails on every step, no step is measured and this stays
+   * null (callers keep their bootstrap window).
+   *
    * O(measured keys of the current selection); cheap enough to poll.
    */
   getEstimatedTimestepBytes(): number | null {
     if (!this.zarrStore?.cachingStore) return null
-    const measured: Set<string>[] = []
-    for (const { measuredKeys } of this.currentSelectionSteps()) {
-      if (measuredKeys) measured.push(measuredKeys)
+    const measured: { keys: Set<string>; seq: number }[] = []
+    for (const { measuredKeys, measuredSeq } of this.currentSelectionSteps()) {
+      if (measuredKeys) measured.push({ keys: measuredKeys, seq: measuredSeq })
     }
+    // Sharing counts every measured step: a neighbour measured earlier
+    // still shares the entry (and keys of another view are distinct keys)
     const sharedBy = new Map<string, number>()
-    for (const keys of measured) {
+    for (const { keys } of measured) {
       for (const key of keys) sharedBy.set(key, (sharedBy.get(key) ?? 0) + 1)
     }
+    measured.sort((a, b) => b.seq - a.seq)
     let total = 0
     let counted = 0
-    for (const keys of measured) {
+    for (const { keys } of measured) {
+      if (counted === ESTIMATE_RECENT_STEPS) break
       let bytes = 0
       for (const key of keys) {
         const size = this.keyBytes.get(key)

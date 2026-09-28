@@ -169,8 +169,9 @@ Notes:
 - `getRecommendedPrefetchCount()` reads the live chunk budget, so the prefetch
   window grows/shrinks with `setMaxChunkCacheBytes`. Its per-step cost
   (`getEstimatedTimestepBytes()`) is measured from completed prefetch steps'
-  own chunk keys (an entry shared by k steps, such as a shard spanning
-  several time steps, counts 1/k to each), so both return `null` until the
+  own chunk keys, averaged over the 16 most recently prefetched steps (an
+  entry shared by k steps, such as a shard spanning several time steps,
+  counts 1/k to each), so both return `null` until the
   first prefetch step lands: prefetch a small bootstrap window meanwhile.
   Only untiled mode prefetches; in tiled mode both stay `null`.
 - Whether the chunk cache exists is fixed at construction and survives
