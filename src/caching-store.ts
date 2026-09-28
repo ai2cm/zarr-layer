@@ -156,6 +156,15 @@ export class CachingStore implements AsyncReadable {
     return this.cache.has(key)
   }
 
+  /**
+   * Byte size of a cached entry, or undefined when the key is not cached.
+   * A plain lookup: unlike get(), it does not touch the LRU order, so it is
+   * safe to poll.
+   */
+  getEntryBytes(key: string): number | undefined {
+    return this.cache.get(key)?.byteSize
+  }
+
   /** Check cache status for multiple keys. */
   getStatus(keys: string[]): ('cached' | 'missing')[] {
     return keys.map((k) => (this.cache.has(k) ? 'cached' : 'missing'))

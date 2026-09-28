@@ -107,6 +107,12 @@ interface StepKeys {
   timeIndex: number
   selection: string
   keys: Set<string>
+  /**
+   * A prefetch of this step ran to completion (not aborted), so `keys`
+   * holds every key the step needs for the regions it was fetched for. Keys
+   * of an in-flight or render-only step may be a partial set.
+   */
+  complete: boolean
 }
 
 export class ZarrLayer {
@@ -228,6 +234,13 @@ export class ZarrLayer {
    * each of them.
    */
   private timestepKeys: Map<string, StepKeys> = new Map()
+  /**
+   * Byte size of each recorded key, taken from the CachingStore when the
+   * access is recorded. Kept after the entry is evicted, so the per-step
+   * estimate does not depend on what is still resident. Cleared with
+   * timestepKeys.
+   */
+  private keyBytes: Map<string, number> = new Map()
   /**
    * Prefetch requests in flight, keyed by the AbortSignal the queue created
    * for the step. zarrita forwards that same signal to every store.get /
@@ -542,6 +555,7 @@ export class ZarrLayer {
       this.removeAccessListener = null
       this.prefetchQueue.clear()
       this.timestepKeys.clear()
+      this.keyBytes.clear()
       if (this.zarrStore) {
         this.zarrStore.cleanup()
         this.zarrStore = null
@@ -569,6 +583,7 @@ export class ZarrLayer {
       this.removeAccessListener = null
       this.prefetchQueue.clear()
       this.timestepKeys.clear()
+      this.keyBytes.clear()
       if (this.zarrStore) {
         this.zarrStore.cleanup()
         this.zarrStore = null
@@ -680,10 +695,8 @@ export class ZarrLayer {
     if (!mode?.prefetchTimeSteps) return true
     // One signal per step, so with several steps in flight each access is
     // still attributed to the step whose request made it.
-    this.prefetchSignals.set(signal, {
-      timeIndex: timeIdx,
-      selection: this.currentSelection(),
-    })
+    const selection = this.currentSelection()
+    this.prefetchSignals.set(signal, { timeIndex: timeIdx, selection })
     const limiterOptions = { priority: info.seq, signal }
     try {
       const done = await mode.prefetchTimeSteps(
@@ -694,6 +707,12 @@ export class ZarrLayer {
           createQueue: () => this.prefetchLimiter.chunkQueue(limiterOptions),
         }
       )
+      // Modes also resolve true when aborted, so check the signal: only a
+      // step that ran to completion has recorded its full key set.
+      if (done !== false && !signal.aborted) {
+        const entry = this.timestepKeys.get(this.stepKey(timeIdx, selection))
+        if (entry) entry.complete = true
+      }
       return done !== false
     } finally {
       this.prefetchSignals.delete(signal)
@@ -736,10 +755,13 @@ export class ZarrLayer {
     const key = this.stepKey(timeIndex, selection)
     let entry = this.timestepKeys.get(key)
     if (!entry) {
-      entry = { timeIndex, selection, keys: new Set() }
+      entry = { timeIndex, selection, keys: new Set(), complete: false }
       this.timestepKeys.set(key, entry)
     }
     entry.keys.add(cacheKey)
+    // Listeners run after the entry is stored, so it is resident here
+    const bytes = this.zarrStore?.cachingStore?.getEntryBytes(cacheKey)
+    if (bytes !== undefined) this.keyBytes.set(cacheKey, bytes)
   }
 
   /** Recorded steps of the current selection. */
@@ -808,19 +830,46 @@ export class ZarrLayer {
   }
 
   /**
-   * Average bytes consumed per recorded time step, derived from the
-   * CachingStore's current residency. Returns null when there isn't enough
-   * data to estimate (e.g. before the first fetch resolves).
+   * Average chunk-cache bytes one time step of the current selection costs,
+   * measured from the steps' own keys: the average, over completed prefetch
+   * steps, of the byte sizes of each step's recorded keys. A cache entry
+   * recorded by k steps (e.g. a shard holding several time steps) counts
+   * 1/k towards each. Cache entries outside these key sets (e.g. metadata
+   * read before a time index is selected) do not count, and the displayed
+   * step, which may also hold coordinate arrays read at init, counts only
+   * once a prefetch of it completes. Sizes are remembered when a key is
+   * recorded, so eviction or a budget change does not change the estimate.
+   *
+   * Returns null until a prefetch step has completed: keys of an in-flight
+   * or render-only step can be a partial set, which would underestimate.
+   * Until a shard's neighbouring steps are recorded, its whole size counts
+   * towards the one step that recorded it, so the early estimate errs high.
+   *
+   * O(recorded keys of the current selection); cheap enough to poll.
    */
   getEstimatedTimestepBytes(): number | null {
-    const cachingStore = this.zarrStore?.cachingStore ?? null
-    if (!cachingStore) return null
-    const chunksInCache = cachingStore.size
-    if (chunksInCache === 0 || this.timestepKeys.size === 0) return null
-    const avgChunkBytes = cachingStore.getTotalBytes() / chunksInCache
-    const avgChunksPerStep = this.getChunksPerTimestep()
-    if (avgChunksPerStep <= 0) return null
-    return avgChunkBytes * avgChunksPerStep
+    if (!this.zarrStore?.cachingStore) return null
+    const steps = this.currentSelectionSteps()
+    const sharedBy = new Map<string, number>()
+    for (const { keys } of steps) {
+      for (const key of keys) sharedBy.set(key, (sharedBy.get(key) ?? 0) + 1)
+    }
+    let total = 0
+    let counted = 0
+    for (const { keys, complete } of steps) {
+      if (!complete) continue
+      let bytes = 0
+      for (const key of keys) {
+        const size = this.keyBytes.get(key)
+        if (size !== undefined) bytes += size / sharedBy.get(key)!
+      }
+      // A step with nothing in view fetched nothing: no information
+      if (bytes > 0) {
+        total += bytes
+        counted++
+      }
+    }
+    return counted > 0 ? total / counted : null
   }
 
   /**
@@ -829,9 +878,10 @@ export class ZarrLayer {
    * one step's worth of bytes for the current selector so prefetching never
    * evicts what the user is actively viewing.
    *
-   * Returns null when the layer hasn't fetched anything yet (no per-step
-   * cost estimate). Callers should treat null as "skip prefetching" and let
-   * the next render produce an estimate that future calls can rely on.
+   * Returns null while there is no per-step cost estimate, i.e. until the
+   * first prefetch step completes (see `getEstimatedTimestepBytes`).
+   * Callers should treat null as "prefetch a small bootstrap window": the
+   * estimate becomes available as those steps land.
    */
   getRecommendedPrefetchCount(safetyFactor: number = 0.9): number | null {
     const cachingStore = this.zarrStore?.cachingStore ?? null

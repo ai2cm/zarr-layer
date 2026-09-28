@@ -36,6 +36,7 @@ function fakeLayer({
       has: (k) => resident.has(k),
       maxBytes: 1000,
       getTotalBytes: () => resident.size * 10,
+      getEntryBytes: (k) => (resident.has(k) ? 10 : undefined),
       get size() {
         return resident.size
       },
