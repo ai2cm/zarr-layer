@@ -83,6 +83,13 @@ export interface PrefetchFetchOptions {
    * shared prefetch request cap. Default: zarrita's unbounded queue.
    */
   createQueue?: () => ChunkQueueLike
+  /**
+   * Called when a chunk fetch of the step fails with an error other than an
+   * abort (the mode still resolves the step as done, so it is not retried).
+   * ZarrLayer then leaves the step out of the per-step byte estimate, since
+   * it read only part of its chunks.
+   */
+  onFetchError?: () => void
 }
 
 export interface ZarrMode {

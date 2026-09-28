@@ -172,6 +172,7 @@ Notes:
   own chunk keys (an entry shared by k steps, such as a shard spanning
   several time steps, counts 1/k to each), so both return `null` until the
   first prefetch step lands: prefetch a small bootstrap window meanwhile.
+  Only untiled mode prefetches; in tiled mode both stay `null`.
 - Whether the chunk cache exists is fixed at construction and survives
   `setVariable` and remove/re-add. A layer constructed with
   `maxChunkCacheBytes: 0` cannot enable it at runtime (the setter is a no-op

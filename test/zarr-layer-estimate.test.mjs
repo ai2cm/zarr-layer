@@ -14,8 +14,14 @@ const tick = () => new Promise((r) => setTimeout(r, 0))
 // are `sizes[key]` bytes. The fake mode's per-step fetch reads the step's
 // keys (`keysFor(member, idx)`) through the store with the request's signal,
 // like zarrita does, once released; `release({ abortAfter: n })` aborts the
-// step after its first n keys.
-function estimateLayer({ sizes, keysFor, maxBytes = 100_000 }) {
+// step after its first n keys. Keys in `failing` fail to fetch; like untiled
+// mode, the step swallows the error, reports it and still resolves done.
+function estimateLayer({
+  sizes,
+  keysFor,
+  maxBytes = 100_000,
+  failing = new Set(),
+}) {
   const layer = new ZarrLayer({
     id: 'test',
     source: 'http://example.invalid/store.zarr',
@@ -26,6 +32,7 @@ function estimateLayer({ sizes, keysFor, maxBytes = 100_000 }) {
   })
   const base = {
     async get(key) {
+      if (failing.has(key)) throw new Error(`fetch failed: ${key}`)
       const n = sizes[key]
       return n === undefined ? undefined : new Uint8Array(n)
     },
@@ -37,7 +44,7 @@ function estimateLayer({ sizes, keysFor, maxBytes = 100_000 }) {
   layer.mode = {
     setSelector: async () => {},
     dispose() {},
-    prefetchTimeSteps(indices, dim, signal) {
+    prefetchTimeSteps(indices, dim, signal, options) {
       const idx = indices[0]
       const member = layer.normalizedSelector.member.selected
       return new Promise((resolve) => {
@@ -49,7 +56,11 @@ function estimateLayer({ sizes, keysFor, maxBytes = 100_000 }) {
               entry.abort()
               break
             }
-            await store.get(keys[i], { signal })
+            try {
+              await store.get(keys[i], { signal })
+            } catch {
+              options.onFetchError?.()
+            }
           }
           resolve(true) // untiled mode resolves true when aborted too
         }
@@ -188,17 +199,65 @@ test('a budget change keeps the estimate and rescales the recommended count', as
 })
 
 test('getEntryBytes reads the size without touching LRU order', async () => {
-  const sizes = { '/a': 10, '/b': 20, '/c': 30 }
-  const store = new CachingStore(
-    { get: async (k) => new Uint8Array(sizes[k]) },
-    30
-  )
+  const store = new CachingStore({ get: async () => new Uint8Array(10) }, 20)
   await store.get('/a')
   await store.get('/b')
   assert.equal(store.getEntryBytes('/a'), 10)
   assert.equal(store.getEntryBytes('/missing'), undefined)
   await store.get('/c') // evicts the least recently used: still /a
   assert.equal(store.has('/a'), false)
-  assert.equal(store.has('/b'), false)
-  assert.equal(store.getEntryBytes('/c'), 30)
+  assert.equal(store.has('/b'), true)
+  assert.equal(store.getEntryBytes('/c'), 10)
+})
+
+test('render reads of other levels or regions do not count towards a measured step', async () => {
+  const sizes = {
+    '/0/v/c/1': 1000,
+    '/0/v/c/2': 1000,
+    '/1/v/c/1/0': 1000,
+    '/1/v/c/1/1': 1000,
+  }
+  const { layer, fetchStep, renderRead } = estimateLayer({
+    sizes,
+    keysFor: (m, t) => [`/0/v/c/${t}`],
+  })
+  await fetchStep(1)
+  await fetchStep(2)
+  assert.equal(layer.getEstimatedTimestepBytes(), 1000)
+  // The user moves to step 1 and zooms in: renders read a finer level
+  await layer.setSelector({ time: { selected: 1, type: 'index' }, member: 0 })
+  await renderRead('/1/v/c/1/0')
+  await renderRead('/1/v/c/1/1')
+  assert.equal(layer.getEstimatedTimestepBytes(), 1000)
+})
+
+test('a prefetch step with a failed chunk fetch does not count', async () => {
+  const sizes = { '/v/c/1/0': 1000, '/v/c/1/1': 1000, '/v/c/2/0': 1000 }
+  const { layer, fetchStep } = estimateLayer({
+    sizes,
+    keysFor: (m, t) => [`/v/c/${t}/0`, `/v/c/${t}/1`],
+    failing: new Set(['/v/c/2/1']),
+  })
+  await fetchStep(2)
+  assert.equal(layer.getEstimatedTimestepBytes(), null)
+  await fetchStep(1)
+  assert.equal(layer.getEstimatedTimestepBytes(), 2000)
+})
+
+test('two steps sharing a shard, both in flight, split it once both land', async () => {
+  const sizes = { '/v/c/0': 2000 }
+  const { layer, fetches } = estimateLayer({
+    sizes,
+    keysFor: (m, t) => ['/v/c/0'],
+  })
+  layer.prefetchTimeSteps([0, 1])
+  await tick()
+  assert.equal(fetches.length, 2)
+  await fetches[0].release()
+  await tick()
+  // Step 1 is still in flight: step 0 alone carries the shard (errs high)
+  assert.equal(layer.getEstimatedTimestepBytes(), 2000)
+  await fetches[1].release()
+  await tick()
+  assert.equal(layer.getEstimatedTimestepBytes(), 1000)
 })
