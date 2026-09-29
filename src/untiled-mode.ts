@@ -2878,6 +2878,7 @@ export class UntiledMode implements ZarrMode {
           } catch (e) {
             if ((e as Error).name === 'AbortError') aborted = true
             // Swallow other errors for prefetch — non-critical
+            else options.onFetchError?.()
           }
         }
       }

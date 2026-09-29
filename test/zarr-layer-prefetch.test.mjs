@@ -36,6 +36,7 @@ function fakeLayer({
       has: (k) => resident.has(k),
       maxBytes: 1000,
       getTotalBytes: () => resident.size * 10,
+      getEntryBytes: (k) => (resident.has(k) ? 10 : undefined),
       get size() {
         return resident.size
       },
@@ -505,7 +506,7 @@ test('attribution with interleaved accesses from several concurrent steps', asyn
 const zarr = await import('zarrita')
 const { RequestLimiter } = await loadSrc('src/request-limiter.ts')
 
-async function slowArray({ size = 40, chunk = 10 } = {}) {
+async function slowArray({ size = 40, chunk = 10, fail = () => false } = {}) {
   const files = new Map()
   const stats = { live: 0, peak: 0, chunkGets: 0 }
   const store = {
@@ -516,6 +517,7 @@ async function slowArray({ size = 40, chunk = 10 } = {}) {
       stats.peak = Math.max(stats.peak, stats.live)
       await new Promise((r) => setTimeout(r, 3))
       stats.live--
+      if (fail(key)) throw new Error(`503 ${key}`)
       return undefined // missing chunk: fill value
     },
     async set(key, value) {
@@ -573,6 +575,26 @@ test('UntiledMode primitive: createQueue caps chunk requests, also within multi-
   )
   assert.equal(stats.chunkGets, 16)
   assert.equal(stats.peak, 3)
+})
+
+test('UntiledMode primitive: a failed chunk fetch is reported through onFetchError', async () => {
+  const { arr, stats } = await slowArray({
+    size: 40,
+    chunk: 10,
+    fail: (key) => key.endsWith('/c/1/0/0'),
+  })
+  const state = regionState(arr, { size: 40, region: 10 })
+  let errors = 0
+  const result = await UntiledMode.prototype.prefetchTimeSteps.call(
+    state,
+    [1],
+    'time',
+    new AbortController().signal,
+    { onFetchError: () => errors++ }
+  )
+  assert.equal(result, true, 'still done: not retried')
+  assert.equal(stats.chunkGets, 16, 'the other regions are still fetched')
+  assert.equal(errors, 1)
 })
 
 test('UntiledMode primitive: an abort mid-step starts no further regions', async () => {

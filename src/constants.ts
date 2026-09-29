@@ -21,6 +21,13 @@ export const MERCATOR_SUBDIVISIONS = 1
 /** Web Mercator world extent in meters (half of full world width) */
 export const WEB_MERCATOR_EXTENT = 20037508.342789244
 
+/**
+ * Number of most recent completed prefetch steps the per-step byte estimate
+ * averages over (ZarrLayer.getEstimatedTimestepBytes), so it follows a
+ * change of view (zoom level, visible regions) within a few prefetch rounds.
+ */
+export const ESTIMATE_RECENT_STEPS = 16
+
 /** Common names for spatial dimensions. These are matched case-insensitively. */
 export const SPATIAL_DIMENSION_ALIASES: Record<'lat' | 'lon', string[]> = {
   lat: ['lat', 'latitude', 'y'],
