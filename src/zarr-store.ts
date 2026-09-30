@@ -3,6 +3,8 @@ import type { Readable, AsyncReadable } from '@zarrita/storage'
 import {
   CachingStore,
   DEFAULT_CHUNK_CACHE_BYTES,
+  RangeIgnoredError,
+  RangeNotSatisfiableError,
   validCacheBytes,
 } from './caching-store'
 import type {
@@ -84,6 +86,12 @@ interface ZarrStoreOptions {
    * `maxChunkCacheBytes > 0`.
    */
   chunkCacheEnabled?: boolean
+  /**
+   * Read byte ranges with range requests through the chunk cache (see
+   * `CachingStore` range mode and `ZarrLayerOptions.rangeRequests`).
+   * Default false.
+   */
+  rangeRequests?: boolean
 }
 
 interface StoreDescription {
@@ -109,49 +117,92 @@ interface StoreDescription {
 }
 
 /**
+ * A fetch that applies `transformRequest` to each request, with the fully
+ * resolved URL. This enables per-path authentication like presigned S3 URLs.
+ */
+const transformedFetch =
+  (transformRequest: TransformRequest) =>
+  async (request: Request): Promise<Response> => {
+    const { url: transformedUrl, ...overrides } = await transformRequest(
+      request.url,
+      { method: request.method as 'GET' | 'HEAD' }
+    )
+    const mergedHeaders = new Headers(request.headers)
+    if (overrides.headers) {
+      for (const [k, v] of Object.entries(
+        overrides.headers as Record<string, string>
+      )) {
+        mergedHeaders.set(k, v)
+      }
+    }
+    // Use `request` as the base init so signal/body/credentials/etc. carry
+    // over (Request's own properties aren't spread-friendly), then overlay
+    // transformRequest overrides with merged headers last.
+    const response = await fetch(
+      new Request(new Request(transformedUrl, request), {
+        ...overrides,
+        headers: mergedHeaders,
+      })
+    )
+    // Remap 403 to 404 for S3/CloudFront compatibility: these services
+    // return 403 (not 404) for missing or inaccessible paths.
+    if (response.status === 403) {
+      return new Response(null, { status: 404 })
+    }
+    return response
+  }
+
+/**
+ * Wrap a fetch so a Range request that did not get a 206 is reported
+ * instead of passed through: FetchStore would hand the whole body of a 200
+ * back as if it were the range. A 200 throws `RangeIgnoredError` with the
+ * body (the CachingStore keeps it as the whole object), a 416 throws
+ * `RangeNotSatisfiableError`. Requests without a Range header pass through.
+ */
+export const checkRangeResponses =
+  (inner: (request: Request) => Promise<Response>) =>
+  async (request: Request): Promise<Response> => {
+    const response = await inner(request)
+    if (!request.headers.has('Range')) return response
+    if (response.status === 200) {
+      const body = new Uint8Array(await response.arrayBuffer())
+      throw new RangeIgnoredError(request.url, body)
+    }
+    if (response.status === 416) {
+      // Drain, so the connection can be reused
+      await response.body?.cancel().catch(() => {})
+      throw new RangeNotSatisfiableError(request.url)
+    }
+    return response
+  }
+
+/**
  * Factory function to create a store with optional request transformation.
  * When transformRequest is provided, uses FetchStore's native fetch handler
  * to intercept each request with the fully resolved URL.
- * This enables per-path authentication like presigned S3 URLs.
+ *
+ * With `rangeRequests`, suffix ranges (shard indexes) are one `bytes=-N`
+ * request instead of a HEAD plus a range, and range responses are checked
+ * (see `checkRangeResponses`).
  */
 const createFetchStore = (
   url: string,
-  transformRequest?: TransformRequest
+  transformRequest?: TransformRequest,
+  rangeRequests: boolean = false
 ): zarr.FetchStore => {
+  if (rangeRequests) {
+    const inner = transformRequest
+      ? transformedFetch(transformRequest)
+      : (request: Request) => fetch(request)
+    return new zarr.FetchStore(url, {
+      useSuffixRequest: true,
+      fetch: checkRangeResponses(inner),
+    })
+  }
   if (!transformRequest) {
     return new zarr.FetchStore(url)
   }
-  return new zarr.FetchStore(url, {
-    async fetch(request: Request): Promise<Response> {
-      const { url: transformedUrl, ...overrides } = await transformRequest(
-        request.url,
-        { method: request.method as 'GET' | 'HEAD' }
-      )
-      const mergedHeaders = new Headers(request.headers)
-      if (overrides.headers) {
-        for (const [k, v] of Object.entries(
-          overrides.headers as Record<string, string>
-        )) {
-          mergedHeaders.set(k, v)
-        }
-      }
-      // Use `request` as the base init so signal/body/credentials/etc. carry
-      // over (Request's own properties aren't spread-friendly), then overlay
-      // transformRequest overrides with merged headers last.
-      const response = await fetch(
-        new Request(new Request(transformedUrl, request), {
-          ...overrides,
-          headers: mergedHeaders,
-        })
-      )
-      // Remap 403 to 404 for S3/CloudFront compatibility: these services
-      // return 403 (not 404) for missing or inaccessible paths.
-      if (response.status === 403) {
-        return new Response(null, { status: 404 })
-      }
-      return response
-    },
-  })
+  return new zarr.FetchStore(url, { fetch: transformedFetch(transformRequest) })
 }
 
 export class ZarrStore {
@@ -190,6 +241,7 @@ export class ZarrStore {
   private _crsOverride: boolean = false // Track if CRS was explicitly set by user
   private maxChunkCacheBytes: number = DEFAULT_CHUNK_CACHE_BYTES
   private chunkCacheEnabled: boolean
+  private rangeRequests: boolean
   /** The caching store wrapper, if chunk caching is enabled. */
   cachingStore: CachingStore | null = null
 
@@ -228,6 +280,7 @@ export class ZarrStore {
     customStore,
     maxChunkCacheBytes,
     chunkCacheEnabled,
+    rangeRequests = false,
   }: ZarrStoreOptions) {
     if (!source && !customStore) {
       throw new Error('source is required when customStore is not provided')
@@ -272,12 +325,18 @@ export class ZarrStore {
       }
     }
     this.chunkCacheEnabled = chunkCacheEnabled ?? this.maxChunkCacheBytes > 0
+    // Range mode lives in the chunk cache; without one, zarrita already
+    // reads ranges straight from the base store
+    this.rangeRequests = rangeRequests && this.chunkCacheEnabled
 
     this.initialized = this._initialize()
   }
 
   private async _initialize(): Promise<this> {
-    const storeCacheKey = `${this.source}:${this.version ?? 'auto'}`
+    // Range mode builds a different base store (see createFetchStore)
+    const storeCacheKey = `${this.source}:${this.version ?? 'auto'}${
+      this.rangeRequests ? ':range' : ''
+    }`
 
     if (this.customStore) {
       // Validate that custom store implements required Readable interface
@@ -295,7 +354,11 @@ export class ZarrStore {
         : ZarrStore._storeCache.get(storeCacheKey)
 
       if (!storePromise) {
-        const baseStore = createFetchStore(this.source, this.transformRequest)
+        const baseStore = createFetchStore(
+          this.source,
+          this.transformRequest,
+          this.rangeRequests
+        )
         // When the version is known, tell the consolidated-metadata wrapper
         // to only try that format — avoids a wasted .zmetadata fetch on v3
         // stores (and vice versa). Falls back to auto-detect when unknown.
@@ -329,7 +392,8 @@ export class ZarrStore {
     if (this.chunkCacheEnabled) {
       this.cachingStore = new CachingStore(
         this.store as AsyncReadable,
-        this.maxChunkCacheBytes
+        this.maxChunkCacheBytes,
+        { rangeRequests: this.rangeRequests }
       )
       this.store = this.cachingStore as unknown as ZarrStoreType
     }

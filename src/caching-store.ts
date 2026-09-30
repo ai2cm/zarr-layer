@@ -2,9 +2,16 @@
  * @module caching-store
  *
  * LRU byte-level cache that wraps a zarrita AsyncReadable store.
- * Intercepts store.get() calls to cache raw chunk bytes (Uint8Array),
+ * Intercepts store.get() / getRange() calls to cache raw bytes (Uint8Array),
  * so all zarr operations (zarr.get slicing, array.getChunk, queries)
  * benefit from caching transparently.
+ *
+ * Two ways to read a byte range (sharded zarr v3 reads a shard's index with a
+ * suffix range, then each inner chunk with an offset range):
+ * - full-object mode (the default): getRange downloads the whole object with
+ *   get(), caches it under its key and slices it in memory.
+ * - range mode (`rangeRequests: true`): getRange asks the base store for just
+ *   those bytes and caches them under a range key (see `rangeCacheKey`).
  */
 
 import type { AsyncReadable, GetOptions, RangeQuery } from '@zarrita/storage'
@@ -19,6 +26,9 @@ interface CacheEntry {
 /**
  * Called on every access with the cache key and the caller's options (as
  * passed by zarrita: `{ signal }`), so listeners can tell requests apart.
+ * For a range read in range mode the key is the range key (see
+ * `rangeCacheKey`); for one served from a whole cached object it is the
+ * object's key.
  */
 export type AccessListener = (cacheKey: string, opts?: GetOptions) => void
 
@@ -36,9 +46,56 @@ export function validCacheBytes(bytes: number): number | null {
   return Number.isFinite(bytes) && bytes >= 0 ? Math.floor(bytes) : null
 }
 
-/** A base-store fetch shared by every concurrent miss on one key. */
-interface InflightFetch {
-  promise: Promise<Uint8Array | undefined>
+/**
+ * Cache key of a byte range of `key` in range mode: `<key>#<offset>:<length>`
+ * or `<key>#suffix:<length>`. It is what the access listener reports and
+ * what `has` / `getEntryBytes` take for that range.
+ */
+export function rangeCacheKey(key: string, range: RangeQuery): string {
+  return 'suffixLength' in range
+    ? `${key}#suffix:${range.suffixLength}`
+    : `${key}#${range.offset}:${range.length}`
+}
+
+/**
+ * Thrown by a range-capable fetch when a server answered a Range request
+ * with the whole object (200 instead of 206), as a proxy that drops the
+ * Range header does. Carries the body, so the caller can use it as the full
+ * object instead of downloading it again. See `createFetchStore`.
+ */
+export class RangeIgnoredError extends Error {
+  readonly data: Uint8Array
+  constructor(url: string, data: Uint8Array) {
+    super(`Range request answered with the whole object: ${url}`)
+    this.name = 'RangeIgnoredError'
+    this.data = data
+  }
+}
+
+/**
+ * Thrown by a range-capable fetch when a server rejects a Range request
+ * (416 Range Not Satisfiable). See `createFetchStore`.
+ */
+export class RangeNotSatisfiableError extends Error {
+  constructor(url: string) {
+    super(`Range request rejected (416): ${url}`)
+    this.name = 'RangeNotSatisfiableError'
+  }
+}
+
+export interface CachingStoreOptions {
+  /**
+   * Read byte ranges with range requests to the base store (its `getRange`)
+   * instead of downloading whole objects. Default false. Falls back to the
+   * whole object, and stays there for the rest of the store's life, when
+   * the server ignores (200) or rejects (416) a range; see `getRange`.
+   */
+  rangeRequests?: boolean
+}
+
+/** A base-store fetch shared by every concurrent miss on one cache key. */
+interface InflightFetch<T> {
+  promise: Promise<T>
   /** Aborts the base-store request; used when the last waiter aborts. */
   controller: AbortController
   /** Callers currently awaiting `promise` (those without a signal never leave). */
@@ -46,8 +103,38 @@ interface InflightFetch {
   settled: boolean
 }
 
+/** A range read's bytes and the cache key they are attributed to. */
+interface RangeResult {
+  data: Uint8Array
+  cacheKey: string
+}
+
 function abortError(): DOMException {
   return new DOMException('The operation was aborted.', 'AbortError')
+}
+
+// By name rather than instanceof, so errors from another copy of this
+// module (e.g. a second bundle) are recognised too
+const errorName = (err: unknown): string | undefined =>
+  (err as { name?: unknown } | null)?.name as string | undefined
+
+function isAbort(err: unknown): boolean {
+  return errorName(err) === 'AbortError'
+}
+
+function ignoredRangeBody(err: unknown): Uint8Array | null {
+  const data = (err as { data?: unknown } | null)?.data
+  return errorName(err) === 'RangeIgnoredError' && data instanceof Uint8Array
+    ? data
+    : null
+}
+
+function sliceRange(full: Uint8Array, range: RangeQuery): Uint8Array {
+  if ('suffixLength' in range) {
+    const start = full.length - range.suffixLength
+    return full.slice(start >= 0 ? start : 0)
+  }
+  return full.slice(range.offset, range.offset + range.length)
 }
 
 export class CachingStore implements AsyncReadable {
@@ -56,22 +143,42 @@ export class CachingStore implements AsyncReadable {
   private _maxBytes: number
   private baseStore: AsyncReadable
   private accessListeners: Set<AccessListener> = new Set()
-  /** Base-store fetches in flight, by key (see get()). */
-  private inflight: Map<string, InflightFetch> = new Map()
+  /** Base-store fetches in flight, by cache key (see get() / getRange()). */
+  private inflight: Map<string, InflightFetch<unknown>> = new Map()
+  /**
+   * Whether getRange issues range requests. Starts as the `rangeRequests`
+   * option (when the base store has getRange) and turns off for good when
+   * the server ignores or rejects a range.
+   */
+  private _rangeRequests: boolean
+  /** Whether any range entry was ever stored (see dropRangesOf). */
+  private usedRanges: boolean = false
 
   constructor(
     baseStore: AsyncReadable,
-    maxBytes: number = DEFAULT_CHUNK_CACHE_BYTES
+    maxBytes: number = DEFAULT_CHUNK_CACHE_BYTES,
+    options: CachingStoreOptions = {}
   ) {
     this.baseStore = baseStore
     // Callers (ZarrStore) validate and warn; this only guards against an
     // unbounded or NaN budget.
     this._maxBytes = validCacheBytes(maxBytes) ?? DEFAULT_CHUNK_CACHE_BYTES
+    this._rangeRequests =
+      !!options.rangeRequests && typeof baseStore.getRange === 'function'
   }
 
   /** Current byte budget. */
   get maxBytes(): number {
     return this._maxBytes
+  }
+
+  /**
+   * Whether byte ranges are read with range requests (range mode). False
+   * when the option was off, the base store has no getRange, or a server
+   * ignored or rejected a range (the store then reads whole objects).
+   */
+  get rangeRequests(): boolean {
+    return this._rangeRequests
   }
 
   /**
@@ -84,10 +191,10 @@ export class CachingStore implements AsyncReadable {
    * - Growing never evicts; the extra room is filled by subsequent fetches.
    * - `0` evicts everything. The store keeps wrapping the base store, and (as
    *   with any entry larger than the budget) the single most recent fetch is
-   *   still retained so `getRange` on a sharded file does not refetch the
-   *   whole shard for every inner chunk. Restoring a positive budget later
-   *   resumes normal caching, so `setMaxBytes(0)` followed by
-   *   `setMaxBytes(previous)` acts as a "clear cache".
+   *   still retained so, in full-object mode, `getRange` on a sharded file
+   *   does not refetch the whole shard for every inner chunk. Restoring a
+   *   positive budget later resumes normal caching, so `setMaxBytes(0)`
+   *   followed by `setMaxBytes(previous)` acts as a "clear cache".
    */
   setMaxBytes(bytes: number): void {
     const next = validCacheBytes(bytes)
@@ -124,6 +231,16 @@ export class CachingStore implements AsyncReadable {
     for (const fn of this.accessListeners) fn(cacheKey, opts)
   }
 
+  /** A cached entry, moved to the most-recently-used end. */
+  private touch(cacheKey: string): CacheEntry | undefined {
+    const cached = this.cache.get(cacheKey)
+    if (cached) {
+      this.cache.delete(cacheKey)
+      this.cache.set(cacheKey, cached)
+    }
+    return cached
+  }
+
   /**
    * Get a key, from the cache or the base store.
    *
@@ -144,86 +261,107 @@ export class CachingStore implements AsyncReadable {
     key: AbsolutePath,
     opts?: GetOptions
   ): Promise<Uint8Array | undefined> {
-    const cached = this.cache.get(key)
+    const cached = this.touch(key)
     if (cached) {
-      // LRU: move to end of Map (most recently used)
-      this.cache.delete(key)
-      this.cache.set(key, cached)
       this.notifyAccess(key, opts)
       return cached.data
     }
-
-    const signal = opts?.signal
-    if (signal?.aborted) throw abortError()
-
-    const shared = this.inflight.get(key) ?? this.startFetch(key, opts)
-    shared.waiters++
-
-    let result: Uint8Array | undefined
-    if (!signal) {
-      result = await shared.promise
-    } else {
-      let onAbort: (() => void) | undefined
-      try {
-        result = await Promise.race([
-          shared.promise,
-          new Promise<never>((_, reject) => {
-            onAbort = () => {
-              // This caller leaves; the last one out cancels the request
-              shared.waiters--
-              if (shared.waiters === 0 && !shared.settled) {
-                if (this.inflight.get(key) === shared) this.inflight.delete(key)
-                shared.controller.abort()
-              }
-              reject(abortError())
-            }
-            signal.addEventListener('abort', onAbort, { once: true })
-          }),
-        ])
-      } finally {
-        if (onAbort) signal.removeEventListener('abort', onAbort)
-      }
-    }
+    const result = await this.getFull(key, opts)
     if (result !== undefined) this.notifyAccess(key, opts)
     return result
   }
 
+  /** get() without the cache lookup or the access notification. */
+  private getFull(
+    key: AbsolutePath,
+    opts?: GetOptions
+  ): Promise<Uint8Array | undefined> {
+    return this.shared(key, opts, async (signal) => {
+      const result = await this.baseStore.get(key, { ...opts, signal })
+      if (result !== undefined) this.store(key, result)
+      return result
+    })
+  }
+
   /**
-   * Start a shared base-store fetch of `key` and register it in `inflight`
-   * until it settles. The base store gets the fetch's own signal (other
-   * options from the first caller). The result is stored before any waiter
-   * resumes, so listeners see the entry resident.
+   * Wait on the shared fetch for `cacheKey`, starting it with `fetch` if none
+   * is in flight. Implements the waiter and abort semantics described on
+   * get(). `fetch` gets the shared fetch's own signal and must store its
+   * result before resolving, so listeners see the entry resident.
    */
-  private startFetch(key: AbsolutePath, opts?: GetOptions): InflightFetch {
+  private async shared<T>(
+    cacheKey: string,
+    opts: GetOptions | undefined,
+    fetch: (signal: AbortSignal) => Promise<T>
+  ): Promise<T> {
+    const signal = opts?.signal
+    if (signal?.aborted) throw abortError()
+
+    const shared =
+      (this.inflight.get(cacheKey) as InflightFetch<T> | undefined) ??
+      this.startFetch(cacheKey, fetch)
+    shared.waiters++
+
+    if (!signal) return shared.promise
+    let onAbort: (() => void) | undefined
+    try {
+      return await Promise.race([
+        shared.promise,
+        new Promise<never>((_, reject) => {
+          onAbort = () => {
+            // This caller leaves; the last one out cancels the request
+            shared.waiters--
+            if (shared.waiters === 0 && !shared.settled) {
+              if (this.inflight.get(cacheKey) === shared) {
+                this.inflight.delete(cacheKey)
+              }
+              shared.controller.abort()
+            }
+            reject(abortError())
+          }
+          signal.addEventListener('abort', onAbort, { once: true })
+        }),
+      ])
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort)
+    }
+  }
+
+  /**
+   * Start a shared fetch of `cacheKey` and register it in `inflight` until
+   * it settles.
+   */
+  private startFetch<T>(
+    cacheKey: string,
+    fetch: (signal: AbortSignal) => Promise<T>
+  ): InflightFetch<T> {
     const controller = new AbortController()
-    const shared: InflightFetch = {
-      promise: undefined as unknown as Promise<Uint8Array | undefined>,
+    const shared: InflightFetch<T> = {
+      promise: undefined as unknown as Promise<T>,
       controller,
       waiters: 0,
       settled: false,
     }
     shared.promise = (async () => {
       try {
-        const result = await this.baseStore.get(key, {
-          ...opts,
-          signal: controller.signal,
-        })
-        if (result !== undefined) this.store(key, result)
-        return result
+        return await fetch(controller.signal)
       } finally {
         shared.settled = true
-        if (this.inflight.get(key) === shared) this.inflight.delete(key)
+        if (this.inflight.get(cacheKey) === shared) {
+          this.inflight.delete(cacheKey)
+        }
       }
     })()
     // Every waiter may have left (aborted); don't report the rejection as
     // unhandled
     shared.promise.catch(() => {})
-    this.inflight.set(key, shared)
+    this.inflight.set(cacheKey, shared as InflightFetch<unknown>)
     return shared
   }
 
   /** Store an entry, replacing (and un-counting) any entry for the key. */
   private store(key: string, data: Uint8Array): void {
+    if (this.usedRanges && !key.includes('#')) this.dropRangesOf(key)
     const old = this.cache.get(key)
     if (old) {
       this.totalBytes -= old.byteSize
@@ -234,26 +372,135 @@ export class CachingStore implements AsyncReadable {
     this.totalBytes += data.byteLength
   }
 
+  /**
+   * Read a byte range of `key`.
+   *
+   * A range of an object cached whole (by get(), or by a range fallback) is
+   * sliced from it and attributed to the object's key. Otherwise:
+   *
+   * - Full-object mode: get() the whole object, cache it, slice it.
+   * - Range mode: fetch only the range with the base store's getRange, and
+   *   cache it under `rangeCacheKey(key, range)`, which is also the key the
+   *   access listener reports and `has` / `getEntryBytes` answer for.
+   *   Concurrent reads of one range share one fetch, with get()'s abort
+   *   semantics. Each range entry counts its own bytes and is evicted on its
+   *   own.
+   *
+   * Fallbacks in range mode, so a server or proxy that does not support
+   * ranges degrades to full-object mode instead of breaking:
+   * - The server answered with the whole object (200, see
+   *   `RangeIgnoredError`, or more bytes than asked for from a base store
+   *   that does not throw it): the body is cached as the object's entry and
+   *   sliced, and range mode turns off for this store.
+   * - 416 (`RangeNotSatisfiableError`): range mode turns off, and the
+   *   object is fetched whole.
+   * - Any other error: this read fetches the whole object (range mode stays
+   *   on). If that fails too, its error is thrown.
+   * Aborts are rethrown, never retried.
+   */
   async getRange(
     key: AbsolutePath,
     range: RangeQuery,
     opts?: GetOptions
   ): Promise<Uint8Array | undefined> {
-    // Fetch the full file and slice in memory rather than issuing HTTP Range
-    // requests. Multi-hop proxy chains (jupyter-server-proxy) do not reliably
-    // forward Range headers, causing 416 errors for sharded zarr v3 reads.
-    // The full file is cached by get(), so all inner-chunk reads after the
-    // first hit the LRU cache without any additional network requests.
-    const full = await this.get(key, opts)
-    if (!full) return undefined
-    if ('suffixLength' in range) {
-      const start = full.length - range.suffixLength
-      return full.slice(start >= 0 ? start : 0)
+    const whole = this.touch(key)
+    if (whole) {
+      this.notifyAccess(key, opts)
+      return sliceRange(whole.data, range)
     }
-    return full.slice(range.offset, range.offset + range.length)
+    if (!this._rangeRequests) {
+      const full = await this.get(key, opts)
+      return full ? sliceRange(full, range) : undefined
+    }
+
+    const rangeKey = rangeCacheKey(key, range)
+    const cached = this.touch(rangeKey)
+    if (cached) {
+      this.notifyAccess(rangeKey, opts)
+      return cached.data
+    }
+    const result = await this.shared(rangeKey, opts, (signal) =>
+      this.fetchRange(key, range, rangeKey, { ...opts, signal })
+    )
+    if (result === undefined) return undefined
+    this.notifyAccess(result.cacheKey, opts)
+    return result.data
   }
 
-  /** Check if a key is in the cache. */
+  /** Base-store range fetch with the fallbacks described on getRange(). */
+  private async fetchRange(
+    key: AbsolutePath,
+    range: RangeQuery,
+    rangeKey: string,
+    opts: GetOptions & { signal: AbortSignal }
+  ): Promise<RangeResult | undefined> {
+    let data: Uint8Array | undefined
+    try {
+      data = await this.baseStore.getRange!(key, range, opts)
+    } catch (err) {
+      if (opts.signal.aborted || isAbort(err)) throw err
+      const body = ignoredRangeBody(err)
+      if (body) {
+        this.disableRangeRequests(key, 'returned the whole object')
+        return this.useWhole(key, body, range)
+      }
+      if (errorName(err) === 'RangeNotSatisfiableError') {
+        this.disableRangeRequests(key, 'was rejected (416)')
+      }
+      // Fall back to the whole object; its errors reach the caller
+      const full = await this.getFull(key, opts)
+      return full ? { data: sliceRange(full, range), cacheKey: key } : undefined
+    }
+    if (data === undefined) return undefined
+    const asked = 'suffixLength' in range ? range.suffixLength : range.length
+    if (data.byteLength > asked) {
+      // A base store that passes a 200 through as the result
+      this.disableRangeRequests(key, 'returned the whole object')
+      return this.useWhole(key, data, range)
+    }
+    this.usedRanges = true
+    this.store(rangeKey, data)
+    return { data, cacheKey: rangeKey }
+  }
+
+  /** Cache `full` as `key`'s whole-object entry and slice `range` from it. */
+  private useWhole(
+    key: string,
+    full: Uint8Array,
+    range: RangeQuery
+  ): RangeResult {
+    this.store(key, full)
+    return { data: sliceRange(full, range), cacheKey: key }
+  }
+
+  /**
+   * Drop the range entries of `key` once the whole object is cached, so its
+   * bytes are not counted twice (ranges of it are sliced from the object
+   * from now on). Only after range mode was used; O(entries).
+   */
+  private dropRangesOf(key: string): void {
+    const prefix = `${key}#`
+    for (const [k, entry] of this.cache) {
+      if (k.startsWith(prefix)) {
+        this.totalBytes -= entry.byteSize
+        this.cache.delete(k)
+      }
+    }
+  }
+
+  private disableRangeRequests(key: string, what: string): void {
+    if (!this._rangeRequests) return
+    this._rangeRequests = false
+    console.warn(
+      `[zarr-layer] A range request for ${key} ${what}; ` +
+        `reading whole objects from now on.`
+    )
+  }
+
+  /**
+   * Check if a cache key (an object key, or a range key from
+   * `rangeCacheKey`) is in the cache.
+   */
   has(key: string): boolean {
     return this.cache.has(key)
   }
@@ -289,13 +536,6 @@ export class CachingStore implements AsyncReadable {
   clear(): void {
     this.cache.clear()
     this.totalBytes = 0
-  }
-
-  private rangeKey(key: string, range: RangeQuery): string {
-    if ('suffixLength' in range) {
-      return `${key}:suffix-${range.suffixLength}`
-    }
-    return `${key}:${range.offset}-${range.offset + range.length}`
   }
 
   private evictUntilFits(newBytes: number): void {
