@@ -387,6 +387,9 @@ export class UntiledMode implements ZarrMode {
   private lastViewportHash: string = ''
   private baseSliceArgs: (number | zarr.Slice)[] = [] // Cached slice args for non-spatial dims
   private selectorVersion: number = 0 // Incremented on selector change to track stale regions
+  private viewCompleteCallback: (() => void) | undefined
+  /** Last complete view reported (see checkViewComplete). */
+  private lastViewCompleteToken: string = ''
   // Multi-band support: track which dimensions have multiple selected values
   private baseMultiValueDims: Array<{
     dimIndex: number
@@ -912,6 +915,47 @@ export class UntiledMode implements ZarrMode {
   /**
    * Check if a region has all required data for rendering.
    */
+  setViewCompleteCallback(callback: (() => void) | undefined): void {
+    this.viewCompleteCallback = callback
+  }
+
+  /**
+   * Report (once per distinct view) when every visible region of the
+   * current level holds valid data for the current selector version and none
+   * is loading. A region whose fetch failed or was aborted keeps an older
+   * selectorVersion (or no data), so an interrupted render is never
+   * reported; a region restored from the normalized cache is current.
+   */
+  private checkViewComplete(): void {
+    if (!this.viewCompleteCallback) return
+    if (
+      this.lastVisibleRegionsLevel !== this.currentLevelIndex ||
+      this.lastVisibleRegions.length === 0
+    ) {
+      return
+    }
+    const levelIndex = this.currentLevelIndex
+    const parts: string[] = []
+    for (const { regionX, regionY } of this.lastVisibleRegions) {
+      const region = this.regionCache.get(
+        this.makeRegionKey(levelIndex, regionX, regionY)
+      )
+      if (
+        !region ||
+        region.loading ||
+        region.selectorVersion !== this.selectorVersion ||
+        !this.isRegionValid(region)
+      ) {
+        return
+      }
+      parts.push(`${regionX},${regionY}`)
+    }
+    const token = `${levelIndex}:${this.selectorVersion}:${parts.join('|')}`
+    if (token === this.lastViewCompleteToken) return
+    this.lastViewCompleteToken = token
+    this.viewCompleteCallback()
+  }
+
   private isRegionValid(region: RegionState): boolean {
     return !!(
       region.data &&
@@ -1690,6 +1734,8 @@ export class UntiledMode implements ZarrMode {
     if (restoredFromCache) {
       this.invalidate()
     }
+    // Everything in view may already be current (restored, or loaded)
+    this.checkViewComplete()
 
     // Skip if nothing to fetch
     if (
@@ -2099,6 +2145,7 @@ export class UntiledMode implements ZarrMode {
       region.loading = false
       region.requestId = null
       this.requestCanceller.controllers.delete(requestId)
+      this.checkViewComplete()
       // Re-evaluate visible regions after abort so panned-back regions get re-fetched.
       if (controller.signal.aborted && !this.isRemoved) {
         this.invalidate()
@@ -2780,6 +2827,7 @@ export class UntiledMode implements ZarrMode {
         })
         region.textureUploaded = result.uploaded
       }
+      this.checkViewComplete()
 
       // Rebuild base slice args for consistency, then invalidate to render
       await this.buildBaseSliceArgs()

@@ -122,8 +122,8 @@ interface StepKeys {
   /**
    * Keys of the step's latest completed fetch, or null while none has
    * completed: a prefetch that ran to completion (its key set, as
-   * `measuredKeys`), or a render of the displayed step whose loading
-   * finished (merged into the current set, see `handleChunkLoadingChange`).
+   * `measuredKeys`), or a render of the displayed step that the mode
+   * reported fully rendered (see `handleViewComplete`).
    * The step reads as 'cached' only when this is set and all of it is
    * resident, so a step aborted partway (whose `keys` are all resident but
    * incomplete) reads 'partial' and is fetched again.
@@ -275,12 +275,11 @@ export class ZarrLayer {
     { timeIndex: number; selection: string; keys: Set<string> }
   > = new WeakMap()
   /**
-   * Render reads of the displayed step during the current chunk-loading
-   * episode (see handleChunkLoadingChange), or null outside one. `step` is
-   * the stepKey the reads were attributed to; a read for another step (the
-   * displayed step changed) restarts the set.
+   * Non-prefetch reads attributed to the displayed step since it became
+   * displayed (see handleViewComplete). `step` is the stepKey they were
+   * attributed to; a read for another step restarts the set.
    */
-  private renderEpisode: { step: string; keys: Set<string> } | null = null
+  private displayedReads: { step: string; keys: Set<string> } | null = null
   /** Memoized currentSelection(); reset when the selector or time dim changes. */
   private selectionCache: string | null = null
   /** Disposer for the continuous CachingStore access listener. */
@@ -528,36 +527,35 @@ export class ZarrLayer {
     loading: boolean
     chunks: boolean
   }): void => {
-    const wasLoading = this.chunksLoading
     this.chunksLoading = state.chunks
-    if (state.chunks && !wasLoading) {
-      // A render fetch starts: collect the displayed step's reads
-      this.renderEpisode = null
-    } else if (!state.chunks && wasLoading) {
-      this.completeRenderEpisode()
-    }
     this.emitLoadingState()
   }
 
   /**
-   * The mode finished loading chunks: the render of the displayed step is
-   * complete, so the keys it read count as a completed fetch of that step
-   * (merged with the step's earlier complete set: a pan only reads the new
-   * regions). Skipped if the displayed step changed since the reads, or
-   * nothing was read (e.g. everything came from the mode's own caches).
+   * The mode reports that the current view of the displayed step is fully
+   * rendered (every visible region or tile holds data for the current
+   * selector; see `ZarrMode.setViewCompleteCallback`). A region that failed
+   * or was aborted is not rendered for the current selector, so an
+   * interrupted render never gets here; nor does a throttled one until its
+   * fetch lands. It does get here for a redisplay served from the mode's
+   * own caches, which makes no store reads.
+   *
+   * Counts as a completed fetch of the displayed step: its complete set
+   * becomes the earlier complete set (or, if none, every key recorded for
+   * the step: a conservative stand-in, since a redisplay from the mode's
+   * caches reads nothing) plus the reads made while it was displayed.
    */
-  private completeRenderEpisode(): void {
-    const episode = this.renderEpisode
-    this.renderEpisode = null
-    if (!episode || episode.keys.size === 0 || this.initError) return
+  private handleViewComplete = (): void => {
+    if (this.initError) return
     const timeIdx = this.getCurrentTimeIdx()
     if (timeIdx === null) return
     const step = this.stepKey(timeIdx, this.currentSelection())
-    if (episode.step !== step) return
     const entry = this.timestepKeys.get(step)
     if (!entry) return
-    const complete = new Set(entry.completeKeys ?? [])
-    for (const key of episode.keys) complete.add(key)
+    const complete = new Set(entry.completeKeys ?? entry.keys)
+    if (this.displayedReads?.step === step) {
+      for (const key of this.displayedReads.keys) complete.add(key)
+    }
     entry.completeKeys = complete
   }
 
@@ -609,7 +607,7 @@ export class ZarrLayer {
       this.removeAccessListener = null
       this.prefetchQueue.clear()
       this.timestepKeys.clear()
-      this.renderEpisode = null
+      this.displayedReads = null
       this.keyBytes.clear()
       if (this.zarrStore) {
         this.zarrStore.cleanup()
@@ -638,7 +636,7 @@ export class ZarrLayer {
       this.removeAccessListener = null
       this.prefetchQueue.clear()
       this.timestepKeys.clear()
-      this.renderEpisode = null
+      this.displayedReads = null
       this.keyBytes.clear()
       if (this.zarrStore) {
         this.zarrStore.cleanup()
@@ -813,13 +811,11 @@ export class ZarrLayer {
     if (timeIdx !== null) {
       const selection = this.currentSelection()
       this.recordChunkAccess(timeIdx, selection, cacheKey)
-      if (this.chunksLoading) {
-        const step = this.stepKey(timeIdx, selection)
-        if (this.renderEpisode?.step !== step) {
-          this.renderEpisode = { step, keys: new Set() }
-        }
-        this.renderEpisode.keys.add(cacheKey)
+      const step = this.stepKey(timeIdx, selection)
+      if (this.displayedReads?.step !== step) {
+        this.displayedReads = { step, keys: new Set() }
       }
+      this.displayedReads.keys.add(cacheKey)
     }
   }
 
@@ -890,7 +886,8 @@ export class ZarrLayer {
       }
       const complete = entry.completeKeys
       if (!cachingStore) {
-        // No byte cache configured — recorded keys are our only signal.
+        // Unreachable in practice: keys are recorded by the CachingStore's
+        // access listener, so without a cache no step has keys.
         result[idx] = complete ? 'cached' : 'partial'
         continue
       }
@@ -1207,6 +1204,7 @@ export class ZarrLayer {
     this.dataScaleLocked = true
 
     this.mode.setLoadingCallback(this.handleChunkLoadingChange)
+    this.mode.setViewCompleteCallback?.(this.handleViewComplete)
     await this.mode.initialize()
 
     if (this.map && this.gl) {

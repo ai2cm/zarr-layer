@@ -183,6 +183,7 @@ test('a render access during an in-flight prefetch is recorded under the display
   // ...and an access without options (e.g. a metadata read)
   layer.attributeChunkAccess('m0/t0')
   layer.handleChunkLoadingChange({ loading: false, chunks: false })
+  layer.handleViewComplete() // the mode rendered every visible region
   fetches[0].release()
   await tick()
   assert.equal(layer.isTimeStepCached(0), true, 'displayed step recorded')

@@ -116,6 +116,9 @@ export class TiledMode implements ZarrMode {
   private xyLimits: XYLimits | null = null
   private tileBounds: Record<string, MercatorBounds> = {}
   private pendingChunks: Set<string> = new Set()
+  private viewCompleteCallback: (() => void) | undefined
+  /** Last complete view reported (see checkViewComplete). */
+  private lastViewCompleteToken: string = ''
   private currentLevel: number | null = null
   private selectorVersion: number = 0
   private throttleMs: number
@@ -217,6 +220,8 @@ export class TiledMode implements ZarrMode {
         tilesToFetch.push(tileTuple)
       }
     }
+
+    if (tilesToFetch.length === 0) this.checkViewComplete()
 
     if (tilesToFetch.length > 0) {
       // Throttle: if too soon since last fetch, schedule a trailing update
@@ -345,6 +350,34 @@ export class TiledMode implements ZarrMode {
 
   setLoadingCallback(callback: LoadingStateCallback | undefined): void {
     setLoadingCallbackUtil(this.loadingManager, callback)
+  }
+
+  setViewCompleteCallback(callback: (() => void) | undefined): void {
+    this.viewCompleteCallback = callback
+  }
+
+  /**
+   * Report (once per distinct view) when every visible tile holds data for
+   * the current selector and none is pending. A tile whose fetch failed or
+   * was aborted keeps no data or an older selectorHash, so an interrupted
+   * render is never reported; a tile already cached for the selector is.
+   */
+  private checkViewComplete(): void {
+    if (!this.viewCompleteCallback || !this.tileCache) return
+    if (this.visibleTiles.length === 0) return
+    const hash = JSON.stringify(this.selector)
+    const keys: string[] = []
+    for (const tileTuple of this.visibleTiles) {
+      const tileKey = tileToKey(tileTuple)
+      if (this.pendingChunks.has(tileKey)) return
+      const tile = this.tileCache.get(tileKey)
+      if (!tile?.data || tile.selectorHash !== hash) return
+      keys.push(tileKey)
+    }
+    const token = `${hash}:${keys.join('|')}`
+    if (token === this.lastViewCompleteToken) return
+    this.lastViewCompleteToken = token
+    this.viewCompleteCallback()
   }
 
   getCRS(): CRS {
@@ -545,6 +578,7 @@ export class TiledMode implements ZarrMode {
       cancelOlderRequests(this.requestCanceller, version)
 
       this.emitLoadingState()
+      this.checkViewComplete()
 
       // Always invalidate to show data as it arrives - this allows
       // intermediate frames to render when scrubbing through time

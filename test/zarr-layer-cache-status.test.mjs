@@ -66,13 +66,20 @@ function statusLayer({ maxBytes = 100_000, failing = new Set() } = {}) {
     await fetches.at(-1).release(releaseOptions)
     await tick()
   }
-  // A render of the displayed step: the mode reports chunk loading around
-  // its reads (no prefetch signal), like untiled mode's fetchRegions.
-  const render = async (keys, { finish = true } = {}) => {
+  // A render of the displayed step: its reads (no prefetch signal), with the
+  // mode's chunk-loading edges around them, then (if `complete`) the mode's
+  // report that every visible region holds data for the current selector.
+  const render = async (keys, { complete = true } = {}) => {
     layer.handleChunkLoadingChange({ loading: true, chunks: true })
-    for (const key of keys) await store.get(key)
-    if (finish)
-      layer.handleChunkLoadingChange({ loading: false, chunks: false })
+    for (const key of keys) {
+      try {
+        await store.get(key)
+      } catch {
+        // the mode swallows a failed region read and renders the rest
+      }
+    }
+    layer.handleChunkLoadingChange({ loading: false, chunks: false })
+    if (complete) layer.handleViewComplete()
   }
   const status = (t) => layer.getCacheStatus([t])[t]
   return { layer, store, fetches, fetchStep, render, keysFor, status }
@@ -123,33 +130,70 @@ test('a step with a failed chunk fetch is not cached', async () => {
   assert.equal(status(5), 'partial')
 })
 
-test('a completed render of the displayed step reads cached', async () => {
+test('a render the mode reports complete reads cached', async () => {
   const { render, keysFor, status } = statusLayer()
   await render(keysFor(0))
   assert.equal(status(0), 'cached')
 })
 
-test('render reads without a finished render do not count as cached', async () => {
-  const { layer, render, keysFor, status } = statusLayer()
-  // Still loading
-  await render(keysFor(0).slice(0, 1), { finish: false })
+test('a render whose loading ended after a failed read is not cached', async () => {
+  // One read lands, the other fails; the mode still emits chunks:false but
+  // never reports the view complete (the failed region is not current)
+  const { render, keysFor, status } = statusLayer({
+    failing: new Set(['/v/c/0/1']),
+  })
+  await render(keysFor(0), { complete: false })
   assert.equal(status(0), 'partial')
-  // The user steps away before the render finishes: step 0 stays partial,
-  // and step 1's loading end does not complete it
+})
+
+test('a render aborted partway (loading ends, not complete) is not cached', async () => {
+  const { layer, render, keysFor, status } = statusLayer()
+  await render(keysFor(0).slice(0, 1), { complete: false })
+  assert.equal(status(0), 'partial')
+  // The user steps away: step 0 stays partial
   await layer.setSelector({ time: { selected: 1, type: 'index' } })
-  layer.handleChunkLoadingChange({ loading: false, chunks: false })
+  layer.handleViewComplete() // step 1's view (nothing recorded for it)
   assert.equal(status(0), 'partial')
   assert.equal(status(1), 'missing')
 })
 
-test('a render during a step change completes only the step it read for', async () => {
+test('(a) a view completing while chunks still read as loading (throttle) counts', async () => {
+  // Fast stepping: untiled mode keeps chunks=true while a throttled fetch is
+  // pending, so no chunks:false edge arrives, but the displayed step's
+  // regions did land for the current selector
+  const { layer, store, keysFor, status } = statusLayer()
+  layer.handleChunkLoadingChange({ loading: true, chunks: true })
+  for (const key of keysFor(0)) await store.get(key)
+  layer.handleViewComplete()
+  assert.equal(layer.chunksLoading, true)
+  assert.equal(status(0), 'cached')
+})
+
+test('(b) a redisplay served from the mode cache (no reads) reads cached', async () => {
+  const { layer, store, keysFor, status } = statusLayer()
+  // Step 0's chunks were read while displayed, but its render was cut off
+  // (the step changed before the mode reported it complete)
+  for (const key of keysFor(0)) await store.get(key)
+  await layer.setSelector({ time: { selected: 1, type: 'index' } })
+  await layer.setSelector({ time: { selected: 0, type: 'index' } })
+  assert.equal(status(0), 'partial')
+  // Back on step 0: the normalized cache restores every region, no reads
+  layer.handleViewComplete()
+  assert.equal(status(0), 'cached')
+  // Its recorded chunks are what the status checks
+  store.setMaxBytes(0)
+  store.setMaxBytes(100_000)
+  assert.equal(status(0), 'missing')
+})
+
+test('a step change mid-render completes only the step on screen', async () => {
   const { layer, store, render, keysFor, status } = statusLayer()
   layer.handleChunkLoadingChange({ loading: true, chunks: true })
   await store.get(keysFor(0)[0])
-  // Displayed step changes while chunks are still loading; step 1 is read
+  // Displayed step changes before step 0's view completes; step 1 is read
   await layer.setSelector({ time: { selected: 1, type: 'index' } })
   for (const key of keysFor(1)) await store.get(key)
-  layer.handleChunkLoadingChange({ loading: false, chunks: false })
+  layer.handleViewComplete()
   assert.equal(status(0), 'partial')
   assert.equal(status(1), 'cached')
   // A later render pass (e.g. a pan) of step 1 adds to its complete set
@@ -177,4 +221,155 @@ test('a completed prefetch replaces the render-complete set', async () => {
   assert.equal(fetches.length, 1)
   assert.equal(store.has('/v/c/0/other-level'), false)
   assert.equal(status(0), 'cached')
+})
+
+test('a render and a prefetch deduped onto one in-flight key are each attributed', async () => {
+  // Shard /v/s/0 holds steps 0 and 1: the render of step 0 and the
+  // prefetch of step 1 read it at once
+  const pending = []
+  const base = {
+    get: () => new Promise((resolve) => pending.push(resolve)),
+  }
+  const layer = new ZarrLayer({
+    id: 'test',
+    source: 'http://example.invalid/store.zarr',
+    variable: 'v',
+    clim: [0, 1],
+    colormap: ['#000000', '#ffffff'],
+    selector: { time: { selected: 0, type: 'index' } },
+  })
+  const store = new CachingStore(base, 100_000)
+  store.addAccessListener((key, opts) => layer.attributeChunkAccess(key, opts))
+  layer.zarrStore = { cachingStore: store }
+  let prefetchRead
+  layer.mode = {
+    setSelector: async () => {},
+    dispose() {},
+    async prefetchTimeSteps(indices, dim, signal) {
+      prefetchRead = store.get('/v/s/0', { signal })
+      await prefetchRead
+      return true
+    },
+  }
+  layer.handleChunkLoadingChange({ loading: true, chunks: true })
+  const renderRead = store.get('/v/s/0')
+  layer.prefetchTimeSteps([1])
+  await tick()
+  assert.equal(pending.length, 1, 'one base fetch')
+  pending[0](new Uint8Array(1000))
+  await Promise.all([renderRead, prefetchRead])
+  await tick()
+  layer.handleViewComplete()
+  const status = layer.getCacheStatus([0, 1])
+  assert.deepEqual(status, { 0: 'cached', 1: 'cached' })
+  assert.deepEqual(layer.getCacheDebugInfo().perTimestepHits, [
+    { timeIndex: 0, recorded: 1, hits: 1 },
+    { timeIndex: 1, recorded: 1, hits: 1 },
+  ])
+  assert.equal(store.getTotalBytes(), 1000)
+})
+
+// Mode side: when the modes report a complete view. Called on a minimal
+// fake `this`, like the UntiledMode primitive tests.
+const { UntiledMode } = await loadSrc('src/untiled-mode.ts')
+const { TiledMode } = await loadSrc('src/tiled-mode.ts')
+
+function untiledState(regions, overrides = {}) {
+  const calls = []
+  const state = {
+    viewCompleteCallback: () => calls.push(1),
+    lastViewCompleteToken: '',
+    lastVisibleRegionsLevel: 0,
+    currentLevelIndex: 0,
+    selectorVersion: 2,
+    lastVisibleRegions: regions.map(([regionX, regionY]) => ({
+      regionX,
+      regionY,
+    })),
+    regionCache: new Map(),
+    makeRegionKey: (l, x, y) => `${l}:${x}:${y}`,
+    isRegionValid: UntiledMode.prototype.isRegionValid,
+    ...overrides,
+  }
+  for (const [x, y] of regions) {
+    state.regionCache.set(`0:${x}:${y}`, {
+      loading: false,
+      selectorVersion: 2,
+      data: new Float32Array(1),
+      textureUploaded: true,
+      texture: {},
+      vertexBuffer: {},
+      pixCoordBuffer: {},
+      vertexArr: {},
+      mercatorBounds: {},
+    })
+  }
+  const check = () => UntiledMode.prototype.checkViewComplete.call(state)
+  return { state, calls, check }
+}
+
+test('UntiledMode reports a view complete once, only when every visible region is current', () => {
+  const { state, calls, check } = untiledState([
+    [0, 0],
+    [1, 0],
+  ])
+  // A region still loading, or failed/aborted (older selector version)
+  state.regionCache.get('0:1:0').loading = true
+  check()
+  state.regionCache.get('0:1:0').loading = false
+  state.regionCache.get('0:1:0').selectorVersion = 1
+  check()
+  assert.equal(calls.length, 0)
+  // Fetched, or restored from the normalized cache, for the current version
+  state.regionCache.get('0:1:0').selectorVersion = 2
+  check()
+  check()
+  assert.equal(calls.length, 1, 'once per view')
+  // A new selector version: incomplete until its regions are current
+  state.selectorVersion = 3
+  check()
+  assert.equal(calls.length, 1)
+  for (const r of state.regionCache.values()) r.selectorVersion = 3
+  check()
+  assert.equal(calls.length, 2)
+})
+
+test('UntiledMode reports nothing before a visible-region pass for the level', () => {
+  const { calls, check } = untiledState([[0, 0]], {
+    lastVisibleRegionsLevel: -1,
+  })
+  check()
+  assert.equal(calls.length, 0)
+})
+
+test('TiledMode reports a view complete only when every visible tile has current data', () => {
+  const calls = []
+  const selector = { time: { selected: 1, type: 'index' } }
+  const hash = JSON.stringify(selector)
+  const tiles = new Map([
+    ['0,0,0', { data: new Float32Array(1), selectorHash: hash }],
+    ['1,0,0', { data: new Float32Array(1), selectorHash: 'old' }],
+  ])
+  const state = {
+    viewCompleteCallback: () => calls.push(1),
+    lastViewCompleteToken: '',
+    selector,
+    visibleTiles: [
+      [0, 0, 0],
+      [1, 0, 0],
+    ],
+    pendingChunks: new Set(),
+    tileCache: { get: (k) => tiles.get(k) },
+  }
+  const check = () => TiledMode.prototype.checkViewComplete.call(state)
+  check()
+  assert.equal(calls.length, 0, 'a tile holds data for an old selector')
+  tiles.get('1,0,0').selectorHash = hash
+  state.pendingChunks.add('1,0,0')
+  check()
+  assert.equal(calls.length, 0, 'a tile is pending')
+  state.pendingChunks.clear()
+  check()
+  check()
+  assert.equal(calls.length, 1)
 })
