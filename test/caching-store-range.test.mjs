@@ -11,7 +11,7 @@ const {
   RangeIgnoredError,
   RangeNotSatisfiableError,
   RangeRateLimitedError,
-  RangeRefusedError,
+  RANGE_NETWORK_FAILURES_BEFORE_ERROR,
   RANGE_KEY_SEPARATOR: S,
   rangeCacheKey,
 } = await loadSrc('src/caching-store.ts')
@@ -368,22 +368,62 @@ test('a bare network failure (TypeError) twice on a fresh store is a dropout: th
   assert.equal(calls.at(-1).kind, 'range')
 })
 
-test('RangeRefusedError (Range refused, plain HEAD works): range mode off, one full GET', async (t) => {
-  const warn = t.mock.method(console, 'warn', () => {})
+test('many concurrent network failures: no whole GETs, no mode change', async () => {
+  const n = 8
   const { base, calls } = rangeBase({
-    sizes: { '/s': 1000 },
-    fail: [new RangeRefusedError('/s')],
+    sizes: { '/s': 100_000 },
+    fail: Array.from({ length: 2 * n }, network),
     auto: true,
   })
-  const store = rangeStore(base)
-  const r = await store.getRange('/s', { offset: 0, length: 5 })
-  assert.deepEqual(r, expectedSlice(1000, { offset: 0, length: 5 }))
-  assert.deepEqual(
-    calls.map((c) => c.kind),
-    ['range', 'get']
+  const store = rangeStore(base, 1_000_000)
+  const reads = Array.from({ length: n }, (_, i) =>
+    store.getRange('/s', { offset: i * 1000, length: 100 })
   )
-  assert.equal(store.rangeRequests, false)
-  assert.equal(warn.mock.callCount(), 1)
+  const results = await Promise.allSettled(reads)
+  assert.ok(results.every((r) => r.status === 'rejected'))
+  assert.equal(calls.filter((c) => c.kind === 'get').length, 0)
+  assert.equal(calls.length, 2 * n, 'one retry each')
+  assert.equal(store.rangeRequests, true)
+})
+
+test('repeated network failures before any range worked: one console.error, no mode change', async (t) => {
+  const error = t.mock.method(console, 'error', () => {})
+  const N = RANGE_NETWORK_FAILURES_BEFORE_ERROR
+  const { base, calls } = rangeBase({
+    sizes: { '/s': 100_000 },
+    fail: Array.from({ length: 2 * N }, network),
+    auto: true,
+  })
+  const store = rangeStore(base, 1_000_000)
+  for (let i = 0; i < N; i++) {
+    await store
+      .getRange('/s', { offset: i * 1000, length: 100 })
+      .catch(() => {})
+  }
+  assert.equal(error.mock.callCount(), 1, 'logged once')
+  assert.match(
+    String(error.mock.calls[0].arguments[0]),
+    /Range reads are failing.*may\s+not allow the Range header.*rangeRequests off/s
+  )
+  assert.equal(store.rangeRequests, true)
+  assert.equal(calls.filter((c) => c.kind === 'get').length, 0)
+})
+
+test('network failures after a range worked never log the misconfiguration error', async (t) => {
+  const error = t.mock.method(console, 'error', () => {})
+  const N = RANGE_NETWORK_FAILURES_BEFORE_ERROR
+  const { base } = rangeBase({ sizes: { '/s': 100_000 }, auto: true })
+  const store = rangeStore(base, 1_000_000)
+  await store.getRange('/s', { offset: 0, length: 100 })
+  const orig = base.getRange
+  base.getRange = () => Promise.reject(network())
+  for (let i = 1; i <= N; i++) {
+    await store
+      .getRange('/s', { offset: i * 1000, length: 100 })
+      .catch(() => {})
+  }
+  base.getRange = orig
+  assert.equal(error.mock.callCount(), 0)
 })
 
 test('when the whole-object fallback fails too, its error reaches the caller', async (t) => {

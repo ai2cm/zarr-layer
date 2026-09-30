@@ -136,18 +136,12 @@ export class RangeRateLimitedError extends Error {
 }
 
 /**
- * Thrown by a range-capable fetch when a ranged request failed at the
- * network level (TypeError) but the same URL answers a plain HEAD: the Range
- * header itself is refused (e.g. a CORS preflight that does not allow it, or
- * a proxy that drops such requests). See `checkRangeResponses`. A TypeError
- * that is not this is a network failure (dropout) and is retried.
+ * Failed range attempts with a network-level error (TypeError) on a store
+ * where no range read has succeeded yet, after which `console.error` says
+ * the deployment may not allow Range (once per store). A TypeError never
+ * switches modes: from JS a CORS refusal looks exactly like a network blip.
  */
-export class RangeRefusedError extends Error {
-  constructor(url: string) {
-    super(`Range request refused (network error, plain HEAD works): ${url}`)
-    this.name = 'RangeRefusedError'
-  }
-}
+export const RANGE_NETWORK_FAILURES_BEFORE_ERROR = 6
 
 export interface CachingStoreOptions {
   /**
@@ -221,6 +215,11 @@ export class CachingStore implements AsyncReadable {
   /** Whether any range entry was ever stored (see dropRangesOf). */
   private usedRanges: boolean = false
   private readonly retryDelayMs: () => number
+  /** Whether a range read has ever succeeded (only for the error below). */
+  private rangeSucceeded: boolean = false
+  /** Failed range attempts with a TypeError since the last success. */
+  private networkFailures: number = 0
+  private reportedNetworkFailures: boolean = false
 
   constructor(
     baseStore: AsyncReadable,
@@ -463,15 +462,17 @@ export class CachingStore implements AsyncReadable {
    *   `RangeIgnoredError`, or more bytes than asked for from a base store
    *   that does not throw it): the body is cached as the object's entry and
    *   sliced, and range mode turns off for this store.
-   * - 416 (`RangeNotSatisfiableError`), or `RangeRefusedError` (the ranged
-   *   request failed at the network level while a plain HEAD of the same
-   *   URL works, e.g. a CORS preflight that refuses Range): range mode turns
-   *   off, and the object is fetched whole.
+   * - 416 (`RangeNotSatisfiableError`): range mode turns off, and the
+   *   object is fetched whole.
    * - 429 (`RangeRateLimitedError`): thrown at once, not retried.
-   * - Any other error (5xx, a short read, a network failure (TypeError:
-   *   the HEAD probe failed too, so it is a dropout, not a refusal), an
-   *   AbortError the read did not ask for): retried once after
+   * - Any other error (5xx, a short read, a network failure (TypeError),
+   *   an AbortError the read did not ask for): retried once after
    *   `retryDelayMs` (jittered, see `RANGE_RETRY_DELAY_MS`), then thrown.
+   *   A TypeError never switches modes: a CORS refusal of Range can't be
+   *   told from a network blip. If range reads keep failing that way before
+   *   any has succeeded, one `console.error` says so (see
+   *   `RANGE_NETWORK_FAILURES_BEFORE_ERROR`); range mode is opt-in per
+   *   deployment, once its hops are verified.
    *   Never a whole-object download: that would be a whole shard, which can
    *   be bigger than the cache.
    * Aborts of the read itself are rethrown, never retried. A suffix (shard
@@ -540,19 +541,8 @@ export class CachingStore implements AsyncReadable {
           return this.useWhole(key, body, range)
         }
         const name = errorName(err)
-        // Shown unsupported: a 416, or a Range-specific network refusal
-        // (checkRangeResponses probed the URL without Range). A bare
-        // TypeError is a dropout and is retried below: disabling ranges for
-        // it would make every later read a whole-shard GET.
-        const unsupported =
-          name === 'RangeNotSatisfiableError' || name === 'RangeRefusedError'
-        if (unsupported) {
-          this.disableRangeRequests(
-            key,
-            name === 'RangeRefusedError'
-              ? 'was refused (network error; plain HEAD works)'
-              : 'was rejected (416)'
-          )
+        if (name === 'RangeNotSatisfiableError') {
+          this.disableRangeRequests(key, 'was rejected (416)')
           // Its errors reach the caller
           const full = await this.getFull(key, opts)
           return full
@@ -562,6 +552,9 @@ export class CachingStore implements AsyncReadable {
         // Rate-limited: retrying now only adds to it (task 44); a later
         // window refetches
         if (name === 'RangeRateLimitedError') throw err
+        // Network-level: a dropout as far as we can tell (retried below,
+        // never a switch-off: a whole-shard GET per read would follow)
+        if (name === 'TypeError') this.noteNetworkFailure(key)
         // Anything else (5xx, a short read, a network blip, or an
         // AbortError this fetch did not ask for, e.g. from a lower layer that
         // shares a request): retry once, then give up without downloading
@@ -580,6 +573,8 @@ export class CachingStore implements AsyncReadable {
       return this.useWhole(key, data, range)
     }
     this.usedRanges = true
+    this.rangeSucceeded = true
+    this.networkFailures = 0
     this.store(rangeKey, data)
     return { data, cacheKey: rangeKey }
   }
@@ -607,6 +602,31 @@ export class CachingStore implements AsyncReadable {
         this.cache.delete(k)
       }
     }
+  }
+
+  /**
+   * Count a range attempt that failed with a TypeError. After
+   * RANGE_NETWORK_FAILURES_BEFORE_ERROR of them in a row on a store where no
+   * range read has worked, log one error: the likely cause is a deployment
+   * whose CORS (or a proxy) refuses the Range header.
+   */
+  private noteNetworkFailure(key: string): void {
+    this.networkFailures++
+    if (
+      this.rangeSucceeded ||
+      this.reportedNetworkFailures ||
+      this.networkFailures < RANGE_NETWORK_FAILURES_BEFORE_ERROR
+    ) {
+      return
+    }
+    this.reportedNetworkFailures = true
+    console.error(
+      `[zarr-layer] Range reads are failing: ${this.networkFailures} range ` +
+        `requests in a row failed with a network error and none has ` +
+        `succeeded (last: ${key}). If the network is up, this deployment may ` +
+        `not allow the Range header: check its CORS (Access-Control-Allow-` +
+        `Headers must allow Range) or turn rangeRequests off for it.`
+    )
   }
 
   private disableRangeRequests(key: string, what: string): void {

@@ -147,35 +147,30 @@ async function realStack() {
   })
 }
 
-// globalThis.fetch for the probe tests: ranged GETs fail at the network
-// level; a HEAD (the probe) answers 200 when `headWorks`, else fails too.
-// A plain GET answers the whole body.
-function stubRangeRefusal({ headWorks }) {
+// globalThis.fetch that answers ranges and whole GETs (HEAD: 200, as a
+// server whose CORS is fine would), except while `offline`, when every
+// request rejects with a TypeError. `blips` makes the next n requests fail.
+function stubFlakyNetwork() {
   const requests = []
   const original = globalThis.fetch
-  let offline = true
+  const state = { offline: false, blips: 0 }
   globalThis.fetch = async (request) => {
     const range = request.headers.get('Range')
     requests.push({ method: request.method, range })
-    if (!offline) {
-      if (!range) return new Response(body, { status: 200 })
-      const [s, e] = /bytes=(\d+)-(\d+)/.exec(range).slice(1).map(Number)
-      return new Response(body.slice(s, e + 1), { status: 206 })
-    }
-    if (range) throw new TypeError('Failed to fetch')
-    if (request.method === 'HEAD') {
-      if (headWorks) return new Response(null, { status: 200 })
+    if (state.offline || state.blips > 0) {
+      if (state.blips > 0) state.blips--
       throw new TypeError('Failed to fetch')
     }
-    if (headWorks) return new Response(body, { status: 200 })
-    throw new TypeError('Failed to fetch')
+    if (request.method === 'HEAD') return new Response(null, { status: 200 })
+    if (!range) return new Response(body, { status: 200 })
+    const [s, e] = /bytes=(\d+)-(\d+)/.exec(range).slice(1).map(Number)
+    return new Response(body.slice(s, e + 1), { status: 206 })
   }
-  return {
-    requests,
-    online: () => (offline = false),
-    restore: () => (globalThis.fetch = original),
-  }
+  return { requests, state, restore: () => (globalThis.fetch = original) }
 }
+
+const noWholeGet = (requests) =>
+  requests.every((q) => q.method === 'HEAD' || q.range !== null)
 
 test('real stack: adjacent ranges read together go out as one coalesced request', async () => {
   const net = stubGlobalFetch()
@@ -340,8 +335,9 @@ test('coalescing: a read aborted before the flush does not widen the group', asy
   }
 })
 
-test('real stack: offline on a fresh store (range and HEAD probe fail) keeps range mode, no whole GET', async () => {
-  const net = stubRangeRefusal({ headWorks: false })
+test('real stack: offline on a fresh store: throws, range mode stays on, the next read is a range', async () => {
+  const net = stubFlakyNetwork()
+  net.state.offline = true
   try {
     const store = await realStack()
     await assert.rejects(store.getRange('/v/c/0', { offset: 0, length: 100 }), {
@@ -350,33 +346,47 @@ test('real stack: offline on a fresh store (range and HEAD probe fail) keeps ran
     assert.equal(store.rangeRequests, true)
     assert.deepEqual(
       net.requests.map((r) => `${r.method} ${r.range}`),
-      ['GET bytes=0-99', 'HEAD null', 'GET bytes=0-99', 'HEAD null']
+      ['GET bytes=0-99', 'GET bytes=0-99']
     )
-    net.online()
+    net.state.offline = false
     const r = await store.getRange('/v/c/0', { offset: 0, length: 100 })
     assert.deepEqual(r, body.slice(0, 100))
-    assert.equal(net.requests.at(-1).range, 'bytes=0-99')
-    assert.ok(
-      net.requests.every((q) => q.method === 'HEAD' || q.range !== null),
-      'no whole GET'
+    assert.ok(noWholeGet(net.requests))
+  } finally {
+    net.restore()
+  }
+})
+
+test('real stack: a blip on a fresh store (HEAD would work) is retried: no whole GET, range mode on', async () => {
+  const net = stubFlakyNetwork()
+  net.state.blips = 1
+  try {
+    const store = await realStack()
+    const r = await store.getRange('/v/c/0', { offset: 0, length: 100 })
+    assert.deepEqual(r, body.slice(0, 100))
+    assert.equal(store.rangeRequests, true)
+    assert.deepEqual(
+      net.requests.map((q) => `${q.method} ${q.range}`),
+      ['GET bytes=0-99', 'GET bytes=0-99']
     )
   } finally {
     net.restore()
   }
 })
 
-test('real stack: Range refused but a plain HEAD works: RangeRefusedError, whole-object mode', async (t) => {
-  t.mock.method(console, 'warn', () => {})
-  const net = stubRangeRefusal({ headWorks: true })
+test('real stack: a blip across several shards after ranges worked: no whole GETs, range mode on', async () => {
+  const net = stubFlakyNetwork()
   try {
     const store = await realStack()
-    const r = await store.getRange('/v/c/0', { offset: 0, length: 100 })
-    assert.deepEqual(r, body.slice(0, 100))
-    assert.equal(store.rangeRequests, false)
-    assert.deepEqual(
-      net.requests.map((q) => `${q.method} ${q.range}`),
-      ['GET bytes=0-99', 'HEAD null', 'GET null']
+    await store.getRange('/v/c/0', { offset: 0, length: 100 })
+    net.state.blips = 3
+    const reads = ['/v/c/1', '/v/c/2', '/v/c/3'].map((k) =>
+      store.getRange(k, { offset: 0, length: 100 })
     )
+    const out = await Promise.all(reads)
+    assert.ok(out.every((d) => d.byteLength === 100))
+    assert.equal(store.rangeRequests, true)
+    assert.ok(noWholeGet(net.requests))
   } finally {
     net.restore()
   }
