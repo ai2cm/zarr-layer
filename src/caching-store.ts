@@ -136,9 +136,11 @@ export class RangeRateLimitedError extends Error {
 }
 
 /**
- * Failed range attempts with a network-level error (TypeError) on a store
- * where no range read has succeeded yet, after which `console.error` says
- * the deployment may not allow Range (once per store). A TypeError never
+ * Range reads that failed with a network-level error (TypeError) on their
+ * last attempt, in a row, on a store where no range read has succeeded yet,
+ * after which `console.error` says the deployment may not allow Range (once
+ * per store). A first attempt whose retry succeeds doesn't count, so a blip
+ * under many concurrent reads stays quiet. A TypeError never
  * switches modes: from JS a CORS refusal looks exactly like a network blip.
  */
 export const RANGE_NETWORK_FAILURES_BEFORE_ERROR = 6
@@ -554,7 +556,8 @@ export class CachingStore implements AsyncReadable {
         if (name === 'RangeRateLimitedError') throw err
         // Network-level: a dropout as far as we can tell (retried below,
         // never a switch-off: a whole-shard GET per read would follow)
-        if (name === 'TypeError') this.noteNetworkFailure(key)
+        // (only exhausted reads count towards the misconfiguration error)
+        if (name === 'TypeError' && attempt > 0) this.noteNetworkFailure(key)
         // Anything else (5xx, a short read, a network blip, or an
         // AbortError this fetch did not ask for, e.g. from a lower layer that
         // shares a request): retry once, then give up without downloading
@@ -605,7 +608,7 @@ export class CachingStore implements AsyncReadable {
   }
 
   /**
-   * Count a range attempt that failed with a TypeError. After
+   * Count a range read whose last attempt failed with a TypeError. After
    * RANGE_NETWORK_FAILURES_BEFORE_ERROR of them in a row on a store where no
    * range read has worked, log one error: the likely cause is a deployment
    * whose CORS (or a proxy) refuses the Range header.
@@ -622,7 +625,8 @@ export class CachingStore implements AsyncReadable {
     this.reportedNetworkFailures = true
     console.error(
       `[zarr-layer] Range reads are failing: ${this.networkFailures} range ` +
-        `requests in a row failed with a network error and none has ` +
+        `reads in a row failed with a network error (after a retry each) ` +
+        `and none has ` +
         `succeeded (last: ${key}). If the network is up, this deployment may ` +
         `not allow the Range header: check its CORS (Access-Control-Allow-` +
         `Headers must allow Range) or turn rangeRequests off for it.`

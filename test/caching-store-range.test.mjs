@@ -409,6 +409,25 @@ test('repeated network failures before any range worked: one console.error, no m
   assert.equal(calls.filter((c) => c.kind === 'get').length, 0)
 })
 
+test('a blip under many concurrent reads on a fresh store (retries succeed) logs no error', async (t) => {
+  const error = t.mock.method(console, 'error', () => {})
+  const N = RANGE_NETWORK_FAILURES_BEFORE_ERROR
+  const { base, calls } = rangeBase({
+    sizes: { '/s': 100_000 },
+    fail: Array.from({ length: N }, network), // every first attempt
+    auto: true,
+  })
+  const store = rangeStore(base, 1_000_000)
+  const out = await Promise.all(
+    Array.from({ length: N }, (_, i) =>
+      store.getRange('/s', { offset: i * 1000, length: 100 })
+    )
+  )
+  assert.ok(out.every((d) => d.byteLength === 100))
+  assert.equal(calls.length, 2 * N)
+  assert.equal(error.mock.callCount(), 0)
+})
+
 test('network failures after a range worked never log the misconfiguration error', async (t) => {
   const error = t.mock.method(console, 'error', () => {})
   const N = RANGE_NETWORK_FAILURES_BEFORE_ERROR
