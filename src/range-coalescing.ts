@@ -11,7 +11,13 @@
  *
  * - a request whose own signal aborts rejects on its own, at once;
  * - the group's fetch is aborted only when *every* request in it has
- *   aborted (never, if one of them has no signal).
+ *   aborted (never, if one of them has no signal);
+ * - requests already aborted at flush time are left out of the groups, so
+ *   they don't widen a fetch.
+ *
+ * Adapted from zarrita (github.com/manzt/zarrita.js), 0.7.1
+ * `src/extension/range-coalescing.ts`.
+ * Copyright (c) 2020-2023 Trevor Manz, MIT License.
  */
 
 import * as zarr from 'zarrita'
@@ -26,6 +32,20 @@ interface PendingRequest {
   resolve: (data: Uint8Array | undefined) => void
   reject: (err: unknown) => void
   settled: boolean
+  /** Removes the request's abort listener (set by groupSignal). */
+  detach?: () => void
+}
+
+/** Settle a request once, dropping its abort listener. */
+function settle(
+  req: PendingRequest,
+  outcome: { data: Uint8Array | undefined } | { error: unknown }
+): void {
+  if (req.settled) return
+  req.settled = true
+  req.detach?.()
+  if ('error' in outcome) req.reject(outcome.error)
+  else req.resolve(outcome.data)
 }
 
 interface Group {
@@ -81,14 +101,11 @@ function groupSignal(requests: PendingRequest[]): AbortSignal | undefined {
       continue
     }
     const onAbort = () => {
-      if (!req.settled) {
-        req.settled = true
-        req.reject(abortError())
-      }
+      settle(req, { error: abortError() })
       if (--live === 0 && cancellable) controller.abort()
     }
-    if (signal.aborted) onAbort()
-    else signal.addEventListener('abort', onAbort, { once: true })
+    signal.addEventListener('abort', onAbort, { once: true })
+    req.detach = () => signal.removeEventListener('abort', onAbort)
   }
   return cancellable ? controller.signal : undefined
 }
@@ -118,20 +135,13 @@ export const withRangeCoalescing = zarr.defineStoreExtension(
         }
         for (const req of group.requests) {
           if (req.settled) continue
-          req.settled = true
-          if (!data) {
-            req.resolve(undefined)
-            continue
-          }
           const start = req.offset - group.offset
-          req.resolve(data.slice(start, start + req.length))
+          settle(req, {
+            data: data ? data.slice(start, start + req.length) : undefined,
+          })
         }
       } catch (err) {
-        for (const req of group.requests) {
-          if (req.settled) continue
-          req.settled = true
-          req.reject(err)
-        }
+        for (const req of group.requests) settle(req, { error: err })
       }
     }
 
@@ -139,7 +149,14 @@ export const withRangeCoalescing = zarr.defineStoreExtension(
       const work = pending
       pending = new Map()
       scheduled = false
-      for (const [path, requests] of work) {
+      for (const [path, all] of work) {
+        // Requests aborted while waiting for the flush: reject, don't fetch
+        const requests: PendingRequest[] = []
+        for (const req of all) {
+          if (req.signal?.aborted) settle(req, { error: abortError() })
+          else requests.push(req)
+        }
+        if (requests.length === 0) continue
         requests.sort((a, b) => a.offset - b.offset)
         for (const group of groupRequests(requests, coalesceSize)) {
           void fetchGroup(path, group)

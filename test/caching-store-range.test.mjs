@@ -10,6 +10,7 @@ const {
   CachingStore,
   RangeIgnoredError,
   RangeNotSatisfiableError,
+  RangeRateLimitedError,
   RANGE_KEY_SEPARATOR: S,
   rangeCacheKey,
 } = await loadSrc('src/caching-store.ts')
@@ -258,7 +259,6 @@ const aborted = () => new DOMException('aborted', 'AbortError')
 
 for (const [label, err] of [
   ['a 503', status(503)],
-  ['a 429', status(429)],
   ['a short read', new Error('Short read: expected 10 bytes but received 4')],
 ]) {
   test(`${label} is retried once, then thrown: never a whole-object GET`, async () => {
@@ -281,6 +281,42 @@ for (const [label, err] of [
     assert.equal(calls.at(-1).kind, 'range')
   })
 }
+
+test('a 429 (RangeRateLimitedError) is thrown at once: no retry, no whole GET', async () => {
+  const err = new RangeRateLimitedError('/s')
+  const { base, calls } = rangeBase({
+    sizes: { '/s': 1000 },
+    fail: [err],
+    auto: true,
+  })
+  const store = rangeStore(base)
+  await assert.rejects(store.getRange('/s', { offset: 0, length: 5 }), err)
+  assert.deepEqual(
+    calls.map((c) => c.kind),
+    ['range']
+  )
+  assert.equal(store.rangeRequests, true)
+})
+
+test('after a range has worked, a TypeError twice is a dropout: thrown, range mode stays on', async () => {
+  const { base, calls } = rangeBase({ sizes: { '/s': 1000 }, auto: true })
+  const store = rangeStore(base)
+  await store.getRange('/s', { offset: 0, length: 5 })
+  // The next two range calls fail at the network level
+  const orig = base.getRange
+  let failures = 2
+  base.getRange = (...args) =>
+    failures-- > 0 ? Promise.reject(network()) : orig(...args)
+  await assert.rejects(store.getRange('/s', { offset: 10, length: 5 }), {
+    name: 'TypeError',
+  })
+  assert.equal(store.rangeRequests, true)
+  assert.equal(calls.filter((c) => c.kind === 'get').length, 0)
+  // Back online: ranges again
+  const r = await store.getRange('/s', { offset: 10, length: 5 })
+  assert.deepEqual(r, expectedSlice(1000, { offset: 10, length: 5 }))
+  assert.equal(calls.at(-1).kind, 'range')
+})
 
 test('a transient error: the retry succeeds and is cached as a range', async () => {
   const { base, calls } = rangeBase({
@@ -310,7 +346,7 @@ test('a network failure (TypeError) once: the retry succeeds, range mode stays o
   assert.equal(store.rangeRequests, true)
 })
 
-test('a network failure (TypeError) twice (e.g. CORS): range mode off, one full GET', async (t) => {
+test('a network failure (TypeError) twice before any range worked (e.g. CORS): range mode off, one full GET', async (t) => {
   const warn = t.mock.method(console, 'warn', () => {})
   const { base, calls } = rangeBase({
     sizes: { '/s': 1000 },

@@ -237,3 +237,69 @@ test('real stack: a 503 is retried once, then thrown; no whole-object GET', asyn
     net.restore()
   }
 })
+
+test('real stack: a 429 is thrown at once, not retried', async () => {
+  const net = stubGlobalFetch({ statusFor: () => 429 })
+  try {
+    const store = await realStack()
+    await assert.rejects(store.getRange('/v/c/0', { offset: 0, length: 100 }), {
+      name: 'RangeRateLimitedError',
+    })
+    assert.equal(net.requests.length, 1)
+  } finally {
+    net.restore()
+  }
+})
+
+test('real stack: a network dropout after ranges worked keeps range mode (no whole GET)', async () => {
+  let offline = false
+  const net = stubGlobalFetch()
+  const online = globalThis.fetch
+  globalThis.fetch = (request) =>
+    offline
+      ? (net.requests.push({ range: request.headers.get('Range') }),
+        Promise.reject(new TypeError('Failed to fetch')))
+      : online(request)
+  try {
+    const store = await realStack()
+    await store.getRange('/v/c/0', { offset: 0, length: 100 })
+    offline = true
+    await assert.rejects(
+      store.getRange('/v/c/0', { offset: 200, length: 100 }),
+      { name: 'TypeError' }
+    )
+    offline = false
+    assert.equal(store.rangeRequests, true)
+    const r = await store.getRange('/v/c/0', { offset: 200, length: 100 })
+    assert.deepEqual(r, body.slice(200, 300))
+    assert.ok(
+      net.requests.every((q) => q.range !== null),
+      'no whole GET'
+    )
+  } finally {
+    net.restore()
+  }
+})
+
+test('coalescing: a read aborted before the flush does not widen the group', async () => {
+  const net = stubGlobalFetch()
+  try {
+    const store = await realStack()
+    const a = new AbortController()
+    const pa = store.getRange(
+      '/v/c/0',
+      { offset: 500, length: 100 },
+      { signal: a.signal }
+    )
+    const pb = store.getRange('/v/c/0', { offset: 0, length: 100 })
+    a.abort()
+    await assert.rejects(pa, { name: 'AbortError' })
+    assert.deepEqual(await pb, body.slice(0, 100))
+    assert.deepEqual(
+      net.requests.map((r) => r.range),
+      ['bytes=0-99']
+    )
+  } finally {
+    net.restore()
+  }
+})

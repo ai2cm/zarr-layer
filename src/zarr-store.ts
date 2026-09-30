@@ -5,6 +5,7 @@ import {
   DEFAULT_CHUNK_CACHE_BYTES,
   RangeIgnoredError,
   RangeNotSatisfiableError,
+  RangeRateLimitedError,
   validCacheBytes,
 } from './caching-store'
 import { withRangeCoalescing } from './range-coalescing'
@@ -158,7 +159,8 @@ const transformedFetch =
  * instead of passed through: FetchStore would hand the whole body of a 200
  * back as if it were the range. A 200 throws `RangeIgnoredError` with the
  * body (the CachingStore keeps it as the whole object), a 416 throws
- * `RangeNotSatisfiableError`. Requests without a Range header pass through.
+ * `RangeNotSatisfiableError`, a 429 `RangeRateLimitedError`. Requests
+ * without a Range header pass through.
  */
 export const checkRangeResponses =
   (inner: (request: Request) => Promise<Response>) =>
@@ -174,10 +176,12 @@ export const checkRangeResponses =
       const body = new Uint8Array(await response.arrayBuffer())
       throw new RangeIgnoredError(request.url, body)
     }
-    if (response.status === 416) {
+    if (response.status === 416 || response.status === 429) {
       // Drain, so the connection can be reused
       await response.body?.cancel().catch(() => {})
-      throw new RangeNotSatisfiableError(request.url)
+      throw response.status === 416
+        ? new RangeNotSatisfiableError(request.url)
+        : new RangeRateLimitedError(request.url)
     }
     return response
   }
