@@ -225,6 +225,8 @@ export class ZarrLayer {
    * enable or disable caching across `setVariable` or remove/re-add.
    */
   private readonly chunkCacheEnabled: boolean
+  /** Range mode of the chunk cache (see `ZarrLayerOptions.rangeRequests`). */
+  private readonly rangeRequests: boolean
   /** Time dim of the last prefetchTimeSteps call ('time' until then). */
   private prefetchTimeDimName: string = 'time'
   /**
@@ -401,6 +403,7 @@ export class ZarrLayer {
     store,
     renderPoles = false,
     maxChunkCacheBytes,
+    rangeRequests = false,
     prefetchConcurrency,
     prefetchMaxRequests,
   }: ZarrLayerOptions) {
@@ -485,6 +488,7 @@ export class ZarrLayer {
     }
     this.maxChunkCacheBytes = chunkBudget
     this.chunkCacheEnabled = chunkBudget === undefined || chunkBudget > 0
+    this.rangeRequests = rangeRequests
 
     const steps = normalizeConcurrency(
       prefetchConcurrency,
@@ -1228,6 +1232,7 @@ export class ZarrLayer {
         customStore: this.customStore,
         maxChunkCacheBytes: this.maxChunkCacheBytes,
         chunkCacheEnabled: this.chunkCacheEnabled,
+        rangeRequests: this.rangeRequests,
       })
 
       await this.zarrStore.initialized

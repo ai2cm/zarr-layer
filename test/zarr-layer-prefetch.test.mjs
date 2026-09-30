@@ -509,7 +509,12 @@ test('attribution with interleaved accesses from several concurrent steps', asyn
 const zarr = await import('zarrita')
 const { RequestLimiter } = await loadSrc('src/request-limiter.ts')
 
-async function slowArray({ size = 40, chunk = 10, fail = () => false } = {}) {
+async function slowArray({
+  size = 40,
+  chunk = 10,
+  fail = () => false,
+  failError = (key) => new Error(`503 ${key}`),
+} = {}) {
   const files = new Map()
   const stats = { live: 0, peak: 0, chunkGets: 0 }
   const store = {
@@ -520,7 +525,7 @@ async function slowArray({ size = 40, chunk = 10, fail = () => false } = {}) {
       stats.peak = Math.max(stats.peak, stats.live)
       await new Promise((r) => setTimeout(r, 3))
       stats.live--
-      if (fail(key)) throw new Error(`503 ${key}`)
+      if (fail(key)) throw failError(key)
       return undefined // missing chunk: fill value
     },
     async set(key, value) {
@@ -598,6 +603,28 @@ test('UntiledMode primitive: a failed chunk fetch is reported through onFetchErr
   assert.equal(result, true, 'still done: not retried')
   assert.equal(stats.chunkGets, 16, 'the other regions are still fetched')
   assert.equal(errors, 1)
+})
+
+test("UntiledMode primitive: an AbortError while the step's signal is live is a failed fetch, not an abort", async () => {
+  // e.g. a shared lower-level read another caller aborted (task 46 review)
+  const { arr, stats } = await slowArray({
+    size: 40,
+    chunk: 10,
+    fail: (key) => key.endsWith('/c/1/0/0'),
+    failError: () => new DOMException('aborted', 'AbortError'),
+  })
+  const state = regionState(arr, { size: 40, region: 10 })
+  let errors = 0
+  const result = await UntiledMode.prototype.prefetchTimeSteps.call(
+    state,
+    [1],
+    'time',
+    new AbortController().signal,
+    { onFetchError: () => errors++ }
+  )
+  assert.equal(result, true)
+  assert.equal(errors, 1)
+  assert.equal(stats.chunkGets, 16, 'the other regions are still fetched')
 })
 
 test('UntiledMode primitive: an abort mid-step starts no further regions', async () => {

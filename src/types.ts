@@ -171,6 +171,20 @@ export interface ZarrLayerOptions {
    */
   maxChunkCacheBytes?: number
   /**
+   * Read byte ranges (the shard index and inner chunks of sharded zarr v3)
+   * with HTTP Range requests, caching each range, instead of downloading
+   * and caching whole shard objects. Default: `false` (whole objects: some
+   * multi-hop proxies do not forward Range headers reliably).
+   *
+   * If a server answers a range with the whole object (200) or rejects it
+   * (416), the layer caches that object and reads whole objects from then
+   * on, so a proxy that drops Range degrades to the default behaviour.
+   * Applies to `source` stores and to a custom `store` that has `getRange`;
+   * needs the chunk cache (ignored with `maxChunkCacheBytes: 0`, where
+   * zarrita reads ranges directly).
+   */
+  rangeRequests?: boolean
+  /**
    * Prefetch time steps (`prefetchTimeSteps`) in flight at once. Default: 4
    * (one day of 6-hourly data). Steps start in window order; `1` restores
    * strictly sequential prefetch. Fractional values are floored; an invalid
