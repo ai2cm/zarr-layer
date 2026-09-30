@@ -47,14 +47,46 @@ export function validCacheBytes(bytes: number): number | null {
 }
 
 /**
- * Cache key of a byte range of `key` in range mode: `<key>#<offset>:<length>`
- * or `<key>#suffix:<length>`. It is what the access listener reports and
- * what `has` / `getEntryBytes` take for that range.
+ * Separator between an object key and its range in range cache keys: NUL,
+ * which cannot occur in a zarr key (an object key containing `#` or `:` is
+ * never mistaken for a range key).
+ */
+export const RANGE_KEY_SEPARATOR = '\u0000'
+
+/**
+ * Cache key of a byte range of `key` in range mode:
+ * `<key>\0<offset>:<length>` or `<key>\0suffix:<length>` (see
+ * `RANGE_KEY_SEPARATOR`). It is what the access listener reports and what
+ * `has` / `getEntryBytes` take for that range.
+ *
+ * Keys name byte positions, not content: like the whole-object cache, this
+ * assumes objects do not change while cached. A suffix key in particular
+ * names "the last N bytes", which would silently go stale if the object
+ * were rewritten with another length.
  */
 export function rangeCacheKey(key: string, range: RangeQuery): string {
   return 'suffixLength' in range
-    ? `${key}#suffix:${range.suffixLength}`
-    : `${key}#${range.offset}:${range.length}`
+    ? `${key}${RANGE_KEY_SEPARATOR}suffix:${range.suffixLength}`
+    : `${key}${RANGE_KEY_SEPARATOR}${range.offset}:${range.length}`
+}
+
+/** Delay before the one retry of a failed range read. */
+export const RANGE_RETRY_DELAY_MS = 250
+
+/** Wait `ms`, rejecting with an AbortError if `signal` aborts first. */
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(abortError())
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(abortError())
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
 }
 
 /**
@@ -117,10 +149,6 @@ function abortError(): DOMException {
 // module (e.g. a second bundle) are recognised too
 const errorName = (err: unknown): string | undefined =>
   (err as { name?: unknown } | null)?.name as string | undefined
-
-function isAbort(err: unknown): boolean {
-  return errorName(err) === 'AbortError'
-}
 
 function ignoredRangeBody(err: unknown): Uint8Array | null {
   const data = (err as { data?: unknown } | null)?.data
@@ -361,7 +389,9 @@ export class CachingStore implements AsyncReadable {
 
   /** Store an entry, replacing (and un-counting) any entry for the key. */
   private store(key: string, data: Uint8Array): void {
-    if (this.usedRanges && !key.includes('#')) this.dropRangesOf(key)
+    if (this.usedRanges && !key.includes(RANGE_KEY_SEPARATOR)) {
+      this.dropRangesOf(key)
+    }
     const old = this.cache.get(key)
     if (old) {
       this.totalBytes -= old.byteSize
@@ -392,11 +422,15 @@ export class CachingStore implements AsyncReadable {
    *   `RangeIgnoredError`, or more bytes than asked for from a base store
    *   that does not throw it): the body is cached as the object's entry and
    *   sliced, and range mode turns off for this store.
-   * - 416 (`RangeNotSatisfiableError`): range mode turns off, and the
-   *   object is fetched whole.
-   * - Any other error: this read fetches the whole object (range mode stays
-   *   on). If that fails too, its error is thrown.
-   * Aborts are rethrown, never retried.
+   * - 416 (`RangeNotSatisfiableError`), or a network-level failure
+   *   (TypeError, e.g. a CORS rejection) on two attempts: range mode turns
+   *   off, and the object is fetched whole.
+   * - Any other error (5xx, 429, a short read, an AbortError the read did
+   *   not ask for): retried once after `RANGE_RETRY_DELAY_MS`, then thrown.
+   *   Never a whole-object download: that would be a whole shard, which can
+   *   be bigger than the cache.
+   * Aborts of the read itself are rethrown, never retried. A suffix (shard
+   * index) read is not cancelled by its caller's abort; see below.
    */
   async getRange(
     key: AbsolutePath,
@@ -419,7 +453,16 @@ export class CachingStore implements AsyncReadable {
       this.notifyAccess(rangeKey, opts)
       return cached.data
     }
-    const result = await this.shared(rangeKey, opts, (signal) =>
+    // A suffix read is a shard index: small, and zarrita shares one index
+    // read among every chunk read of the shard while passing only the first
+    // caller's signal. Letting that caller's abort cancel it would reject the
+    // other chunk reads, so it runs to completion (it is still attributed to
+    // the caller that made it).
+    const waitOpts =
+      'suffixLength' in range && opts?.signal
+        ? { ...opts, signal: undefined }
+        : opts
+    const result = await this.shared(rangeKey, waitOpts, (signal) =>
       this.fetchRange(key, range, rangeKey, { ...opts, signal })
     )
     if (result === undefined) return undefined
@@ -427,7 +470,11 @@ export class CachingStore implements AsyncReadable {
     return result.data
   }
 
-  /** Base-store range fetch with the fallbacks described on getRange(). */
+  /**
+   * Base-store range fetch with the fallbacks described on getRange(): a
+   * whole object only when range support is shown to be broken, otherwise
+   * one retry and then the error.
+   */
   private async fetchRange(
     key: AbsolutePath,
     range: RangeQuery,
@@ -435,21 +482,46 @@ export class CachingStore implements AsyncReadable {
     opts: GetOptions & { signal: AbortSignal }
   ): Promise<RangeResult | undefined> {
     let data: Uint8Array | undefined
-    try {
-      data = await this.baseStore.getRange!(key, range, opts)
-    } catch (err) {
-      if (opts.signal.aborted || isAbort(err)) throw err
-      const body = ignoredRangeBody(err)
-      if (body) {
-        this.disableRangeRequests(key, 'returned the whole object')
-        return this.useWhole(key, body, range)
+    for (let attempt = 0; ; attempt++) {
+      try {
+        data = await this.baseStore.getRange!(key, range, opts)
+        break
+      } catch (err) {
+        // Our own shared fetch was aborted (every waiter left): done
+        if (opts.signal.aborted) throw err
+        const body = ignoredRangeBody(err)
+        if (body) {
+          this.disableRangeRequests(key, 'returned the whole object')
+          return this.useWhole(key, body, range)
+        }
+        const name = errorName(err)
+        const unsupported =
+          name === 'RangeNotSatisfiableError' ||
+          // A network-level failure twice in a row (e.g. a CORS preflight
+          // that rejects the Range header; a blip passes on the retry)
+          (name === 'TypeError' && attempt > 0)
+        if (unsupported) {
+          this.disableRangeRequests(
+            key,
+            name === 'TypeError'
+              ? 'failed twice (network/CORS)'
+              : 'was rejected (416)'
+          )
+          // Its errors reach the caller
+          const full = await this.getFull(key, opts)
+          return full
+            ? { data: sliceRange(full, range), cacheKey: key }
+            : undefined
+        }
+        // Anything else (5xx, 429, a short read, a network blip, or an
+        // AbortError this fetch did not ask for, e.g. from a lower layer that
+        // shares a request): retry once, then give up without downloading
+        // the whole object (a 3 km shard is hundreds of MB and bigger than the
+        // cache). Callers retry later: a prefetch step reports the failure
+        // and is refetched, a render refetches.
+        if (attempt > 0) throw err
+        await delay(RANGE_RETRY_DELAY_MS, opts.signal)
       }
-      if (errorName(err) === 'RangeNotSatisfiableError') {
-        this.disableRangeRequests(key, 'was rejected (416)')
-      }
-      // Fall back to the whole object; its errors reach the caller
-      const full = await this.getFull(key, opts)
-      return full ? { data: sliceRange(full, range), cacheKey: key } : undefined
     }
     if (data === undefined) return undefined
     const asked = 'suffixLength' in range ? range.suffixLength : range.length
@@ -479,7 +551,7 @@ export class CachingStore implements AsyncReadable {
    * from now on). Only after range mode was used; O(entries).
    */
   private dropRangesOf(key: string): void {
-    const prefix = `${key}#`
+    const prefix = `${key}${RANGE_KEY_SEPARATOR}`
     for (const [k, entry] of this.cache) {
       if (k.startsWith(prefix)) {
         this.totalBytes -= entry.byteSize
@@ -536,6 +608,7 @@ export class CachingStore implements AsyncReadable {
   clear(): void {
     this.cache.clear()
     this.totalBytes = 0
+    this.usedRanges = false
   }
 
   private evictUntilFits(newBytes: number): void {

@@ -10,6 +10,7 @@ const {
   CachingStore,
   RangeIgnoredError,
   RangeNotSatisfiableError,
+  RANGE_KEY_SEPARATOR: S,
   rangeCacheKey,
 } = await loadSrc('src/caching-store.ts')
 const { ZarrLayer } = await loadSrc('src/zarr-layer.ts')
@@ -30,7 +31,15 @@ const expectedSlice = (n, range) => {
 // `mode` changes how getRange answers: 'range' (a 206), 'ignore' (the whole
 // object, as FetchStore passes a 200 through), 'ignoreError' (throws
 // RangeIgnoredError with the whole body), '416', 'error'.
-function rangeBase({ sizes = {}, mode = 'range', auto = false } = {}) {
+// `fail`: errors thrown by the first getRange calls, one per call, before
+// answering normally.
+function rangeBase({
+  sizes = {},
+  mode = 'range',
+  auto = false,
+  fail = [],
+} = {}) {
+  fail = [...fail]
   const calls = []
   const pending = (kind, key, range, opts, answer) =>
     new Promise((resolve, reject) => {
@@ -55,7 +64,9 @@ function rangeBase({ sizes = {}, mode = 'range', auto = false } = {}) {
       )
     },
     getRange(key, range, opts) {
+      const failure = fail.shift()
       return pending('range', key, range, opts, () => {
+        if (failure) throw failure
         const n = sizes[key]
         if (n === undefined) return undefined
         if (mode === 'ignore') return objectBytes(n)
@@ -87,7 +98,7 @@ test('range mode reads a range with getRange and caches it under its range key',
     [['range', '/s']]
   )
   const key = rangeCacheKey('/s', range)
-  assert.equal(key, '/s#100:50')
+  assert.equal(key, `/s${S}100:50`)
   assert.ok(store.has(key))
   assert.ok(!store.has('/s'))
   assert.equal(store.getEntryBytes(key), 50)
@@ -104,8 +115,8 @@ test('suffix ranges are cached under their own key', async () => {
   const store = rangeStore(base)
   const idx = await store.getRange('/s', { suffixLength: 20 })
   assert.deepEqual(idx, expectedSlice(1000, { suffixLength: 20 }))
-  assert.equal(rangeCacheKey('/s', { suffixLength: 20 }), '/s#suffix:20')
-  assert.equal(store.getEntryBytes('/s#suffix:20'), 20)
+  assert.equal(rangeCacheKey('/s', { suffixLength: 20 }), `/s${S}suffix:20`)
+  assert.equal(store.getEntryBytes(`/s${S}suffix:20`), 20)
   await store.getRange('/s', { suffixLength: 20 })
   assert.equal(calls.length, 1)
 })
@@ -181,8 +192,8 @@ test('the access listener gets the range key with each caller options', async ()
   assert.deepEqual(
     seen.map(([k, s, resident]) => [k, s === s1 ? 's1' : '-', resident]).sort(),
     [
-      ['/s#0:8', '-', true],
-      ['/s#0:8', 's1', true],
+      [`/s${S}0:8`, '-', true],
+      [`/s${S}0:8`, 's1', true],
     ]
   )
 })
@@ -241,27 +252,85 @@ test('a 416 turns range mode off and reads the whole object', async (t) => {
   assert.deepEqual(seen, ['/s'])
 })
 
-test('another range error reads the whole object once; range mode stays on', async () => {
-  const { base, calls } = rangeBase({ sizes: { '/s': 1000 }, mode: 'error' })
+const status = (code) => new Error(`Unexpected response status ${code} `)
+const network = () => new TypeError('Failed to fetch')
+const aborted = () => new DOMException('aborted', 'AbortError')
+
+for (const [label, err] of [
+  ['a 503', status(503)],
+  ['a 429', status(429)],
+  ['a short read', new Error('Short read: expected 10 bytes but received 4')],
+]) {
+  test(`${label} is retried once, then thrown: never a whole-object GET`, async () => {
+    const { base, calls } = rangeBase({
+      sizes: { '/s': 1000 },
+      fail: [err, err],
+      auto: true,
+    })
+    const store = rangeStore(base)
+    await assert.rejects(store.getRange('/s', { offset: 0, length: 5 }), err)
+    assert.deepEqual(
+      calls.map((c) => c.kind),
+      ['range', 'range']
+    )
+    assert.equal(store.rangeRequests, true)
+    assert.equal(store.size, 0)
+    // The next read tries a range again
+    const r = await store.getRange('/s', { offset: 0, length: 5 })
+    assert.deepEqual(r, expectedSlice(1000, { offset: 0, length: 5 }))
+    assert.equal(calls.at(-1).kind, 'range')
+  })
+}
+
+test('a transient error: the retry succeeds and is cached as a range', async () => {
+  const { base, calls } = rangeBase({
+    sizes: { '/s': 1000 },
+    fail: [status(502)],
+    auto: true,
+  })
   const store = rangeStore(base)
-  const p1 = store.getRange('/s', { offset: 0, length: 5 })
-  const p2 = store.getRange('/s', { offset: 5, length: 5 })
-  calls[0].resolveData()
-  calls[1].resolveData()
-  await tick()
-  // Both fall back onto one shared full get
-  const gets = calls.filter((c) => c.kind === 'get')
-  assert.equal(gets.length, 1)
-  gets[0].resolveData()
-  const [a, b] = await Promise.all([p1, p2])
-  assert.deepEqual(a, expectedSlice(1000, { offset: 0, length: 5 }))
-  assert.deepEqual(b, expectedSlice(1000, { offset: 5, length: 5 }))
-  assert.equal(store.rangeRequests, true)
-  assert.equal(store.getTotalBytes(), 1000)
+  const r = await store.getRange('/s', { offset: 10, length: 5 })
+  assert.deepEqual(r, expectedSlice(1000, { offset: 10, length: 5 }))
+  assert.equal(calls.length, 2)
+  assert.ok(store.has(`/s${S}10:5`))
 })
 
-test('when the fallback get fails too, its error reaches the caller and nothing is cached', async () => {
-  const { base, calls } = rangeBase({ sizes: { '/s': 1000 }, mode: 'error' })
+test('a network failure (TypeError) once: the retry succeeds, range mode stays on', async () => {
+  const { base, calls } = rangeBase({
+    sizes: { '/s': 1000 },
+    fail: [network()],
+    auto: true,
+  })
+  const store = rangeStore(base)
+  await store.getRange('/s', { offset: 0, length: 5 })
+  assert.deepEqual(
+    calls.map((c) => c.kind),
+    ['range', 'range']
+  )
+  assert.equal(store.rangeRequests, true)
+})
+
+test('a network failure (TypeError) twice (e.g. CORS): range mode off, one full GET', async (t) => {
+  const warn = t.mock.method(console, 'warn', () => {})
+  const { base, calls } = rangeBase({
+    sizes: { '/s': 1000 },
+    fail: [network(), network()],
+    auto: true,
+  })
+  const store = rangeStore(base)
+  const r = await store.getRange('/s', { offset: 0, length: 5 })
+  assert.deepEqual(r, expectedSlice(1000, { offset: 0, length: 5 }))
+  assert.deepEqual(
+    calls.map((c) => c.kind),
+    ['range', 'range', 'get']
+  )
+  assert.equal(store.rangeRequests, false)
+  assert.equal(warn.mock.callCount(), 1)
+})
+
+test('when the whole-object fallback fails too, its error reaches the caller', async (t) => {
+  t.mock.method(console, 'warn', () => {})
+  const { base, calls } = rangeBase({ sizes: { '/s': 1000 }, mode: '416' })
   const store = rangeStore(base)
   const p = store.getRange('/s', { offset: 0, length: 5 })
   calls[0].resolveData()
@@ -269,6 +338,33 @@ test('when the fallback get fails too, its error reaches the caller and nothing 
   calls[1].reject(new Error('still down'))
   await assert.rejects(p, /still down/)
   assert.equal(store.size, 0)
+})
+
+test('an AbortError the read did not ask for (a shared lower-level request) is retried', async () => {
+  const { base, calls } = rangeBase({
+    sizes: { '/s': 1000 },
+    fail: [aborted()],
+    auto: true,
+  })
+  const store = rangeStore(base)
+  const signal = new AbortController().signal
+  const r = await store.getRange('/s', { offset: 0, length: 5 }, { signal })
+  assert.deepEqual(r, expectedSlice(1000, { offset: 0, length: 5 }))
+  assert.equal(calls.length, 2)
+})
+
+test("a shard-index (suffix) read is not cancelled by its caller's abort", async () => {
+  const { base, calls } = rangeBase({ sizes: { '/s': 1000 } })
+  const store = rangeStore(base)
+  const c = new AbortController()
+  const p = store.getRange('/s', { suffixLength: 16 }, { signal: c.signal })
+  c.abort()
+  await tick()
+  assert.equal(calls[0].signal.aborted, false)
+  calls[0].resolveData()
+  // The caller still gets it (zarrita shares it with other chunk reads)
+  assert.equal((await p).byteLength, 16)
+  assert.ok(store.has(`/s${S}suffix:16`))
 })
 
 test('a missing object reads undefined and is not cached', async () => {
@@ -301,7 +397,7 @@ test('caching the whole object drops its range entries (no double counting)', as
   await store.getRange('/t', { offset: 0, length: 100 })
   assert.equal(store.getTotalBytes(), 220)
   await store.get('/s')
-  assert.deepEqual([...store.cache.keys()].sort(), ['/s', '/t#0:100'])
+  assert.deepEqual([...store.cache.keys()].sort(), ['/s', `/t${S}0:100`])
   assert.equal(store.getTotalBytes(), 1100)
 })
 
@@ -316,14 +412,14 @@ test('range entries are counted and evicted one by one (LRU)', async () => {
   await store.getRange('/s', { offset: 0, length: 100 })
   await store.getRange('/s', { offset: 300, length: 100 })
   assert.equal(store.getTotalBytes(), 300)
-  assert.ok(store.has('/s#0:100'))
-  assert.ok(!store.has('/s#100:100'))
-  assert.ok(store.has('/s#200:100'))
-  assert.ok(store.has('/s#300:100'))
+  assert.ok(store.has(`/s${S}0:100`))
+  assert.ok(!store.has(`/s${S}100:100`))
+  assert.ok(store.has(`/s${S}200:100`))
+  assert.ok(store.has(`/s${S}300:100`))
   // Shrinking the budget evicts range entries too
   store.setMaxBytes(100)
   assert.equal(store.getTotalBytes(), 100)
-  assert.deepEqual([...store.cache.keys()], ['/s#300:100'])
+  assert.deepEqual([...store.cache.keys()], [`/s${S}300:100`])
 })
 
 test('without getRange on the base store, or by default, getRange reads whole objects', async () => {
@@ -408,15 +504,15 @@ test('range entries are attributed to steps: cached, partial after eviction, est
     ...layer.timestepKeys.get(layer.stepKey(0, layer.currentSelection())).keys,
   ]
   assert.deepEqual(keys0.sort(), [
-    '/v/c/0#0:400',
-    '/v/c/0#400:400',
-    '/v/c/0#suffix:36',
+    `/v/c/0${S}0:400`,
+    `/v/c/0${S}400:400`,
+    `/v/c/0${S}suffix:36`,
   ])
   // The estimate uses each step's own range bytes (index shared: step 0 only
   // read it here, so it counts for step 0)
   assert.equal(layer.getEstimatedTimestepBytes(), (836 + 800) / 2)
   // Evicting one of step 1's chunks makes it partial
-  store.cache.delete('/v/c/0#1000:400')
+  store.cache.delete(`/v/c/0${S}1000:400`)
   store.totalBytes -= 400
   assert.deepEqual(layer.getCacheStatus([0, 1]), { 0: 'cached', 1: 'partial' })
 })

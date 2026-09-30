@@ -2927,7 +2927,12 @@ export class UntiledMode implements ZarrMode {
               createQueue: options.createQueue,
             })
           } catch (e) {
-            if ((e as Error).name === 'AbortError') aborted = true
+            // An AbortError while this step's own signal is live came from a
+            // shared lower-level read (not this step's abort): the step's
+            // key set is incomplete, so report it as a failed fetch
+            if ((e as Error).name === 'AbortError' && signal.aborted) {
+              aborted = true
+            }
             // Swallow other errors for prefetch — non-critical
             else options.onFetchError?.()
           }

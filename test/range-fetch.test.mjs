@@ -99,3 +99,141 @@ test('checkRangeResponses passes requests without Range through untouched', asyn
   const res = await f(new Request('http://example.invalid/x'))
   assert.equal(res.status, 200)
 })
+
+// ---- the real range-mode stack: createFetchStore + withRangeCoalescing ----
+
+const { createFetchStore } = await loadSrc('src/zarr-store.ts')
+const { withRangeCoalescing } = await loadSrc('src/range-coalescing.ts')
+
+// globalThis.fetch answering ranges of `body` after `delayMs`, honouring
+// the request's signal. `statusFor(n)` can force a status for request n.
+function stubGlobalFetch({ delayMs = 20, statusFor = () => null } = {}) {
+  const requests = []
+  const original = globalThis.fetch
+  globalThis.fetch = (request) => {
+    const n = requests.length
+    const entry = { range: request.headers.get('Range'), aborted: false }
+    requests.push(entry)
+    return new Promise((resolve, reject) => {
+      const signal = request.signal
+      const timer = setTimeout(() => {
+        const forced = statusFor(n)
+        if (forced) return resolve(new Response(null, { status: forced }))
+        const m = /^bytes=(\d*)-(\d*)$/.exec(entry.range)
+        const [start, end] =
+          m[1] === ''
+            ? [SIZE - Number(m[2]), SIZE - 1]
+            : [Number(m[1]), Number(m[2])]
+        resolve(new Response(body.slice(start, end + 1), { status: 206 }))
+      }, delayMs)
+      signal?.addEventListener('abort', () => {
+        entry.aborted = true
+        clearTimeout(timer)
+        reject(new DOMException('aborted', 'AbortError'))
+      })
+    })
+  }
+  return { requests, restore: () => (globalThis.fetch = original) }
+}
+
+async function realStack() {
+  const base = await zarr.extendStore(
+    createFetchStore('http://example.invalid/s.zarr', undefined, true),
+    (s) => withRangeCoalescing(s)
+  )
+  return new CachingStore(base, 100_000, { rangeRequests: true })
+}
+
+test('real stack: adjacent ranges read together go out as one coalesced request', async () => {
+  const net = stubGlobalFetch()
+  try {
+    const store = await realStack()
+    const [a, b] = await Promise.all([
+      store.getRange('/v/c/0', { offset: 0, length: 100 }),
+      store.getRange('/v/c/0', { offset: 100, length: 100 }),
+    ])
+    assert.deepEqual(a, body.slice(0, 100))
+    assert.deepEqual(b, body.slice(100, 200))
+    assert.deepEqual(
+      net.requests.map((r) => r.range),
+      ['bytes=0-199']
+    )
+    assert.equal(store.size, 2)
+  } finally {
+    net.restore()
+  }
+})
+
+test('real stack: aborting one coalesced read does not fail its sibling', async () => {
+  const net = stubGlobalFetch()
+  try {
+    const store = await realStack()
+    const a = new AbortController()
+    const b = new AbortController()
+    const pa = store.getRange(
+      '/v/c/0',
+      { offset: 0, length: 100 },
+      { signal: a.signal }
+    )
+    const pb = store.getRange(
+      '/v/c/0',
+      { offset: 100, length: 100 },
+      { signal: b.signal }
+    )
+    setTimeout(() => a.abort(), 5)
+    await assert.rejects(pa, { name: 'AbortError' })
+    assert.deepEqual(await pb, body.slice(100, 200))
+    assert.equal(net.requests.length, 1)
+    assert.equal(net.requests[0].aborted, false)
+  } finally {
+    net.restore()
+  }
+})
+
+test('real stack: when every read of a group aborts, the request is cancelled', async () => {
+  const net = stubGlobalFetch()
+  try {
+    const store = await realStack()
+    const a = new AbortController()
+    const b = new AbortController()
+    const pa = store.getRange(
+      '/v/c/0',
+      { offset: 0, length: 100 },
+      { signal: a.signal }
+    )
+    const pb = store.getRange(
+      '/v/c/0',
+      { offset: 100, length: 100 },
+      { signal: b.signal }
+    )
+    setTimeout(() => {
+      a.abort()
+      b.abort()
+    }, 5)
+    await assert.rejects(pa, { name: 'AbortError' })
+    await assert.rejects(pb, { name: 'AbortError' })
+    await new Promise((r) => setTimeout(r, 30))
+    assert.equal(net.requests[0].aborted, true)
+    assert.equal(store.size, 0)
+  } finally {
+    net.restore()
+  }
+})
+
+test('real stack: a 503 is retried once, then thrown; no whole-object GET', async () => {
+  const net = stubGlobalFetch({ statusFor: () => 503 })
+  try {
+    const store = await realStack()
+    await assert.rejects(
+      store.getRange('/v/c/0', { offset: 0, length: 100 }),
+      /503/
+    )
+    assert.deepEqual(
+      net.requests.map((r) => r.range),
+      ['bytes=0-99', 'bytes=0-99']
+    )
+    assert.equal(store.rangeRequests, true)
+  } finally {
+    net.restore()
+  }
+})

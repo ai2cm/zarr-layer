@@ -7,6 +7,7 @@ import {
   RangeNotSatisfiableError,
   validCacheBytes,
 } from './caching-store'
+import { withRangeCoalescing } from './range-coalescing'
 import type {
   Bounds,
   SpatialDimensions,
@@ -165,6 +166,11 @@ export const checkRangeResponses =
     const response = await inner(request)
     if (!request.headers.has('Range')) return response
     if (response.status === 200) {
+      // Kept even when bigger than the cache budget: this is exactly what
+      // whole-object mode downloads and keeps (the most recent entry is
+      // retained over budget), and dropping it would re-download the object
+      // for each of its inner chunks. A Range-dropping hop degrades to
+      // whole-object mode rather than failing (ace-viz task 46).
       const body = new Uint8Array(await response.arrayBuffer())
       throw new RangeIgnoredError(request.url, body)
     }
@@ -185,7 +191,7 @@ export const checkRangeResponses =
  * request instead of a HEAD plus a range, and range responses are checked
  * (see `checkRangeResponses`).
  */
-const createFetchStore = (
+export const createFetchStore = (
   url: string,
   transformRequest?: TransformRequest,
   rangeRequests: boolean = false
@@ -372,13 +378,15 @@ export class ZarrStore {
             : undefined
         // Range coalescing groups concurrent HTTP range requests into fewer
         // round-trips, reducing latency when fetching many tiles in parallel.
+        // Our own copy of zarrita's: a group is aborted only when all of its
+        // requests are, so one caller's abort never fails another's range.
         storePromise = zarr.extendStore(
           baseStore,
           (store) =>
             zarr
               .withMaybeConsolidatedMetadata(store, consolidatedOpts)
               .catch(() => store),
-          (store) => zarr.withRangeCoalescing(store)
+          (store) => withRangeCoalescing(store)
         ) as Promise<ZarrStoreType>
         if (!bypassCache) {
           ZarrStore._storeCache.set(storeCacheKey, storePromise)
