@@ -135,6 +135,10 @@ export class CachingStore implements AsyncReadable {
    * another, and a lone caller's abort still cancels the request. The
    * access listener fires once per caller that gets data, with that
    * caller's options.
+   *
+   * A base-store error (including a transient one) on a shared fetch
+   * rejects every caller waiting on it; nothing is cached, and the next
+   * get() starts a new fetch.
    */
   async get(
     key: AbsolutePath,
@@ -152,15 +156,13 @@ export class CachingStore implements AsyncReadable {
     const signal = opts?.signal
     if (signal?.aborted) throw abortError()
 
-    let fetch = this.inflight.get(key)
-    if (!fetch) fetch = this.startFetch(key, opts)
-    fetch.waiters++
+    const shared = this.inflight.get(key) ?? this.startFetch(key, opts)
+    shared.waiters++
 
     let result: Uint8Array | undefined
     if (!signal) {
-      result = await fetch.promise
+      result = await shared.promise
     } else {
-      const shared = fetch
       let onAbort: (() => void) | undefined
       try {
         result = await Promise.race([
@@ -194,13 +196,13 @@ export class CachingStore implements AsyncReadable {
    */
   private startFetch(key: AbsolutePath, opts?: GetOptions): InflightFetch {
     const controller = new AbortController()
-    const fetch: InflightFetch = {
+    const shared: InflightFetch = {
       promise: undefined as unknown as Promise<Uint8Array | undefined>,
       controller,
       waiters: 0,
       settled: false,
     }
-    fetch.promise = (async () => {
+    shared.promise = (async () => {
       try {
         const result = await this.baseStore.get(key, {
           ...opts,
@@ -209,15 +211,15 @@ export class CachingStore implements AsyncReadable {
         if (result !== undefined) this.store(key, result)
         return result
       } finally {
-        fetch.settled = true
-        if (this.inflight.get(key) === fetch) this.inflight.delete(key)
+        shared.settled = true
+        if (this.inflight.get(key) === shared) this.inflight.delete(key)
       }
     })()
     // Every waiter may have left (aborted); don't report the rejection as
     // unhandled
-    fetch.promise.catch(() => {})
-    this.inflight.set(key, fetch)
-    return fetch
+    shared.promise.catch(() => {})
+    this.inflight.set(key, shared)
+    return shared
   }
 
   /** Store an entry, replacing (and un-counting) any entry for the key. */
@@ -280,7 +282,10 @@ export class CachingStore implements AsyncReadable {
     return this.cache.size
   }
 
-  /** Clear all cached data. */
+  /**
+   * Clear all cached data. Fetches in flight are not cancelled: they still
+   * resolve their callers and store their entries when they land.
+   */
   clear(): void {
     this.cache.clear()
     this.totalBytes = 0

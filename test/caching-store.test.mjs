@@ -208,3 +208,38 @@ test('concurrent getRange reads of one shard make one base fetch', async () => {
   assert.deepEqual([a.byteLength, b.byteLength, c.byteLength], [4, 4, 2])
   assert.equal(store.getTotalBytes(), 16)
 })
+
+test('an abort after the caller got its data is a no-op', async () => {
+  const { base, calls } = manualBase({ sizes: { '/a': 50 } })
+  const store = new CachingStore(base, 10_000)
+  const c1 = new AbortController()
+  const p1 = store.get('/a', { signal: c1.signal })
+  const p2 = store.get('/a', { signal: new AbortController().signal })
+  calls[0].resolveData()
+  assert.equal((await p1).byteLength, 50)
+  c1.abort()
+  assert.equal((await p2).byteLength, 50)
+  assert.equal(calls[0].signal.aborted, false)
+  assert.equal(store.getTotalBytes(), 50)
+})
+
+test('an abort racing the settle: the caller rejects, the data is still cached once', async () => {
+  const { base, calls } = manualBase({ sizes: { '/a': 50 } })
+  const store = new CachingStore(base, 10_000)
+  const seen = []
+  store.addAccessListener((key) => seen.push(key))
+  const c1 = new AbortController()
+  const p1 = store.get('/a', { signal: c1.signal })
+  // The base request resolves, and the only caller aborts before the shared
+  // fetch's continuation has run
+  calls[0].resolveData()
+  c1.abort()
+  await assert.rejects(p1, { name: 'AbortError' })
+  await tick()
+  assert.deepEqual(seen, [], 'an aborted caller is not attributed')
+  assert.equal(store.size, 1)
+  assert.equal(store.getTotalBytes(), 50)
+  // A later get is a cache hit
+  await store.get('/a')
+  assert.equal(calls.length, 1)
+})
