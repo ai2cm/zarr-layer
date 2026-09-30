@@ -6,6 +6,7 @@ import {
   RangeIgnoredError,
   RangeNotSatisfiableError,
   RangeRateLimitedError,
+  RangeRefusedError,
   validCacheBytes,
 } from './caching-store'
 import { withRangeCoalescing } from './range-coalescing'
@@ -161,12 +162,38 @@ const transformedFetch =
  * body (the CachingStore keeps it as the whole object), a 416 throws
  * `RangeNotSatisfiableError`, a 429 `RangeRateLimitedError`. Requests
  * without a Range header pass through.
+ *
+ * A ranged request that fails at the network level (TypeError) is probed:
+ * the same URL as a plain HEAD (CORS-simple, no preflight). If the HEAD gets
+ * a response (other than a 429), the network is fine and the Range request
+ * itself is refused (e.g. a CORS preflight that doesn't allow Range):
+ * `RangeRefusedError`. If the HEAD fails too, or is rate-limited, it is a
+ * dropout: the original TypeError is rethrown (and retried by the caller).
+ * The probe only runs on errors; on HF it is one more resolver request.
  */
 export const checkRangeResponses =
   (inner: (request: Request) => Promise<Response>) =>
   async (request: Request): Promise<Response> => {
-    const response = await inner(request)
-    if (!request.headers.has('Range')) return response
+    const ranged = request.headers.has('Range')
+    let response: Response
+    try {
+      response = await inner(request)
+    } catch (err) {
+      const name = (err as { name?: unknown } | null)?.name
+      if (!ranged || name !== 'TypeError' || request.signal?.aborted) throw err
+      let probe: Response
+      try {
+        probe = await inner(
+          new Request(request.url, { method: 'HEAD', signal: request.signal })
+        )
+      } catch {
+        throw err
+      }
+      await probe.body?.cancel().catch(() => {})
+      if (probe.status === 429) throw err
+      throw new RangeRefusedError(request.url)
+    }
+    if (!ranged) return response
     if (response.status === 200) {
       // Kept even when bigger than the cache budget: this is exactly what
       // whole-object mode downloads and keeps (the most recent entry is

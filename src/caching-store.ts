@@ -77,7 +77,9 @@ export function rangeCacheKey(key: string, range: RangeQuery): string {
  */
 export const RANGE_RETRY_DELAY_MS = 250
 
-const retryDelayMs = () => RANGE_RETRY_DELAY_MS * (1 + 2 * Math.random())
+/** The default retry delay (see RANGE_RETRY_DELAY_MS). */
+export const jitteredRetryDelayMs = (): number =>
+  RANGE_RETRY_DELAY_MS * (1 + 2 * Math.random())
 
 /** Wait `ms`, rejecting with an AbortError if `signal` aborts first. */
 function delay(ms: number, signal: AbortSignal): Promise<void> {
@@ -133,6 +135,20 @@ export class RangeRateLimitedError extends Error {
   }
 }
 
+/**
+ * Thrown by a range-capable fetch when a ranged request failed at the
+ * network level (TypeError) but the same URL answers a plain HEAD: the Range
+ * header itself is refused (e.g. a CORS preflight that does not allow it, or
+ * a proxy that drops such requests). See `checkRangeResponses`. A TypeError
+ * that is not this is a network failure (dropout) and is retried.
+ */
+export class RangeRefusedError extends Error {
+  constructor(url: string) {
+    super(`Range request refused (network error, plain HEAD works): ${url}`)
+    this.name = 'RangeRefusedError'
+  }
+}
+
 export interface CachingStoreOptions {
   /**
    * Read byte ranges with range requests to the base store (its `getRange`)
@@ -141,6 +157,11 @@ export interface CachingStoreOptions {
    * the server ignores (200) or rejects (416) a range; see `getRange`.
    */
   rangeRequests?: boolean
+  /**
+   * Delay before the one retry of a failed range read, in ms. Default:
+   * `jitteredRetryDelayMs` (250–750 ms). Tests pass `() => 0`.
+   */
+  retryDelayMs?: () => number
 }
 
 /** A base-store fetch shared by every concurrent miss on one cache key. */
@@ -199,13 +220,7 @@ export class CachingStore implements AsyncReadable {
   private _rangeRequests: boolean
   /** Whether any range entry was ever stored (see dropRangesOf). */
   private usedRanges: boolean = false
-  /**
-   * Whether a range read has ever succeeded on this store. Until then, a
-   * network-level failure on both attempts reads as "ranges refused" (e.g.
-   * a CORS preflight rejecting Range); after, it is a dropout like a 5xx.
-   * Not reset by clear(): it describes the server, not the cache.
-   */
-  private rangeWorked: boolean = false
+  private readonly retryDelayMs: () => number
 
   constructor(
     baseStore: AsyncReadable,
@@ -218,6 +233,7 @@ export class CachingStore implements AsyncReadable {
     this._maxBytes = validCacheBytes(maxBytes) ?? DEFAULT_CHUNK_CACHE_BYTES
     this._rangeRequests =
       !!options.rangeRequests && typeof baseStore.getRange === 'function'
+    this.retryDelayMs = options.retryDelayMs ?? jitteredRetryDelayMs
   }
 
   /** Current byte budget. */
@@ -447,15 +463,15 @@ export class CachingStore implements AsyncReadable {
    *   `RangeIgnoredError`, or more bytes than asked for from a base store
    *   that does not throw it): the body is cached as the object's entry and
    *   sliced, and range mode turns off for this store.
-   * - 416 (`RangeNotSatisfiableError`), or a network-level failure
-   *   (TypeError, e.g. a CORS rejection) on two attempts before any range
-   *   read on this store has succeeded: range mode turns off, and the object
-   *   is fetched whole. Once a range has worked, a TypeError is a dropout
-   *   (or a 429 without CORS headers) and is handled like a 5xx.
+   * - 416 (`RangeNotSatisfiableError`), or `RangeRefusedError` (the ranged
+   *   request failed at the network level while a plain HEAD of the same
+   *   URL works, e.g. a CORS preflight that refuses Range): range mode turns
+   *   off, and the object is fetched whole.
    * - 429 (`RangeRateLimitedError`): thrown at once, not retried.
-   * - Any other error (5xx, a short read, an AbortError the read did not
-   *   ask for): retried once after a jittered delay (see
-   *   `RANGE_RETRY_DELAY_MS`), then thrown.
+   * - Any other error (5xx, a short read, a network failure (TypeError:
+   *   the HEAD probe failed too, so it is a dropout, not a refusal), an
+   *   AbortError the read did not ask for): retried once after
+   *   `retryDelayMs` (jittered, see `RANGE_RETRY_DELAY_MS`), then thrown.
    *   Never a whole-object download: that would be a whole shard, which can
    *   be bigger than the cache.
    * Aborts of the read itself are rethrown, never retried. A suffix (shard
@@ -524,19 +540,17 @@ export class CachingStore implements AsyncReadable {
           return this.useWhole(key, body, range)
         }
         const name = errorName(err)
+        // Shown unsupported: a 416, or a Range-specific network refusal
+        // (checkRangeResponses probed the URL without Range). A bare
+        // TypeError is a dropout and is retried below: disabling ranges for
+        // it would make every later read a whole-shard GET.
         const unsupported =
-          name === 'RangeNotSatisfiableError' ||
-          // A network-level failure twice in a row (e.g. a CORS preflight
-          // that rejects the Range header; a blip passes on the retry), and
-          // only while no range has ever worked here: afterwards it is a
-          // dropout, and turning ranges off for good would make every later
-          // read a whole-shard GET
-          (name === 'TypeError' && attempt > 0 && !this.rangeWorked)
+          name === 'RangeNotSatisfiableError' || name === 'RangeRefusedError'
         if (unsupported) {
           this.disableRangeRequests(
             key,
-            name === 'TypeError'
-              ? 'failed twice (network/CORS)'
+            name === 'RangeRefusedError'
+              ? 'was refused (network error; plain HEAD works)'
               : 'was rejected (416)'
           )
           // Its errors reach the caller
@@ -555,7 +569,7 @@ export class CachingStore implements AsyncReadable {
         // cache). Callers retry later: a prefetch step reports the failure
         // and is refetched, a render refetches.
         if (attempt > 0) throw err
-        await delay(retryDelayMs(), opts.signal)
+        await delay(this.retryDelayMs(), opts.signal)
       }
     }
     if (data === undefined) return undefined
@@ -566,7 +580,6 @@ export class CachingStore implements AsyncReadable {
       return this.useWhole(key, data, range)
     }
     this.usedRanges = true
-    this.rangeWorked = true
     this.store(rangeKey, data)
     return { data, cacheKey: rangeKey }
   }

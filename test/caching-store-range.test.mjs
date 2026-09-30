@@ -11,6 +11,7 @@ const {
   RangeIgnoredError,
   RangeNotSatisfiableError,
   RangeRateLimitedError,
+  RangeRefusedError,
   RANGE_KEY_SEPARATOR: S,
   rangeCacheKey,
 } = await loadSrc('src/caching-store.ts')
@@ -84,7 +85,10 @@ function rangeBase({
 }
 
 const rangeStore = (base, maxBytes = 10_000) =>
-  new CachingStore(base, maxBytes, { rangeRequests: true })
+  new CachingStore(base, maxBytes, {
+    rangeRequests: true,
+    retryDelayMs: () => 0,
+  })
 
 test('range mode reads a range with getRange and caches it under its range key', async () => {
   const { base, calls } = rangeBase({ sizes: { '/s': 1000 }, auto: true })
@@ -346,11 +350,29 @@ test('a network failure (TypeError) once: the retry succeeds, range mode stays o
   assert.equal(store.rangeRequests, true)
 })
 
-test('a network failure (TypeError) twice before any range worked (e.g. CORS): range mode off, one full GET', async (t) => {
-  const warn = t.mock.method(console, 'warn', () => {})
+test('a bare network failure (TypeError) twice on a fresh store is a dropout: thrown, range mode stays on', async () => {
+  // e.g. offline at page load or right after a variable switch
   const { base, calls } = rangeBase({
     sizes: { '/s': 1000 },
     fail: [network(), network()],
+    auto: true,
+  })
+  const store = rangeStore(base)
+  await assert.rejects(store.getRange('/s', { offset: 0, length: 5 }), {
+    name: 'TypeError',
+  })
+  assert.equal(store.rangeRequests, true)
+  assert.equal(calls.filter((c) => c.kind === 'get').length, 0)
+  // Back online: the next read is a range
+  await store.getRange('/s', { offset: 0, length: 5 })
+  assert.equal(calls.at(-1).kind, 'range')
+})
+
+test('RangeRefusedError (Range refused, plain HEAD works): range mode off, one full GET', async (t) => {
+  const warn = t.mock.method(console, 'warn', () => {})
+  const { base, calls } = rangeBase({
+    sizes: { '/s': 1000 },
+    fail: [new RangeRefusedError('/s')],
     auto: true,
   })
   const store = rangeStore(base)
@@ -358,7 +380,7 @@ test('a network failure (TypeError) twice before any range worked (e.g. CORS): r
   assert.deepEqual(r, expectedSlice(1000, { offset: 0, length: 5 }))
   assert.deepEqual(
     calls.map((c) => c.kind),
-    ['range', 'range', 'get']
+    ['range', 'get']
   )
   assert.equal(store.rangeRequests, false)
   assert.equal(warn.mock.callCount(), 1)

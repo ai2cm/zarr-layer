@@ -141,7 +141,40 @@ async function realStack() {
     createFetchStore('http://example.invalid/s.zarr', undefined, true),
     (s) => withRangeCoalescing(s)
   )
-  return new CachingStore(base, 100_000, { rangeRequests: true })
+  return new CachingStore(base, 100_000, {
+    rangeRequests: true,
+    retryDelayMs: () => 0,
+  })
+}
+
+// globalThis.fetch for the probe tests: ranged GETs fail at the network
+// level; a HEAD (the probe) answers 200 when `headWorks`, else fails too.
+// A plain GET answers the whole body.
+function stubRangeRefusal({ headWorks }) {
+  const requests = []
+  const original = globalThis.fetch
+  let offline = true
+  globalThis.fetch = async (request) => {
+    const range = request.headers.get('Range')
+    requests.push({ method: request.method, range })
+    if (!offline) {
+      if (!range) return new Response(body, { status: 200 })
+      const [s, e] = /bytes=(\d+)-(\d+)/.exec(range).slice(1).map(Number)
+      return new Response(body.slice(s, e + 1), { status: 206 })
+    }
+    if (range) throw new TypeError('Failed to fetch')
+    if (request.method === 'HEAD') {
+      if (headWorks) return new Response(null, { status: 200 })
+      throw new TypeError('Failed to fetch')
+    }
+    if (headWorks) return new Response(body, { status: 200 })
+    throw new TypeError('Failed to fetch')
+  }
+  return {
+    requests,
+    online: () => (offline = false),
+    restore: () => (globalThis.fetch = original),
+  }
 }
 
 test('real stack: adjacent ranges read together go out as one coalesced request', async () => {
@@ -257,7 +290,10 @@ test('real stack: a network dropout after ranges worked keeps range mode (no who
   const online = globalThis.fetch
   globalThis.fetch = (request) =>
     offline
-      ? (net.requests.push({ range: request.headers.get('Range') }),
+      ? (net.requests.push({
+          method: request.method,
+          range: request.headers.get('Range'),
+        }),
         Promise.reject(new TypeError('Failed to fetch')))
       : online(request)
   try {
@@ -273,7 +309,7 @@ test('real stack: a network dropout after ranges worked keeps range mode (no who
     const r = await store.getRange('/v/c/0', { offset: 200, length: 100 })
     assert.deepEqual(r, body.slice(200, 300))
     assert.ok(
-      net.requests.every((q) => q.range !== null),
+      net.requests.every((q) => q.method === 'HEAD' || q.range !== null),
       'no whole GET'
     )
   } finally {
@@ -298,6 +334,48 @@ test('coalescing: a read aborted before the flush does not widen the group', asy
     assert.deepEqual(
       net.requests.map((r) => r.range),
       ['bytes=0-99']
+    )
+  } finally {
+    net.restore()
+  }
+})
+
+test('real stack: offline on a fresh store (range and HEAD probe fail) keeps range mode, no whole GET', async () => {
+  const net = stubRangeRefusal({ headWorks: false })
+  try {
+    const store = await realStack()
+    await assert.rejects(store.getRange('/v/c/0', { offset: 0, length: 100 }), {
+      name: 'TypeError',
+    })
+    assert.equal(store.rangeRequests, true)
+    assert.deepEqual(
+      net.requests.map((r) => `${r.method} ${r.range}`),
+      ['GET bytes=0-99', 'HEAD null', 'GET bytes=0-99', 'HEAD null']
+    )
+    net.online()
+    const r = await store.getRange('/v/c/0', { offset: 0, length: 100 })
+    assert.deepEqual(r, body.slice(0, 100))
+    assert.equal(net.requests.at(-1).range, 'bytes=0-99')
+    assert.ok(
+      net.requests.every((q) => q.method === 'HEAD' || q.range !== null),
+      'no whole GET'
+    )
+  } finally {
+    net.restore()
+  }
+})
+
+test('real stack: Range refused but a plain HEAD works: RangeRefusedError, whole-object mode', async (t) => {
+  t.mock.method(console, 'warn', () => {})
+  const net = stubRangeRefusal({ headWorks: true })
+  try {
+    const store = await realStack()
+    const r = await store.getRange('/v/c/0', { offset: 0, length: 100 })
+    assert.deepEqual(r, body.slice(0, 100))
+    assert.equal(store.rangeRequests, false)
+    assert.deepEqual(
+      net.requests.map((q) => `${q.method} ${q.range}`),
+      ['GET bytes=0-99', 'HEAD null', 'GET null']
     )
   } finally {
     net.restore()
