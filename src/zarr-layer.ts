@@ -119,6 +119,16 @@ interface StepKeys {
   measuredKeys: Set<string> | null
   /** Order in which `measuredKeys` was set (higher = more recent). */
   measuredSeq: number
+  /**
+   * Keys of the step's latest completed fetch, or null while none has
+   * completed: a prefetch that ran to completion (its key set, as
+   * `measuredKeys`), or a render of the displayed step that the mode
+   * reported fully rendered (see `handleViewComplete`).
+   * The step reads as 'cached' only when this is set and all of it is
+   * resident, so a step aborted partway (whose `keys` are all resident but
+   * incomplete) reads 'partial' and is fetched again.
+   */
+  completeKeys: Set<string> | null
 }
 
 export class ZarrLayer {
@@ -264,6 +274,12 @@ export class ZarrLayer {
     AbortSignal,
     { timeIndex: number; selection: string; keys: Set<string> }
   > = new WeakMap()
+  /**
+   * Non-prefetch reads attributed to the displayed step since it became
+   * displayed (see handleViewComplete). `step` is the stepKey they were
+   * attributed to; a read for another step restarts the set.
+   */
+  private displayedReads: { step: string; keys: Set<string> } | null = null
   /** Memoized currentSelection(); reset when the selector or time dim changes. */
   private selectionCache: string | null = null
   /** Disposer for the continuous CachingStore access listener. */
@@ -515,6 +531,34 @@ export class ZarrLayer {
     this.emitLoadingState()
   }
 
+  /**
+   * The mode reports that the current view of the displayed step is fully
+   * rendered (every visible region or tile holds data for the current
+   * selector; see `ZarrMode.setViewCompleteCallback`). A region that failed
+   * or was aborted is not rendered for the current selector, so an
+   * interrupted render never gets here; nor does a throttled one until its
+   * fetch lands. It does get here for a redisplay served from the mode's
+   * own caches, which makes no store reads.
+   *
+   * Counts as a completed fetch of the displayed step: its complete set
+   * becomes the earlier complete set (or, if none, every key recorded for
+   * the step: a conservative stand-in, since a redisplay from the mode's
+   * caches reads nothing) plus the reads made while it was displayed.
+   */
+  private handleViewComplete = (): void => {
+    if (this.initError) return
+    const timeIdx = this.getCurrentTimeIdx()
+    if (timeIdx === null) return
+    const step = this.stepKey(timeIdx, this.currentSelection())
+    const entry = this.timestepKeys.get(step)
+    if (!entry) return
+    const complete = new Set(entry.completeKeys ?? entry.keys)
+    if (this.displayedReads?.step === step) {
+      for (const key of this.displayedReads.keys) complete.add(key)
+    }
+    entry.completeKeys = complete
+  }
+
   setOpacity(opacity: number) {
     this.opacity = opacity
     this.invalidate()
@@ -563,6 +607,7 @@ export class ZarrLayer {
       this.removeAccessListener = null
       this.prefetchQueue.clear()
       this.timestepKeys.clear()
+      this.displayedReads = null
       this.keyBytes.clear()
       if (this.zarrStore) {
         this.zarrStore.cleanup()
@@ -591,6 +636,7 @@ export class ZarrLayer {
       this.removeAccessListener = null
       this.prefetchQueue.clear()
       this.timestepKeys.clear()
+      this.displayedReads = null
       this.keyBytes.clear()
       if (this.zarrStore) {
         this.zarrStore.cleanup()
@@ -729,6 +775,8 @@ export class ZarrLayer {
         if (entry) {
           entry.measuredKeys = keys
           entry.measuredSeq = ++this.measureCount
+          // Exactly the step's chunks for the regions in view
+          entry.completeKeys = keys
         }
       }
       return done !== false
@@ -761,7 +809,13 @@ export class ZarrLayer {
     }
     const timeIdx = this.getCurrentTimeIdx()
     if (timeIdx !== null) {
-      this.recordChunkAccess(timeIdx, this.currentSelection(), cacheKey)
+      const selection = this.currentSelection()
+      this.recordChunkAccess(timeIdx, selection, cacheKey)
+      const step = this.stepKey(timeIdx, selection)
+      if (this.displayedReads?.step !== step) {
+        this.displayedReads = { step, keys: new Set() }
+      }
+      this.displayedReads.keys.add(cacheKey)
     }
   }
 
@@ -780,6 +834,7 @@ export class ZarrLayer {
         keys: new Set(),
         measuredKeys: null,
         measuredSeq: 0,
+        completeKeys: null,
       }
       this.timestepKeys.set(key, entry)
     }
@@ -810,8 +865,11 @@ export class ZarrLayer {
   /**
    * Get cache status for multiple time step indices, for the current values
    * of the other selector dims (e.g. the selected ensemble member).
-   * Returns 'cached' (all recorded chunks resident), 'partial' (some
-   * resident), or 'missing' (none resident or never fetched).
+   * Returns 'cached' when a fetch of the step completed (a prefetch, or a
+   * render of it while displayed) and all of that fetch's chunks are still
+   * resident; 'partial' when some of the step's recorded chunks are resident
+   * but it is not 'cached' (e.g. a prefetch aborted partway, or an evicted
+   * chunk); 'missing' when none are resident or it was never fetched.
    */
   getCacheStatus(
     timeIndices: number[]
@@ -820,23 +878,37 @@ export class ZarrLayer {
     const cachingStore = this.zarrStore?.cachingStore ?? null
     const selection = this.currentSelection()
     for (const idx of timeIndices) {
-      const keys = this.timestepKeys.get(this.stepKey(idx, selection))?.keys
-      if (!keys || keys.size === 0) {
+      const entry = this.timestepKeys.get(this.stepKey(idx, selection))
+      const keys = entry?.keys
+      if (!entry || !keys || keys.size === 0) {
         result[idx] = 'missing'
         continue
       }
+      const complete = entry.completeKeys
       if (!cachingStore) {
-        // No byte cache configured — recorded keys are our only signal.
-        result[idx] = 'cached'
+        // Unreachable in practice: keys are recorded by the CachingStore's
+        // access listener, so without a cache no step has keys.
+        result[idx] = complete ? 'cached' : 'partial'
         continue
+      }
+      if (complete) {
+        let all = true
+        for (const key of complete) {
+          if (!cachingStore.has(key)) {
+            all = false
+            break
+          }
+        }
+        if (all) {
+          result[idx] = 'cached'
+          continue
+        }
       }
       let hits = 0
       for (const key of keys) {
         if (cachingStore.has(key)) hits++
       }
-      if (hits === keys.size) result[idx] = 'cached'
-      else if (hits === 0) result[idx] = 'missing'
-      else result[idx] = 'partial'
+      result[idx] = hits === 0 ? 'missing' : 'partial'
     }
     return result
   }
@@ -1132,6 +1204,7 @@ export class ZarrLayer {
     this.dataScaleLocked = true
 
     this.mode.setLoadingCallback(this.handleChunkLoadingChange)
+    this.mode.setViewCompleteCallback?.(this.handleViewComplete)
     await this.mode.initialize()
 
     if (this.map && this.gl) {
