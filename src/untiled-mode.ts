@@ -96,6 +96,7 @@ import {
   createErrorRetryState,
   scheduleErrorRetry,
   errorRetrySucceeded,
+  errorRetryViewChanged,
   clearErrorRetry,
 } from './mode-utils'
 import { setupBandTextureUniforms, uploadDataTexture } from './render-helpers'
@@ -1735,6 +1736,8 @@ export class UntiledMode implements ZarrMode {
       .map((r) => `${r.regionX},${r.regionY}`)
       .join('|')}`
     const viewportChanged = viewportHash !== this.lastViewportHash
+    // A new view (pan, zoom, time step): failed regions get fresh retries
+    if (viewportChanged) errorRetryViewChanged(this.errorRetry)
     this.lastViewportHash = viewportHash
 
     // If we restored any regions from cache, trigger a repaint
@@ -2145,13 +2148,13 @@ export class UntiledMode implements ZarrMode {
       // checkViewComplete does not count it (the guard above ran with no
       // await since, so no newer fetch can have landed in between)
       region.selectorVersion = fetchSelectorVersion
-      errorRetrySucceeded(this.errorRetry)
+      errorRetrySucceeded(this.errorRetry, key)
 
       this.invalidate()
     } catch (err) {
       if (!(err instanceof DOMException && err.name === 'AbortError')) {
         console.error(`[fetchRegion] Error fetching region ${key}:`, err)
-        this.scheduleRetryAfterError()
+        this.scheduleRetryAfterError(key)
       }
     } finally {
       region.loading = false
@@ -2987,11 +2990,12 @@ export class UntiledMode implements ZarrMode {
   /**
    * A render read failed (not aborted): refetch after a backoff (task 44).
    * A paused map would otherwise keep the region blank until the next pan,
-   * zoom or time change. Reports chunks loading until the retry runs.
+   * zoom or time change. Reports chunks loading until the retry runs;
+   * after ERROR_RETRY_MAX_CYCLES cycles in one view it stops (mode-utils).
    */
-  private scheduleRetryAfterError(): void {
+  private scheduleRetryAfterError(key: string): void {
     if (this.isRemoved) return
-    scheduleErrorRetry(this.errorRetry, () => {
+    scheduleErrorRetry(this.errorRetry, key, () => {
       if (this.isRemoved) return
       this.loadingManager.chunksLoading = hasActiveRequests(
         this.requestCanceller

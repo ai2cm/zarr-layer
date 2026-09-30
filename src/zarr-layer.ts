@@ -134,6 +134,8 @@ interface StepKeys {
 
 /** Largest shard batch (time steps) the prefetch queue starts together. */
 export const MAX_PREFETCH_BATCH = 16
+/** Default `prefetchBatchSteps`. */
+export const DEFAULT_PREFETCH_BATCH_STEPS = 4
 
 export class ZarrLayer {
   readonly type: 'custom' = 'custom'
@@ -246,6 +248,8 @@ export class ZarrLayer {
    * Earlier-started (higher-priority) steps get free slots first.
    */
   private readonly prefetchLimiter: RequestLimiter
+  /** Most steps per prefetch batch (`prefetchBatchSteps`). */
+  private readonly prefetchBatchSteps: number
   /**
    * CachingStore cache keys per step, where a step is a time index *plus*
    * the values of the other non-spatial selector dims (the "selection", e.g.
@@ -412,6 +416,7 @@ export class ZarrLayer {
     prefetchMaxRequests,
     maxRequestsPerSecond,
     requestBurst,
+    prefetchBatchSteps,
   }: ZarrLayerOptions) {
     if (!id) {
       throw new Error('[ZarrLayer] id is required')
@@ -520,6 +525,10 @@ export class ZarrLayer {
         burst: requestBurst,
       })
     }
+    this.prefetchBatchSteps = normalizeConcurrency(
+      prefetchBatchSteps,
+      DEFAULT_PREFETCH_BATCH_STEPS
+    )
     this.prefetchLimiter = new RequestLimiter(requests)
     this.prefetchQueue = new PrefetchQueue({
       fetchStep: (timeIdx, timeDimName, signal, info) =>
@@ -741,11 +750,16 @@ export class ZarrLayer {
   getPrefetchBatchSize(): number {
     const store = this.zarrStore
     if (!store?.shards || !store.cachingStore?.rangeRequests) return 1
+    // Not in the bootstrap window: batch once a step has been measured
+    if (this.getEstimatedTimestepBytes() === null) return 1
     const timeIdx = store.dimensions.indexOf(this.prefetchTimeDimName)
-    const size = timeIdx === -1 ? 1 : store.shards[timeIdx]
-    return Number.isInteger(size) && size >= 2 && size <= MAX_PREFETCH_BATCH
-      ? size
-      : 1
+    let size = timeIdx === -1 ? 1 : store.shards[timeIdx]
+    if (!Number.isInteger(size) || size > MAX_PREFETCH_BATCH) return 1
+    // At most prefetchBatchSteps: halve an even shard extent (Morton order
+    // keeps each aligned half of a shard's steps contiguous, e.g. steps 0-1
+    // and 2-3 of a 4-step shard)
+    while (size > this.prefetchBatchSteps && size % 2 === 0) size /= 2
+    return size >= 2 && size <= this.prefetchBatchSteps ? size : 1
   }
 
   /**

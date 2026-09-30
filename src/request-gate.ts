@@ -15,8 +15,9 @@
  *   others follow once it succeeds (a failed probe starts a longer
  *   cooldown). The rate-limited request itself is retried after the
  *   cooldown, so callers see a slow read, not an error, and a render keeps
- *   showing its loading state. Waiting ends early only when the request's
- *   signal aborts. JS can't read the reset time (HF doesn't expose its
+ *   showing its loading state. Waiting ends early when the request's
+ *   signal aborts; after `RATE_LIMIT_GIVE_UP_MS` (6 min) the read fails
+ *   with `RangeRateLimitedError`. JS can't read the reset time (HF doesn't expose its
  *   `ratelimit` headers to CORS), hence the backoff.
  *
  * A 429 that arrives without CORS headers reaches JS as a network
@@ -30,6 +31,8 @@
  * told apart at this level.
  */
 
+import { RangeRateLimitedError } from './caching-store'
+
 export interface RequestGateOptions {
   /** Token-bucket rate; undefined / invalid / <= 0: no cap. */
   maxRequestsPerSecond?: number
@@ -42,6 +45,12 @@ export interface RequestGateOptions {
 export const DEFAULT_REQUEST_BURST = 10
 export const RATE_LIMIT_BACKOFF_MS = 2000
 export const RATE_LIMIT_MAX_BACKOFF_MS = 30000
+/**
+ * A request still rate-limited after this long (from its first attempt)
+ * fails with `RangeRateLimitedError` instead of retrying on: longer than
+ * one 5-minute fixed window plus the longest cooldown.
+ */
+export const RATE_LIMIT_GIVE_UP_MS = 6 * 60 * 1000
 
 /** How a request that went through the gate ended. */
 export type GateOutcome = 'ok' | 'rate-limited' | 'error'
@@ -49,6 +58,13 @@ export type GateOutcome = 'ok' | 'rate-limited' | 'error'
 export interface GateTicket {
   /** The one request allowed out while recovering from a 429. */
   probe: boolean
+  /**
+   * The gate's limit epoch when the ticket was issued (bumped by every
+   * 429). Only the probe, or a ticket issued after the latest 429, can end
+   * the rate-limited state with a success: a request that left before the
+   * 429 and answers 200 afterwards says nothing about the limit now.
+   */
+  epoch: number
 }
 
 interface Waiter {
@@ -77,6 +93,7 @@ export class RequestGate {
   private limited = false
   private probing = false
   private backoffMs = 0
+  private limitEpoch = 0
   private readonly now: () => number
   private readonly random: () => number
   /** Counters, for tests and debugging. */
@@ -152,11 +169,14 @@ export class RequestGate {
   done(ticket: GateTicket, outcome: GateOutcome): void {
     if (ticket.probe) this.probing = false
     if (outcome === 'ok') {
-      this.limited = false
-      this.backoffMs = 0
+      if (ticket.probe || ticket.epoch === this.limitEpoch) {
+        this.limited = false
+        this.backoffMs = 0
+      }
     } else if (outcome === 'rate-limited') {
       this.stats.rateLimited++
       this.limited = true
+      this.limitEpoch++
       const now = this.now()
       // Several requests in flight when the limit hit each get a 429:
       // one cooldown, not one doubling per request
@@ -204,7 +224,7 @@ export class RequestGate {
       const probe = this.limited
       if (probe) this.probing = true
       this.stats.requests++
-      waiter.resolve({ probe })
+      waiter.resolve({ probe, epoch: this.limitEpoch })
     }
   }
 
@@ -271,14 +291,20 @@ export function resetRequestGates(): void {
 /**
  * Wrap a fetch so every request goes through its origin's gate: waits for
  * its turn, and a 429 is retried after the cooldown (see the module
- * comment) until it succeeds or the request's signal aborts.
+ * comment) until it succeeds, the request's signal aborts, or `giveUpMs`
+ * (default 6 min) has passed (then `RangeRateLimitedError`).
  */
 export function gatedFetch(
   inner: (request: Request) => Promise<Response>,
-  gateFor: (url: string) => RequestGate = requestGateFor
+  gateFor: (url: string) => RequestGate = requestGateFor,
+  {
+    giveUpMs = RATE_LIMIT_GIVE_UP_MS,
+    now = () => Date.now(),
+  }: { giveUpMs?: number; now?: () => number } = {}
 ): (request: Request) => Promise<Response> {
   return async (request: Request) => {
     const gate = gateFor(request.url)
+    const start = now()
     for (;;) {
       const ticket = await gate.acquire(request.signal)
       let response: Response
@@ -296,6 +322,10 @@ export function gatedFetch(
         // Drain, so the connection can be reused
         await response.body?.cancel().catch(() => {})
         gate.done(ticket, 'rate-limited')
+        // Past a whole HF window (5 min) plus a cooldown: fail the read
+        if (now() - start >= giveUpMs) {
+          throw new RangeRateLimitedError(request.url)
+        }
         continue
       }
       // Any other answer: the server is not rate-limiting us

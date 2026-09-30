@@ -63,7 +63,7 @@ interface TilesOptions {
    * Called when a tile's read fails (not aborted), so the mode can schedule
    * a delayed refetch (task 44).
    */
-  onFetchError?: () => void
+  onFetchError?: (tileKey: string) => void
 }
 
 /**
@@ -81,7 +81,7 @@ export class Tiles {
   private bandNames: string[]
   private gl: WebGL2RenderingContext | null = null
   private fixedDataScale: number
-  private onFetchError: (() => void) | undefined
+  private onFetchError: ((tileKey: string) => void) | undefined
 
   constructor({
     store,
@@ -756,7 +756,7 @@ export class Tiles {
         return null
       }
       console.error('Error fetching tile data:', err)
-      this.onFetchError?.()
+      this.onFetchError?.(tileToKey(tileTuple))
       return null
     }
   }

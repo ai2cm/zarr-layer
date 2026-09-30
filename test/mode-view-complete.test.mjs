@@ -72,7 +72,7 @@ function untiled(overrides = {}) {
     checkViewComplete: P.checkViewComplete,
     invalidate() {},
     // Task 44: delayed refetch after a failed read (no-op here)
-    errorRetry: { timer: null, failures: 0 },
+    errorRetry: { timer: null, failures: 0, failedKeys: new Set() },
     scheduleRetryAfterError() {},
     fetched: [],
     fetchRegions(regions) {
@@ -258,7 +258,7 @@ test('TiledMode fetchTileData: reports once the last visible tile lands; a faile
     requestCanceller: { controllers: new Map() },
     emitLoadingState() {},
     invalidate() {},
-    errorRetry: { timer: null, failures: 0 },
+    errorRetry: { timer: null, failures: 0, failedKeys: new Set() },
     checkViewComplete: TiledMode.prototype.checkViewComplete,
     tileCache: {
       get: (k) => tiles.get(k),

@@ -103,6 +103,12 @@ export interface PrefetchQueueOptions {
    */
   batchSize?: () => number
   /**
+   * Steps at the front of the window (window positions below this) are
+   * never batched: they start alone, as soon as a slot is free. Default
+   * `DEFAULT_BATCH_NEAR_STEPS` (8).
+   */
+  batchNearSteps?: number
+  /**
    * Called when `busy` changes: true when the queue starts working through
    * steps, false once nothing is in flight or pending.
    */
@@ -128,6 +134,8 @@ interface InFlight {
 }
 
 export const DEFAULT_PREFETCH_CONCURRENCY = 4
+/** Default `batchNearSteps`. */
+export const DEFAULT_BATCH_NEAR_STEPS = 8
 
 /** A positive integer, or `fallback` for undefined / invalid input. */
 export function normalizeConcurrency(
@@ -146,6 +154,9 @@ export class PrefetchQueue {
   private readonly maxRetryDelayMs: number
   private readonly onBusyChange: ((busy: boolean) => void) | undefined
   private readonly batchSize: (() => number) | undefined
+  private readonly nearSteps: number
+  /** Position of each step in the latest window. */
+  private windowPos = new Map<number, number>()
   private readonly failureRetryDelayMs: number
   private readonly maxFailureRetryDelayMs: number
   private readonly maxFailureRetries: number
@@ -173,6 +184,7 @@ export class PrefetchQueue {
     this.maxRetryDelayMs = options.maxRetryDelayMs ?? 1000
     this.onBusyChange = options.onBusyChange
     this.batchSize = options.batchSize
+    this.nearSteps = options.batchNearSteps ?? DEFAULT_BATCH_NEAR_STEPS
     this.failureRetryDelayMs = options.failureRetryDelayMs ?? 1000
     this.maxFailureRetryDelayMs = options.maxFailureRetryDelayMs ?? 16000
     this.maxFailureRetries = options.maxFailureRetries ?? 5
@@ -207,6 +219,7 @@ export class PrefetchQueue {
     }
 
     this.dim = timeDimName
+    this.windowPos = new Map(wanted.map((idx, pos) => [idx, pos]))
     this.pending = wanted.filter((idx) => !kept.has(idx) && !this.isCached(idx))
     this.fill()
   }
@@ -266,6 +279,15 @@ export class PrefetchQueue {
     })
   }
 
+  /**
+   * In the first `nearSteps` positions of the window: fetched on its own,
+   * never batched, so the step about to be shown doesn't wait for a whole
+   * shard's coalesced response (task 44 review: head-of-line blocking).
+   */
+  private isNear(index: number): boolean {
+    return (this.windowPos.get(index) ?? Infinity) < this.nearSteps
+  }
+
   /** Current batch size (1 = no batching). */
   private currentBatchSize(): number {
     const size = this.batchSize?.() ?? 1
@@ -284,7 +306,7 @@ export class PrefetchQueue {
       const index = this.pending.shift()!
       if (this.isCached(index)) continue
       const size = this.currentBatchSize()
-      if (size < 2) {
+      if (size < 2 || this.isNear(index)) {
         this.start(index)
         continue
       }
@@ -292,7 +314,7 @@ export class PrefetchQueue {
       this.start(index, batch)
       const rest: number[] = []
       for (const idx of this.pending) {
-        if (Math.floor(idx / size) !== batch) rest.push(idx)
+        if (Math.floor(idx / size) !== batch || this.isNear(idx)) rest.push(idx)
         else if (!this.isCached(idx)) this.start(idx, batch)
       }
       this.pending = rest

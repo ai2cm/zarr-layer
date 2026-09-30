@@ -214,6 +214,12 @@ export interface ZarrLayerOptions {
   maxRequestsPerSecond?: number
   /** Bucket size for `maxRequestsPerSecond` (default 10). */
   requestBurst?: number
+  /**
+   * Most time steps prefetched as one shard batch (see
+   * `ZarrLayer.getPrefetchBatchSize`); a larger even shard extent is halved
+   * until it fits. `1` turns batching off. Default: 4.
+   */
+  prefetchBatchSteps?: number
 }
 
 export type CRS = 'EPSG:4326' | 'EPSG:3857'

@@ -36,6 +36,7 @@ import {
   createErrorRetryState,
   scheduleErrorRetry,
   errorRetrySucceeded,
+  errorRetryViewChanged,
   clearErrorRetry,
 } from './mode-utils'
 import { ZarrStore } from './zarr-store'
@@ -135,6 +136,7 @@ export class TiledMode implements ZarrMode {
   private throttleState: ThrottleState = createThrottleState()
   /** Delayed refetch after a failed tile read (task 44; mode-utils). */
   private errorRetry: ErrorRetryState = createErrorRetryState()
+  private lastRetryViewKey = ''
   private requestCanceller: RequestCanceller = createRequestCanceller()
   private loadingManager: LoadingManager = createLoadingManager()
 
@@ -178,7 +180,7 @@ export class TiledMode implements ZarrMode {
         bandNames,
         crs: this.crs,
         fixedDataScale: this.fixedDataScale,
-        onFetchError: () => this.scheduleRetryAfterError(),
+        onFetchError: (tileKey) => this.scheduleRetryAfterError(tileKey),
       })
 
       this.updateGeometryForProjection(false)
@@ -217,6 +219,14 @@ export class TiledMode implements ZarrMode {
 
     const currentHash = JSON.stringify(this.selector)
     const tilesToFetch: TileTuple[] = []
+    // A new view (tiles or selector): failed tiles get fresh retries
+    const retryViewKey = `${currentHash}|${this.visibleTiles
+      .map(tileToKey)
+      .join(';')}`
+    if (retryViewKey !== this.lastRetryViewKey) {
+      this.lastRetryViewKey = retryViewKey
+      errorRetryViewChanged(this.errorRetry)
+    }
 
     for (const tileTuple of this.visibleTiles) {
       const tileKey = tileToKey(tileTuple)
@@ -417,11 +427,12 @@ export class TiledMode implements ZarrMode {
   /**
    * A tile read failed (not aborted): refetch after a backoff (task 44), so
    * a paused map doesn't keep the tile blank until the next view change.
-   * Reports chunks loading until the retry runs.
+   * Reports chunks loading until the retry runs; after
+   * ERROR_RETRY_MAX_CYCLES cycles in one view it stops (mode-utils).
    */
-  private scheduleRetryAfterError(): void {
+  private scheduleRetryAfterError(tileKey: string): void {
     if (!this.tileCache) return
-    scheduleErrorRetry(this.errorRetry, () => {
+    scheduleErrorRetry(this.errorRetry, tileKey, () => {
       if (!this.tileCache) return
       this.emitLoadingState()
       this.invalidate()
@@ -600,7 +611,7 @@ export class TiledMode implements ZarrMode {
         return null
       }
 
-      errorRetrySucceeded(this.errorRetry)
+      errorRetrySucceeded(this.errorRetry, tileKey)
       // Cancel all older pending requests since a newer version has completed
       cancelOlderRequests(this.requestCanceller, version)
 

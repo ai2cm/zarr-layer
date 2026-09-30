@@ -13,8 +13,8 @@
  * all steps of one shard batch the same group, so the batch's chunk reads go
  * out together and coalesce: split by the cap, the reads of a shard's steps
  * (interleaved in the shard, Morton order) left gaps and went out one chunk
- * per request. The overshoot is bounded by one batch's chunk reads, which
- * coalesce into a few requests.
+ * per request. The overshoot is capped: group tasks bypass the cap only
+ * while fewer than `GROUP_OVERSHOOT` × `max` tasks run in all.
  *
  * `chunkQueue()` adapts it to zarrita's `createQueue` option (`zarr.get`
  * calls `add` once per chunk), so the cap counts chunk requests, not
@@ -29,6 +29,9 @@
  * not go through this cap.
  */
 export const DEFAULT_PREFETCH_MAX_REQUESTS = 12
+
+/** Group tasks may run past the cap up to this many times `max` in all. */
+export const GROUP_OVERSHOOT = 2
 
 /** Structural twin of zarrita's `ChunkQueue` (`zarr.get` `createQueue`). */
 export interface ChunkQueueLike {
@@ -129,7 +132,9 @@ export class RequestLimiter {
       }
       if (
         this.running < this.max ||
-        (group !== undefined && this.runningGroups.has(group))
+        (group !== undefined &&
+          this.runningGroups.has(group) &&
+          this.running < this.max * GROUP_OVERSHOOT)
       ) {
         start()
         return
@@ -177,8 +182,12 @@ export class RequestLimiter {
       if (waiter.group === undefined) continue
       const rest: Waiter[] = []
       for (const w of this.waiters) {
-        if (w.group === waiter.group) w.start()
-        else rest.push(w)
+        if (
+          w.group === waiter.group &&
+          this.running < this.max * GROUP_OVERSHOOT
+        ) {
+          w.start()
+        } else rest.push(w)
       }
       this.waiters = rest
     }

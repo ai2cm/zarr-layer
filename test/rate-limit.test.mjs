@@ -30,7 +30,12 @@ const flush = async () => {
 
 // ---- PrefetchQueue: shard batches ----------------------------------------
 
-function batchQueue({ batchSize = 4, maxConcurrentSteps = 1, result } = {}) {
+function batchQueue({
+  batchSize = 4,
+  maxConcurrentSteps = 1,
+  result,
+  near = 0,
+} = {}) {
   const started = []
   const open = new Map()
   const cached = new Set()
@@ -48,6 +53,7 @@ function batchQueue({ batchSize = 4, maxConcurrentSteps = 1, result } = {}) {
     isCached: (i) => cached.has(i),
     maxConcurrentSteps,
     batchSize: () => batchSize,
+    batchNearSteps: near,
     failureRetryDelayMs: 1,
     maxFailureRetryDelayMs: 4,
     random: () => 0.5,
@@ -394,6 +400,10 @@ test('getPrefetchBatchSize: the time extent of a shard, in range mode, up to 16'
     cachingStore: { rangeRequests },
   })
   layer.zarrStore = store([4, 1, 4160, 11520])
+  let estimate = null
+  layer.getEstimatedTimestepBytes = () => estimate
+  assert.equal(layer.getPrefetchBatchSize(), 1, 'no estimate yet (bootstrap)')
+  estimate = 1e7
   assert.equal(layer.getPrefetchBatchSize(), 4)
   layer.zarrStore = store([4, 1, 4160, 11520], false)
   assert.equal(layer.getPrefetchBatchSize(), 1, 'whole objects')
@@ -401,6 +411,24 @@ test('getPrefetchBatchSize: the time extent of a shard, in range mode, up to 16'
   assert.equal(layer.getPrefetchBatchSize(), 1, 'too many steps per shard')
   layer.zarrStore = store(null)
   assert.equal(layer.getPrefetchBatchSize(), 1, 'not sharded')
+  // prefetchBatchSteps halves an even shard extent until it fits
+  const make = (prefetchBatchSteps) => {
+    const l = new ZarrLayer({
+      id: 't',
+      source: 'http://example.invalid/s.zarr',
+      variable: 'v',
+      clim: [0, 1],
+      colormap: ['#000000', '#ffffff'],
+      prefetchBatchSteps,
+    })
+    l.getEstimatedTimestepBytes = () => 1e7
+    l.zarrStore = store([8, 1, 4160, 11520])
+    return l.getPrefetchBatchSize()
+  }
+  assert.equal(make(undefined), 4)
+  assert.equal(make(2), 2)
+  assert.equal(make(8), 8)
+  assert.equal(make(1), 1)
 })
 
 // ---- Delayed refetch after a failed render read -----------------------------
@@ -426,46 +454,225 @@ test('errorRetryDelay: 1 s doubling to 30 s, jittered ±25 %', () => {
   assert.ok(errorRetryDelay(1, () => 0.999) < 1250)
 })
 
-test('UntiledMode: a failed region read schedules one delayed invalidate and reports loading meanwhile', async (t) => {
+test('scheduleErrorRetry: failures in one cycle count once; the next cycle doubles', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const st = modeUtils.createErrorRetryState()
+  let retries = 0
+  // 8 regions fail together: one timer, one cycle
+  for (let i = 0; i < 8; i++)
+    modeUtils.scheduleErrorRetry(st, `r${i}`, () => retries++)
+  assert.equal(st.failures, 1)
+  t.mock.timers.tick(1250)
+  assert.equal(retries, 1, 'first cycle: 1 s ± 25 %')
+  for (let i = 0; i < 8; i++)
+    modeUtils.scheduleErrorRetry(st, `r${i}`, () => retries++)
+  assert.equal(st.failures, 2)
+  t.mock.timers.tick(1499)
+  assert.equal(retries, 1, 'second cycle: at least 1.5 s')
+  t.mock.timers.tick(1001)
+  assert.equal(retries, 2, 'second cycle: under 2.5 s (not 16-30 s)')
+})
+
+test('errorRetrySucceeded: the backoff resets only when no failed region is left', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const st = modeUtils.createErrorRetryState()
+  modeUtils.scheduleErrorRetry(st, 'broken', () => {})
+  modeUtils.scheduleErrorRetry(st, 'flaky', () => {})
+  t.mock.timers.tick(2000)
+  modeUtils.errorRetrySucceeded(st, 'flaky')
+  assert.equal(
+    st.failures,
+    1,
+    'a neighbour loading does not reset the broken region'
+  )
+  modeUtils.scheduleErrorRetry(st, 'broken', () => {})
+  assert.equal(st.failures, 2)
+  t.mock.timers.tick(3000)
+  modeUtils.errorRetrySucceeded(st, 'broken')
+  assert.equal(st.failures, 0)
+})
+
+test('scheduleErrorRetry: stops after ERROR_RETRY_MAX_CYCLES in one view; a view change starts over', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const st = modeUtils.createErrorRetryState()
+  let retries = 0
+  for (let i = 0; i < modeUtils.ERROR_RETRY_MAX_CYCLES; i++) {
+    assert.equal(
+      modeUtils.scheduleErrorRetry(st, 'r', () => retries++),
+      true
+    )
+    t.mock.timers.tick(40000)
+  }
+  assert.equal(retries, modeUtils.ERROR_RETRY_MAX_CYCLES)
+  assert.equal(
+    modeUtils.scheduleErrorRetry(st, 'r', () => retries++),
+    false
+  )
+  assert.equal(st.timer, null, 'no timer: the mode stops reporting loading')
+  t.mock.timers.tick(60000)
+  assert.equal(retries, modeUtils.ERROR_RETRY_MAX_CYCLES)
+  modeUtils.errorRetryViewChanged(st)
+  assert.equal(
+    modeUtils.scheduleErrorRetry(st, 'r', () => retries++),
+    true
+  )
+})
+
+test('UntiledMode: failed regions schedule one delayed invalidate, loading meanwhile, not after the retries stop', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const P = UntiledMode.prototype
   let invalidations = 0
-  const emitted = []
   const state = {
     isRemoved: false,
     errorRetry: modeUtils.createErrorRetryState(),
     throttleState: modeUtils.createThrottleState(),
-    loadingManager: {
-      metadataLoading: false,
-      chunksLoading: false,
-      callback: (s) => emitted.push(s.chunks),
-    },
+    loadingManager: { metadataLoading: false, chunksLoading: false },
     requestCanceller: { controllers: new Map() },
     invalidate: () => invalidations++,
     emitLoadingState: P.emitLoadingState,
   }
-  state.loadingManager.callback = undefined
   const loading = () => state.loadingManager.chunksLoading
-  P.scheduleRetryAfterError.call(state)
-  P.scheduleRetryAfterError.call(state) // a second failure while pending: one timer
+  for (const key of ['0:0,2', '0:1,2', '0:0,3', '0:1,3']) {
+    P.scheduleRetryAfterError.call(state, key)
+  }
   assert.equal(loading(), true, 'loading while the retry is pending')
-  // First failure: 1 s ± 25 %
-  t.mock.timers.tick(749)
-  assert.equal(invalidations, 0)
-  t.mock.timers.tick(501)
-  assert.equal(invalidations, 1)
+  t.mock.timers.tick(1250)
+  assert.equal(invalidations, 1, 'one invalidate for the four regions')
   assert.equal(loading(), false, 'nothing in flight after the timer')
-  // Another failure: the delay has doubled (two failures so far + this one)
-  P.scheduleRetryAfterError.call(state)
-  t.mock.timers.tick(2999)
-  assert.equal(invalidations, 1)
-  t.mock.timers.tick(2001)
-  assert.equal(invalidations, 2)
-  modeUtils.errorRetrySucceeded(state.errorRetry)
-  assert.equal(state.errorRetry.failures, 0)
+  // Keep failing: retries stop after the cycles, and so does "loading"
+  for (let i = 1; i < modeUtils.ERROR_RETRY_MAX_CYCLES + 2; i++) {
+    P.scheduleRetryAfterError.call(state, '0:0,2')
+    t.mock.timers.tick(40000)
+  }
+  assert.equal(invalidations, modeUtils.ERROR_RETRY_MAX_CYCLES)
+  state.loadingManager.chunksLoading = false
+  P.scheduleRetryAfterError.call(state, '0:0,2')
+  assert.equal(loading(), false, 'no forced loading state once retries stop')
   // Removed: no retry
+  modeUtils.errorRetryViewChanged(state.errorRetry)
   state.isRemoved = true
-  P.scheduleRetryAfterError.call(state)
+  P.scheduleRetryAfterError.call(state, '0:0,2')
   t.mock.timers.tick(60000)
-  assert.equal(invalidations, 2)
+  assert.equal(invalidations, modeUtils.ERROR_RETRY_MAX_CYCLES)
+})
+
+// ---- Review round 1 --------------------------------------------------------
+
+test('queue: steps at the front of the window start alone, never batched', () => {
+  const h = batchQueue({ maxConcurrentSteps: 1, near: 2 })
+  h.queue.set([1, 2, 3, 5, 6, 7])
+  // 1 is near: alone. (2 is near too, so it stays pending.)
+  assert.deepEqual(
+    h.started.map((s) => [s.idx, s.batch]),
+    [[1, undefined]]
+  )
+  h.open.get(1)()
+  return tick().then(() => {
+    assert.deepEqual(h.started.at(-1), { idx: 2, batch: undefined })
+    h.open.get(2)()
+    return tick().then(() => {
+      // 3 is far: it starts with... nothing else of batch 0 pending; then
+      // batch 1 (5, 6, 7) together once a slot frees
+      assert.deepEqual(
+        h.started.slice(2).map((s) => s.idx),
+        [3]
+      )
+      h.open.get(3)()
+      return tick().then(() => {
+        assert.deepEqual(
+          h.started.slice(3).map((s) => [s.idx, s.batch]),
+          [
+            [5, 1],
+            [6, 1],
+            [7, 1],
+          ]
+        )
+      })
+    })
+  })
+})
+
+test('limiter: a group bypasses the cap only up to GROUP_OVERSHOOT x max in all', async () => {
+  const { GROUP_OVERSHOOT } = await loadSrc('src/request-limiter.ts')
+  const limiter = new RequestLimiter(2)
+  let started = 0
+  for (let i = 0; i < 20; i++) {
+    limiter.run(() => (started++, new Promise(() => {})), { group: 'A' })
+  }
+  assert.equal(started, 2 * GROUP_OVERSHOOT)
+  assert.equal(limiter.pending, 20 - 2 * GROUP_OVERSHOOT)
+})
+
+test('coalescing: a merged request is capped at maxGroupBytes; members settle one per task', async () => {
+  const calls = []
+  const base = {
+    async get() {},
+    async getRange(key, range) {
+      calls.push(range)
+      return new Uint8Array(range.length)
+    },
+  }
+  const store = await zarr.extendStore(base, (s) =>
+    withRangeCoalescing(s, { maxGroupBytes: 25 })
+  )
+  await Promise.all(
+    [0, 10, 20, 30].map((offset) =>
+      store.getRange('/a', { offset, length: 10 })
+    )
+  )
+  assert.deepEqual(calls, [
+    { offset: 0, length: 20 },
+    { offset: 20, length: 20 },
+  ])
+  // One group: a member's continuation runs before the next member settles
+  const one = await zarr.extendStore(base, (s) => withRangeCoalescing(s))
+  const order = []
+  await Promise.all(
+    [0, 10, 20].map((offset) =>
+      one.getRange('/b', { offset, length: 10 }).then(() => {
+        order.push(offset)
+        return Promise.resolve().then(() => order.push(`after ${offset}`))
+      })
+    )
+  )
+  assert.deepEqual(order, [0, 'after 0', 10, 'after 10', 20, 'after 20'])
+})
+
+test('gate: a success from a request sent before the 429 does not end the rate limit', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const gate = new RequestGate({}, { random: () => 0.5 })
+  const a = await gate.acquire()
+  const b = await gate.acquire()
+  gate.done(a, 'rate-limited')
+  gate.done(b, 'ok') // left before the 429, answered after it
+  assert.equal(gate.rateLimited, true)
+  const got = []
+  for (let i = 0; i < 3; i++) gate.acquire().then((tk) => got.push(tk))
+  t.mock.timers.tick(2000)
+  await flush()
+  assert.equal(got.length, 1, 'still one probe after the cooldown')
+  assert.equal(got[0].probe, true)
+  gate.done(got[0], 'ok')
+  await flush()
+  assert.equal(got.length, 3)
+  assert.equal(gate.rateLimited, false)
+})
+
+test('gatedFetch: still rate-limited after giveUpMs -> RangeRateLimitedError', async () => {
+  let clock = 1000
+  const gate = new RequestGate({}, { random: () => 0.5 })
+  let calls = 0
+  const f = gatedFetch(
+    async () => {
+      calls++
+      clock += 400_000 // this attempt ended 400 s after the first started
+      return new Response(null, { status: 429 })
+    },
+    () => gate,
+    { giveUpMs: 360_000, now: () => clock }
+  )
+  await assert.rejects(f(new Request('http://h.invalid/a')), {
+    name: 'RangeRateLimitedError',
+  })
+  assert.equal(calls, 1, 'no retry past the deadline')
 })
