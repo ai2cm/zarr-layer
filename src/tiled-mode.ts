@@ -32,6 +32,11 @@ import {
   cancelAllRequests,
   setLoadingCallback as setLoadingCallbackUtil,
   emitLoadingState as emitLoadingStateUtil,
+  type ErrorRetryState,
+  createErrorRetryState,
+  scheduleErrorRetry,
+  errorRetrySucceeded,
+  clearErrorRetry,
 } from './mode-utils'
 import { ZarrStore } from './zarr-store'
 import { Tiles } from './tiles'
@@ -128,6 +133,8 @@ export class TiledMode implements ZarrMode {
 
   // Shared state managers
   private throttleState: ThrottleState = createThrottleState()
+  /** Delayed refetch after a failed tile read (task 44; mode-utils). */
+  private errorRetry: ErrorRetryState = createErrorRetryState()
   private requestCanceller: RequestCanceller = createRequestCanceller()
   private loadingManager: LoadingManager = createLoadingManager()
 
@@ -171,6 +178,7 @@ export class TiledMode implements ZarrMode {
         bandNames,
         crs: this.crs,
         fixedDataScale: this.fixedDataScale,
+        onFetchError: () => this.scheduleRetryAfterError(),
       })
 
       this.updateGeometryForProjection(false)
@@ -341,6 +349,7 @@ export class TiledMode implements ZarrMode {
 
   dispose(_gl: WebGL2RenderingContext | WebGLRenderingContext): void {
     clearThrottle(this.throttleState)
+    clearErrorRetry(this.errorRetry)
     cancelAllRequests(this.requestCanceller)
     this.tileCache?.clear()
     this.tileCache = null
@@ -399,8 +408,25 @@ export class TiledMode implements ZarrMode {
   private emitLoadingState(): void {
     // Update chunksLoading state based on pending chunks and throttle state
     this.loadingManager.chunksLoading =
-      this.pendingChunks.size > 0 || this.throttleState.throttledPending
+      this.pendingChunks.size > 0 ||
+      this.throttleState.throttledPending ||
+      this.errorRetry.timer !== null
     emitLoadingStateUtil(this.loadingManager)
+  }
+
+  /**
+   * A tile read failed (not aborted): refetch after a backoff (task 44), so
+   * a paused map doesn't keep the tile blank until the next view change.
+   * Reports chunks loading until the retry runs.
+   */
+  private scheduleRetryAfterError(): void {
+    if (!this.tileCache) return
+    scheduleErrorRetry(this.errorRetry, () => {
+      if (!this.tileCache) return
+      this.emitLoadingState()
+      this.invalidate()
+    })
+    this.emitLoadingState()
   }
 
   async setSelector(selector: NormalizedSelector): Promise<void> {
@@ -574,6 +600,7 @@ export class TiledMode implements ZarrMode {
         return null
       }
 
+      errorRetrySucceeded(this.errorRetry)
       // Cancel all older pending requests since a newer version has completed
       cancelOlderRequests(this.requestCanceller, version)
 

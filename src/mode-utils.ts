@@ -8,6 +8,69 @@
 import type { LoadingStateCallback, LoadingState } from './types'
 
 // ============================================================================
+// Error retry (ace-viz task 44)
+// ============================================================================
+
+/**
+ * A delayed re-render after a render read failed (not aborted). Without it,
+ * a paused map whose region or tile read failed (a 5xx or network error
+ * after the store's retry) stayed blank until the next pan, zoom or time
+ * change. `schedule()` sets one timer (later calls while it is pending do
+ * nothing) that calls `invalidate`, which refetches whatever is still
+ * missing. The delay starts at `ERROR_RETRY_BASE_MS` and doubles with each
+ * failure up to `ERROR_RETRY_MAX_MS`, scaled by a random factor in
+ * [0.75, 1.25); `succeeded()` resets it. While a retry is pending the mode
+ * reports chunks loading, so the UI shows its loading state, not a blank.
+ */
+export interface ErrorRetryState {
+  timer: ReturnType<typeof setTimeout> | null
+  failures: number
+}
+
+export const ERROR_RETRY_BASE_MS = 1000
+export const ERROR_RETRY_MAX_MS = 30000
+
+export function createErrorRetryState(): ErrorRetryState {
+  return { timer: null, failures: 0 }
+}
+
+/** Delay before retry number `failures` (1-based), jittered. */
+export function errorRetryDelay(
+  failures: number,
+  random: () => number = Math.random
+): number {
+  const base = Math.min(
+    ERROR_RETRY_BASE_MS * 2 ** Math.max(0, failures - 1),
+    ERROR_RETRY_MAX_MS
+  )
+  return base * (0.75 + 0.5 * random())
+}
+
+/** Schedule `retry` after the next backoff delay; no-op while pending. */
+export function scheduleErrorRetry(
+  state: ErrorRetryState,
+  retry: () => void
+): void {
+  state.failures++
+  if (state.timer !== null) return
+  state.timer = setTimeout(() => {
+    state.timer = null
+    retry()
+  }, errorRetryDelay(state.failures))
+}
+
+/** A render read succeeded: reset the backoff. */
+export function errorRetrySucceeded(state: ErrorRetryState): void {
+  state.failures = 0
+}
+
+export function clearErrorRetry(state: ErrorRetryState): void {
+  if (state.timer !== null) clearTimeout(state.timer)
+  state.timer = null
+  state.failures = 0
+}
+
+// ============================================================================
 // Throttle Management
 // ============================================================================
 

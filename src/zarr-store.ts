@@ -1,5 +1,5 @@
 import * as zarr from 'zarrita'
-import type { Readable, AsyncReadable } from '@zarrita/storage'
+import type { AbsolutePath, Readable, AsyncReadable } from '@zarrita/storage'
 import {
   CachingStore,
   DEFAULT_CHUNK_CACHE_BYTES,
@@ -9,6 +9,7 @@ import {
   validCacheBytes,
 } from './caching-store'
 import { withRangeCoalescing } from './range-coalescing'
+import { gatedFetch } from './request-gate'
 import type {
   Bounds,
   SpatialDimensions,
@@ -195,26 +196,58 @@ export const checkRangeResponses =
  *
  * With `rangeRequests`, suffix ranges (shard indexes) are one `bytes=-N`
  * request instead of a HEAD plus a range, and range responses are checked
- * (see `checkRangeResponses`).
+ * (see `checkRangeResponses`). Every request goes through its origin's
+ * `RequestGate` (`gatedFetch`): an optional rate cap, and a 429 is retried
+ * after a backoff instead of failing (ace-viz task 44).
  */
 export const createFetchStore = (
   url: string,
   transformRequest?: TransformRequest,
   rangeRequests: boolean = false
 ): zarr.FetchStore => {
-  if (rangeRequests) {
-    const inner = transformRequest
+  // Every request goes through its origin's gate (rate cap, 429 backoff;
+  // see request-gate.ts), under the Range checks so a 429 is retried there
+  const inner = gatedFetch(
+    transformRequest
       ? transformedFetch(transformRequest)
       : (request: Request) => fetch(request)
+  )
+  if (rangeRequests) {
     return new zarr.FetchStore(url, {
       useSuffixRequest: true,
       fetch: checkRangeResponses(inner),
     })
   }
-  if (!transformRequest) {
-    return new zarr.FetchStore(url)
+  return new zarr.FetchStore(url, { fetch: inner })
+}
+
+/**
+ * The shard shape of a sharded zarr v3 array (its `chunk_grid` chunk shape
+ * when a `sharding_indexed` codec is present), or null: not sharded, not
+ * v3, or unreadable. zarrita does not expose it (`array.chunks` is the inner
+ * chunk shape). The array's zarr.json was just read to open it, so this is
+ * served from consolidated metadata or the chunk cache.
+ */
+export async function readShardShape(
+  store: { get(key: AbsolutePath): Promise<Uint8Array | undefined> },
+  arrayPath: string
+): Promise<number[] | null> {
+  try {
+    const path = arrayPath.replace(/^\/+/, '')
+    const bytes = await store.get(`/${path}/zarr.json` as AbsolutePath)
+    if (!bytes) return null
+    const meta = JSON.parse(new TextDecoder().decode(bytes))
+    const codecs = Array.isArray(meta?.codecs) ? meta.codecs : []
+    if (
+      !codecs.some((c: { name?: string }) => c?.name === 'sharding_indexed')
+    ) {
+      return null
+    }
+    const shape = meta?.chunk_grid?.configuration?.chunk_shape
+    return Array.isArray(shape) && shape.every(Number.isInteger) ? shape : null
+  } catch {
+    return null
   }
-  return new zarr.FetchStore(url, { fetch: transformedFetch(transformRequest) })
 }
 
 export class ZarrStore {
@@ -232,6 +265,11 @@ export class ZarrStore {
   dimensions: string[] = []
   shape: number[] = []
   chunks: number[] = []
+  /**
+   * Outer (shard) chunk shape of a sharded v3 array, read in range mode only
+   * (for prefetch shard batches, ace-viz task 44); null otherwise.
+   */
+  shards: number[] | null = null
   fill_value: number | null = null
   dtype: string | null = null
   levels: string[] = []
@@ -636,6 +674,9 @@ export class ZarrStore {
     this.shape = array.shape
     // zarrita's array.chunks already handles sharding (inner chunk shape)
     this.chunks = array.chunks
+    if (this.rangeRequests && this.store) {
+      this.shards = await readShardShape(this.store, basePath)
+    }
     this.fill_value = this.normalizeFillValue(array.fillValue)
     this.dtype = (array.dtype as string) || null
     this.scaleFactor =

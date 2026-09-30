@@ -59,6 +59,11 @@ interface TilesOptions {
   bandNames?: string[]
   crs?: 'EPSG:4326' | 'EPSG:3857'
   fixedDataScale?: number
+  /**
+   * Called when a tile's read fails (not aborted), so the mode can schedule
+   * a delayed refetch (task 44).
+   */
+  onFetchError?: () => void
 }
 
 /**
@@ -76,6 +81,7 @@ export class Tiles {
   private bandNames: string[]
   private gl: WebGL2RenderingContext | null = null
   private fixedDataScale: number
+  private onFetchError: (() => void) | undefined
 
   constructor({
     store,
@@ -86,6 +92,7 @@ export class Tiles {
     maxCachedTiles = 64,
     bandNames = [],
     fixedDataScale = 1,
+    onFetchError,
   }: TilesOptions) {
     this.store = store
     this.selector = selector
@@ -95,6 +102,7 @@ export class Tiles {
     this.maxCachedTiles = maxCachedTiles
     this.bandNames = bandNames
     this.fixedDataScale = fixedDataScale
+    this.onFetchError = onFetchError
   }
 
   /**
@@ -748,6 +756,7 @@ export class Tiles {
         return null
       }
       console.error('Error fetching tile data:', err)
+      this.onFetchError?.()
       return null
     }
   }

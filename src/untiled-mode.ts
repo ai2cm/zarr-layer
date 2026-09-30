@@ -92,6 +92,11 @@ import {
   hasActiveRequests,
   setLoadingCallback as setLoadingCallbackUtil,
   emitLoadingState as emitLoadingStateUtil,
+  type ErrorRetryState,
+  createErrorRetryState,
+  scheduleErrorRetry,
+  errorRetrySucceeded,
+  clearErrorRetry,
 } from './mode-utils'
 import { setupBandTextureUniforms, uploadDataTexture } from './render-helpers'
 import { renderRegion, type RenderableRegion } from './renderable-region'
@@ -364,6 +369,8 @@ export class UntiledMode implements ZarrMode {
 
   // Shared state managers
   private throttleState: ThrottleState = createThrottleState()
+  /** Delayed refetch after a failed render read (task 44; mode-utils). */
+  private errorRetry: ErrorRetryState = createErrorRetryState()
   private requestCanceller: RequestCanceller = createRequestCanceller()
   private loadingManager: LoadingManager = createLoadingManager()
 
@@ -2138,11 +2145,13 @@ export class UntiledMode implements ZarrMode {
       // checkViewComplete does not count it (the guard above ran with no
       // await since, so no newer fetch can have landed in between)
       region.selectorVersion = fetchSelectorVersion
+      errorRetrySucceeded(this.errorRetry)
 
       this.invalidate()
     } catch (err) {
       if (!(err instanceof DOMException && err.name === 'AbortError')) {
         console.error(`[fetchRegion] Error fetching region ${key}:`, err)
+        this.scheduleRetryAfterError()
       }
     } finally {
       region.loading = false
@@ -2663,6 +2672,7 @@ export class UntiledMode implements ZarrMode {
   dispose(gl: WebGL2RenderingContext | WebGLRenderingContext): void {
     this.isRemoved = true
     clearThrottle(this.throttleState)
+    clearErrorRetry(this.errorRetry)
     cancelAllRequests(this.requestCanceller)
     // Clean up region caches
     this.clearRegionCache(gl)
@@ -2963,14 +2973,34 @@ export class UntiledMode implements ZarrMode {
   }
 
   private emitLoadingState(): void {
-    // Update chunksLoading to include throttle state
+    // Update chunksLoading to include throttle state and a pending retry
+    // after a failed read (the region is still wanted, just not loaded yet)
     if (
-      this.throttleState.throttledPending &&
+      (this.throttleState.throttledPending || this.errorRetry.timer !== null) &&
       !this.loadingManager.chunksLoading
     ) {
       this.loadingManager.chunksLoading = true
     }
     emitLoadingStateUtil(this.loadingManager)
+  }
+
+  /**
+   * A render read failed (not aborted): refetch after a backoff (task 44).
+   * A paused map would otherwise keep the region blank until the next pan,
+   * zoom or time change. Reports chunks loading until the retry runs.
+   */
+  private scheduleRetryAfterError(): void {
+    if (this.isRemoved) return
+    scheduleErrorRetry(this.errorRetry, () => {
+      if (this.isRemoved) return
+      this.loadingManager.chunksLoading = hasActiveRequests(
+        this.requestCanceller
+      )
+      this.emitLoadingState()
+      // Re-evaluates visible regions: failed ones have no current data
+      this.invalidate()
+    })
+    this.emitLoadingState()
   }
 
   private async resolveSelectionIndex(

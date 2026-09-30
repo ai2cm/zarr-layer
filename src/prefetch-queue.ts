@@ -20,6 +20,14 @@
  * its request's signal, one signal per step.) Pass `maxConcurrentSteps: 1`
  * for the previous strictly sequential behaviour.
  *
+ * Shard batches (ace-viz task 44): with `batchSize` > 1, steps whose time
+ * indices share a batch (`floor(index / batchSize)`, i.e. one shard along
+ * the time dim) start together: starting a step also starts every other
+ * pending step of its batch, even past `maxConcurrentSteps` (so at most
+ * `maxConcurrentSteps + batchSize - 1` steps are in flight). Their range
+ * reads then go out in the same task and the range coalescing layer merges
+ * adjacent inner chunks of the shard into one request.
+ *
  * No policy lives here (direction, horizon, debounce): callers decide which
  * window they want. The per-step fetch is injected (`fetchStep`), so this
  * class has no dependency on the rendering modes and is unit-testable.
@@ -28,15 +36,19 @@
 /**
  * Fetch one time step. Resolve `false` when the step could not be attempted
  * yet (e.g. the mode is still initializing); the queue retries it, with
- * backoff, for as long as it is still wanted. Any other resolution (or a
- * rejection) counts as done.
+ * backoff, for as long as it is still wanted. Resolve `'failed'` when a
+ * read failed (a 5xx or network error after the store's own retry): the
+ * queue retries it after a jittered exponential backoff, up to
+ * `maxFailureRetries` times while it is still wanted, then drops it (a
+ * later window can ask again). Any other resolution (or a rejection)
+ * counts as done.
  */
 export type PrefetchStepFetcher = (
   timeIndex: number,
   timeDimName: string,
   signal: AbortSignal,
   info: PrefetchStepInfo
-) => Promise<boolean | void>
+) => Promise<boolean | void | 'failed'>
 
 export interface PrefetchStepInfo {
   /**
@@ -45,6 +57,11 @@ export interface PrefetchStepInfo {
    * since steps start in window order.
    */
   seq: number
+  /**
+   * Shard batch of the step (`floor(index / batchSize)`), when batching is
+   * on; steps started together share it (see the class comment).
+   */
+  batch?: number
 }
 
 export interface PrefetchQueueOptions {
@@ -66,6 +83,26 @@ export interface PrefetchQueueOptions {
   retryDelayMs?: number
   maxRetryDelayMs?: number
   /**
+   * Backoff for a step whose fetcher resolved `'failed'`: the first retry
+   * after `failureRetryDelayMs` (default 1000), doubling up to
+   * `maxFailureRetryDelayMs` (default 16000), each scaled by a random
+   * factor in [0.5, 1.5) so failed steps don't retry in lockstep; at most
+   * `maxFailureRetries` retries (default 5). The step keeps its slot while
+   * it waits, so a burst of failures (e.g. a rate limit) also slows the
+   * steps behind it.
+   */
+  failureRetryDelayMs?: number
+  maxFailureRetryDelayMs?: number
+  maxFailureRetries?: number
+  /** Random source for the jitter (tests). */
+  random?: () => number
+  /**
+   * Steps per batch (see the class comment), read each time steps start, so
+   * it can change once the array is known. Values below 2 (or invalid) mean
+   * no batching. Default: no batching.
+   */
+  batchSize?: () => number
+  /**
    * Called when `busy` changes: true when the queue starts working through
    * steps, false once nothing is in flight or pending.
    */
@@ -79,12 +116,15 @@ export interface PrefetchQueueStats {
   completed: number
   /** In-flight steps aborted because a new window no longer wanted them. */
   aborted: number
+  /** Retries of steps whose fetch failed (see `'failed'`). */
+  failureRetries: number
 }
 
 interface InFlight {
   index: number
   dim: string
   controller: AbortController
+  batch?: number
 }
 
 export const DEFAULT_PREFETCH_CONCURRENCY = 4
@@ -105,6 +145,11 @@ export class PrefetchQueue {
   private readonly retryDelayMs: number
   private readonly maxRetryDelayMs: number
   private readonly onBusyChange: ((busy: boolean) => void) | undefined
+  private readonly batchSize: (() => number) | undefined
+  private readonly failureRetryDelayMs: number
+  private readonly maxFailureRetryDelayMs: number
+  private readonly maxFailureRetries: number
+  private readonly random: () => number
   /** Max steps in flight (aborted-but-unsettled steps count). */
   readonly maxConcurrentSteps: number
   private pending: number[] = []
@@ -118,6 +163,7 @@ export class PrefetchQueue {
     started: 0,
     completed: 0,
     aborted: 0,
+    failureRetries: 0,
   }
 
   constructor(options: PrefetchQueueOptions) {
@@ -126,6 +172,11 @@ export class PrefetchQueue {
     this.retryDelayMs = options.retryDelayMs ?? 100
     this.maxRetryDelayMs = options.maxRetryDelayMs ?? 1000
     this.onBusyChange = options.onBusyChange
+    this.batchSize = options.batchSize
+    this.failureRetryDelayMs = options.failureRetryDelayMs ?? 1000
+    this.maxFailureRetryDelayMs = options.maxFailureRetryDelayMs ?? 16000
+    this.maxFailureRetries = options.maxFailureRetries ?? 5
+    this.random = options.random ?? Math.random
     this.maxConcurrentSteps = normalizeConcurrency(
       options.maxConcurrentSteps,
       DEFAULT_PREFETCH_CONCURRENCY
@@ -215,7 +266,16 @@ export class PrefetchQueue {
     })
   }
 
-  /** Start pending steps (front first) while slots are free. */
+  /** Current batch size (1 = no batching). */
+  private currentBatchSize(): number {
+    const size = this.batchSize?.() ?? 1
+    return Number.isFinite(size) && size >= 2 ? Math.floor(size) : 1
+  }
+
+  /**
+   * Start pending steps (front first) while slots are free; each step
+   * brings the pending steps of its batch with it (see the class comment).
+   */
   private fill(): void {
     while (
       this.inFlight.length < this.maxConcurrentSteps &&
@@ -223,28 +283,59 @@ export class PrefetchQueue {
     ) {
       const index = this.pending.shift()!
       if (this.isCached(index)) continue
-      const step: InFlight = {
-        index,
-        dim: this.dim,
-        controller: new AbortController(),
+      const size = this.currentBatchSize()
+      if (size < 2) {
+        this.start(index)
+        continue
       }
-      this.inFlight.push(step)
-      this.stats.started++
-      this.setBusy(true)
-      void this.run(step, this.seq++)
+      const batch = Math.floor(index / size)
+      this.start(index, batch)
+      const rest: number[] = []
+      for (const idx of this.pending) {
+        if (Math.floor(idx / size) !== batch) rest.push(idx)
+        else if (!this.isCached(idx)) this.start(idx, batch)
+      }
+      this.pending = rest
     }
     this.updateBusy()
   }
 
+  private start(index: number, batch?: number): void {
+    const step: InFlight = {
+      index,
+      dim: this.dim,
+      controller: new AbortController(),
+      batch,
+    }
+    this.inFlight.push(step)
+    this.stats.started++
+    this.setBusy(true)
+    void this.run(step, this.seq++)
+  }
+
   private async run(step: InFlight, seq: number): Promise<void> {
-    const { index, dim, controller } = step
+    const { index, dim, controller, batch } = step
+    const info: PrefetchStepInfo =
+      batch === undefined ? { seq } : { seq, batch }
     try {
       let delay = this.retryDelayMs
+      let failureDelay = this.failureRetryDelayMs
+      let failures = 0
       for (;;) {
-        const result = await this.fetchStep(index, dim, controller.signal, {
-          seq,
-        })
-        if (result !== false || controller.signal.aborted) break
+        const result = await this.fetchStep(index, dim, controller.signal, info)
+        if (controller.signal.aborted) break
+        if (result === 'failed') {
+          if (failures++ >= this.maxFailureRetries) break
+          await this.sleep(
+            failureDelay * (0.5 + this.random()),
+            controller.signal
+          )
+          if (controller.signal.aborted || this.isCached(index)) break
+          failureDelay = Math.min(failureDelay * 2, this.maxFailureRetryDelayMs)
+          this.stats.failureRetries++
+          continue
+        }
+        if (result !== false) break
         await this.sleep(delay, controller.signal)
         if (controller.signal.aborted) break
         delay = Math.min(delay * 2, this.maxRetryDelayMs)

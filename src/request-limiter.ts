@@ -8,6 +8,14 @@
  * wait list and rejects with an AbortError without ever running, so an
  * aborted step never holds or waits for a slot.
  *
+ * Groups (ace-viz task 44): a task with a `group` starts at once, past the
+ * cap, while another task of its group is running. The prefetch queue gives
+ * all steps of one shard batch the same group, so the batch's chunk reads go
+ * out together and coalesce: split by the cap, the reads of a shard's steps
+ * (interleaved in the shard, Morton order) left gaps and went out one chunk
+ * per request. The overshoot is bounded by one batch's chunk reads, which
+ * coalesce into a few requests.
+ *
  * `chunkQueue()` adapts it to zarrita's `createQueue` option (`zarr.get`
  * calls `add` once per chunk), so the cap counts chunk requests, not
  * regions. Its `onIdle` waits for every task, even after one fails.
@@ -33,11 +41,17 @@ export interface LimiterRunOptions {
   priority?: number
   /** Aborting while waiting removes the task and rejects with AbortError. */
   signal?: AbortSignal
+  /**
+   * Tasks of one group start past the cap while a task of the group is
+   * running (see the class comment). Compared with `===`.
+   */
+  group?: unknown
 }
 
 interface Waiter {
   priority: number
   seq: number
+  group: unknown
   start: () => void
 }
 
@@ -54,6 +68,8 @@ export class RequestLimiter {
   private running = 0
   private seq = 0
   private waiters: Waiter[] = []
+  /** Running tasks per group (groups with none are removed). */
+  private runningGroups = new Map<unknown, number>()
   /** Highest number of tasks ever running at once (for tests/debugging). */
   peak = 0
 
@@ -75,13 +91,19 @@ export class RequestLimiter {
   }
 
   run<T>(fn: () => Promise<T>, options: LimiterRunOptions = {}): Promise<T> {
-    const { priority = 0, signal } = options
+    const { priority = 0, signal, group } = options
     if (signal?.aborted) return Promise.reject(abortError(signal))
     return new Promise<T>((resolve, reject) => {
       const start = () => {
         signal?.removeEventListener('abort', onAbort)
         this.running++
         if (this.running > this.peak) this.peak = this.running
+        if (group !== undefined) {
+          this.runningGroups.set(
+            group,
+            (this.runningGroups.get(group) ?? 0) + 1
+          )
+        }
         let p: Promise<T>
         try {
           p = Promise.resolve(fn())
@@ -90,17 +112,25 @@ export class RequestLimiter {
         }
         p.then(resolve, reject).finally(() => {
           this.running--
+          if (group !== undefined) {
+            const n = (this.runningGroups.get(group) ?? 1) - 1
+            if (n > 0) this.runningGroups.set(group, n)
+            else this.runningGroups.delete(group)
+          }
           this.next()
         })
       }
-      const waiter: Waiter = { priority, seq: this.seq++, start }
+      const waiter: Waiter = { priority, seq: this.seq++, group, start }
       const onAbort = () => {
         const i = this.waiters.indexOf(waiter)
         if (i === -1) return
         this.waiters.splice(i, 1)
         reject(abortError(signal!))
       }
-      if (this.running < this.max) {
+      if (
+        this.running < this.max ||
+        (group !== undefined && this.runningGroups.has(group))
+      ) {
         start()
         return
       }
@@ -141,7 +171,16 @@ export class RequestLimiter {
 
   private next(): void {
     while (this.running < this.max && this.waiters.length > 0) {
-      this.waiters.shift()!.start()
+      const waiter = this.waiters.shift()!
+      waiter.start()
+      // Its group's other waiters go with it
+      if (waiter.group === undefined) continue
+      const rest: Waiter[] = []
+      for (const w of this.waiters) {
+        if (w.group === waiter.group) w.start()
+        else rest.push(w)
+      }
+      this.waiters = rest
     }
   }
 }

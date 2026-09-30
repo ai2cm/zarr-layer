@@ -15,6 +15,15 @@
  * - requests already aborted at flush time are left out of the groups, so
  *   they don't widen a fetch.
  *
+ * And one difference in timing (ace-viz task 44): the batch is flushed on
+ * the next macrotask (`setTimeout(0)`), not in a microtask, so every range
+ * read issued in the same task is grouped, whatever the depth of the
+ * promise chains that issued it. zarrita's getChunk reaches getRange after a
+ * variable number of awaits (shard index, CachingStore, limiter), so a
+ * microtask flush split the reads of one prefetch batch (several time steps
+ * of one shard, issued together) into many requests. The cost is one
+ * macrotask of latency per read, negligible next to a network round trip.
+ *
  * Adapted from zarrita (github.com/manzt/zarrita.js), 0.7.1
  * `src/extension/range-coalescing.ts`.
  * Copyright (c) 2020-2023 Trevor Manz, MIT License.
@@ -189,7 +198,7 @@ export const withRangeCoalescing = zarr.defineStoreExtension(
           })
           if (!scheduled) {
             scheduled = true
-            queueMicrotask(flush)
+            setTimeout(flush, 0)
           }
         })
       },

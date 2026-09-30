@@ -51,6 +51,7 @@ import {
   DEFAULT_PREFETCH_MAX_REQUESTS,
   RequestLimiter,
 } from './request-limiter'
+import { configureRequestGate } from './request-gate'
 
 type MapboxInternals = {
   transform?: {
@@ -130,6 +131,9 @@ interface StepKeys {
    */
   completeKeys: Set<string> | null
 }
+
+/** Largest shard batch (time steps) the prefetch queue starts together. */
+export const MAX_PREFETCH_BATCH = 16
 
 export class ZarrLayer {
   readonly type: 'custom' = 'custom'
@@ -406,6 +410,8 @@ export class ZarrLayer {
     rangeRequests = false,
     prefetchConcurrency,
     prefetchMaxRequests,
+    maxRequestsPerSecond,
+    requestBurst,
   }: ZarrLayerOptions) {
     if (!id) {
       throw new Error('[ZarrLayer] id is required')
@@ -506,6 +512,14 @@ export class ZarrLayer {
         console.warn(`[ZarrLayer] Invalid ${name} ${value}; using ${used}.`)
       }
     }
+    // The source origin's shared request gate (task 44): a layer that asks
+    // for a cap sets it for every layer reading from that origin
+    if (source && maxRequestsPerSecond !== undefined) {
+      configureRequestGate(source, {
+        maxRequestsPerSecond,
+        burst: requestBurst,
+      })
+    }
     this.prefetchLimiter = new RequestLimiter(requests)
     this.prefetchQueue = new PrefetchQueue({
       fetchStep: (timeIdx, timeDimName, signal, info) =>
@@ -513,6 +527,7 @@ export class ZarrLayer {
       isCached: (timeIdx) => this.isTimeStepCached(timeIdx),
       onBusyChange: () => this.emitLoadingState(),
       maxConcurrentSteps: steps,
+      batchSize: () => this.getPrefetchBatchSize(),
     })
   }
 
@@ -715,6 +730,25 @@ export class ZarrLayer {
   }
 
   /**
+   * Time steps per prefetch batch: the shard extent along the time dim of a
+   * sharded v3 array read by range (ace-viz task 44), else 1. The prefetch
+   * queue starts the steps of one batch together so their inner-chunk
+   * ranges coalesce into few requests; a caller building windows can align
+   * a window's far end to a batch boundary (the ace-viz webapp does). Whole
+   * objects (`rangeRequests` off, or after a fallback) and batches above
+   * MAX_PREFETCH_BATCH steps (e.g. a 100 km shard of 400 steps) give 1.
+   */
+  getPrefetchBatchSize(): number {
+    const store = this.zarrStore
+    if (!store?.shards || !store.cachingStore?.rangeRequests) return 1
+    const timeIdx = store.dimensions.indexOf(this.prefetchTimeDimName)
+    const size = timeIdx === -1 ? 1 : store.shards[timeIdx]
+    return Number.isInteger(size) && size >= 2 && size <= MAX_PREFETCH_BATCH
+      ? size
+      : 1
+  }
+
+  /**
    * The current values of the non-time, non-spatial selector dims, as a
    * stable string (e.g. `{"member":{"selected":3,"type":"index"}}`).
    */
@@ -747,7 +781,7 @@ export class ZarrLayer {
     timeDimName: string,
     signal: AbortSignal,
     info: PrefetchStepInfo
-  ): Promise<boolean> {
+  ): Promise<boolean | 'failed'> {
     if (this.metadataLoading) return false
     const mode = this.mode
     if (!mode?.prefetchTimeSteps) return true
@@ -757,7 +791,9 @@ export class ZarrLayer {
     // Keys this fetch reads, for the per-step byte estimate
     const keys = new Set<string>()
     this.prefetchSignals.set(signal, { timeIndex: timeIdx, selection, keys })
-    const limiterOptions = { priority: info.seq, signal }
+    // Steps of one shard batch share a limiter group, so their chunk reads
+    // go out together and coalesce (task 44)
+    const limiterOptions = { priority: info.seq, signal, group: info.batch }
     let failed = false
     try {
       const done = await mode.prefetchTimeSteps(
@@ -783,7 +819,9 @@ export class ZarrLayer {
           entry.completeKeys = keys
         }
       }
-      return done !== false
+      if (done === false) return false
+      // A failed read: the queue retries the step with backoff (task 44)
+      return failed && !signal.aborted ? 'failed' : true
     } finally {
       this.prefetchSignals.delete(signal)
     }
