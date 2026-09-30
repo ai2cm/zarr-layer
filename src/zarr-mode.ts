@@ -110,9 +110,12 @@ export interface ZarrMode {
   /**
    * Called when the current view of the current selector is fully rendered:
    * every visible region/tile holds data fetched (or restored from the
-   * mode's own cache) for it. Not called while any of them is loading,
-   * failed or was aborted. Called once per distinct complete view (selector
-   * version, level, visible set). ZarrLayer uses it to count a render of the
+   * mode's own cache) for it. Not called while any of them is loading, or
+   * while its latest fetch for the current selector failed or was aborted
+   * (at any point, including after the read): such a region/tile keeps an
+   * older selector version/hash until a fetch for the current one finishes.
+   * Called once per distinct complete view (selector version or hash,
+   * level, visible set). ZarrLayer uses it to count a render of the
    * displayed step as a completed fetch for cache status.
    */
   setViewCompleteCallback?(callback: (() => void) | undefined): void

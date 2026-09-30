@@ -912,9 +912,6 @@ export class UntiledMode implements ZarrMode {
     }
   }
 
-  /**
-   * Check if a region has all required data for rendering.
-   */
   setViewCompleteCallback(callback: (() => void) | undefined): void {
     this.viewCompleteCallback = callback
   }
@@ -956,6 +953,9 @@ export class UntiledMode implements ZarrMode {
     this.viewCompleteCallback()
   }
 
+  /**
+   * Check if a region has all required data for rendering.
+   */
   private isRegionValid(region: RegionState): boolean {
     return !!(
       region.data &&
@@ -2000,9 +2000,6 @@ export class UntiledMode implements ZarrMode {
       // Only render if this is newer than what's already rendered for this region
       if (fetchSelectorVersion < region.selectorVersion) return
 
-      // Update region's selector version
-      region.selectorVersion = fetchSelectorVersion
-
       // Resample bands to Mercator space if needed (EPSG:4326 or custom projection)
       let bandDataToProcess = bandArrays
       let outputW = actualW
@@ -2135,6 +2132,12 @@ export class UntiledMode implements ZarrMode {
       if (needsGeometry) {
         this.createRegionGeometry(regionX, regionY, gl, region)
       }
+
+      // Mark the region current only once it is fully rendered: if any step
+      // above throws, it keeps its older version, so it is refetched and
+      // checkViewComplete does not count it (the guard above ran with no
+      // await since, so no newer fetch can have landed in between)
+      region.selectorVersion = fetchSelectorVersion
 
       this.invalidate()
     } catch (err) {

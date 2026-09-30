@@ -157,10 +157,10 @@ test('a render aborted partway (loading ends, not complete) is not cached', asyn
   assert.equal(status(1), 'missing')
 })
 
-test('(a) a view completing while chunks still read as loading (throttle) counts', async () => {
-  // Fast stepping: untiled mode keeps chunks=true while a throttled fetch is
-  // pending, so no chunks:false edge arrives, but the displayed step's
-  // regions did land for the current selector
+test('(a) a view completing while the loading state still reports chunks (throttledPending) counts', async () => {
+  // Fast stepping: untiled mode's emitLoadingState reports chunks=true
+  // while throttledPending is set, so no chunks:false edge arrives, but the
+  // displayed step's regions did land for the current selector
   const { layer, store, keysFor, status } = statusLayer()
   layer.handleChunkLoadingChange({ loading: true, chunks: true })
   for (const key of keysFor(0)) await store.get(key)
