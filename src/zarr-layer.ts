@@ -119,6 +119,16 @@ interface StepKeys {
   measuredKeys: Set<string> | null
   /** Order in which `measuredKeys` was set (higher = more recent). */
   measuredSeq: number
+  /**
+   * Keys of the step's latest completed fetch, or null while none has
+   * completed: a prefetch that ran to completion (its key set, as
+   * `measuredKeys`), or a render of the displayed step whose loading
+   * finished (merged into the current set, see `handleChunkLoadingChange`).
+   * The step reads as 'cached' only when this is set and all of it is
+   * resident, so a step aborted partway (whose `keys` are all resident but
+   * incomplete) reads 'partial' and is fetched again.
+   */
+  completeKeys: Set<string> | null
 }
 
 export class ZarrLayer {
@@ -264,6 +274,13 @@ export class ZarrLayer {
     AbortSignal,
     { timeIndex: number; selection: string; keys: Set<string> }
   > = new WeakMap()
+  /**
+   * Render reads of the displayed step during the current chunk-loading
+   * episode (see handleChunkLoadingChange), or null outside one. `step` is
+   * the stepKey the reads were attributed to; a read for another step (the
+   * displayed step changed) restarts the set.
+   */
+  private renderEpisode: { step: string; keys: Set<string> } | null = null
   /** Memoized currentSelection(); reset when the selector or time dim changes. */
   private selectionCache: string | null = null
   /** Disposer for the continuous CachingStore access listener. */
@@ -511,8 +528,37 @@ export class ZarrLayer {
     loading: boolean
     chunks: boolean
   }): void => {
+    const wasLoading = this.chunksLoading
     this.chunksLoading = state.chunks
+    if (state.chunks && !wasLoading) {
+      // A render fetch starts: collect the displayed step's reads
+      this.renderEpisode = null
+    } else if (!state.chunks && wasLoading) {
+      this.completeRenderEpisode()
+    }
     this.emitLoadingState()
+  }
+
+  /**
+   * The mode finished loading chunks: the render of the displayed step is
+   * complete, so the keys it read count as a completed fetch of that step
+   * (merged with the step's earlier complete set: a pan only reads the new
+   * regions). Skipped if the displayed step changed since the reads, or
+   * nothing was read (e.g. everything came from the mode's own caches).
+   */
+  private completeRenderEpisode(): void {
+    const episode = this.renderEpisode
+    this.renderEpisode = null
+    if (!episode || episode.keys.size === 0 || this.initError) return
+    const timeIdx = this.getCurrentTimeIdx()
+    if (timeIdx === null) return
+    const step = this.stepKey(timeIdx, this.currentSelection())
+    if (episode.step !== step) return
+    const entry = this.timestepKeys.get(step)
+    if (!entry) return
+    const complete = new Set(entry.completeKeys ?? [])
+    for (const key of episode.keys) complete.add(key)
+    entry.completeKeys = complete
   }
 
   setOpacity(opacity: number) {
@@ -563,6 +609,7 @@ export class ZarrLayer {
       this.removeAccessListener = null
       this.prefetchQueue.clear()
       this.timestepKeys.clear()
+      this.renderEpisode = null
       this.keyBytes.clear()
       if (this.zarrStore) {
         this.zarrStore.cleanup()
@@ -591,6 +638,7 @@ export class ZarrLayer {
       this.removeAccessListener = null
       this.prefetchQueue.clear()
       this.timestepKeys.clear()
+      this.renderEpisode = null
       this.keyBytes.clear()
       if (this.zarrStore) {
         this.zarrStore.cleanup()
@@ -729,6 +777,8 @@ export class ZarrLayer {
         if (entry) {
           entry.measuredKeys = keys
           entry.measuredSeq = ++this.measureCount
+          // Exactly the step's chunks for the regions in view
+          entry.completeKeys = keys
         }
       }
       return done !== false
@@ -761,7 +811,15 @@ export class ZarrLayer {
     }
     const timeIdx = this.getCurrentTimeIdx()
     if (timeIdx !== null) {
-      this.recordChunkAccess(timeIdx, this.currentSelection(), cacheKey)
+      const selection = this.currentSelection()
+      this.recordChunkAccess(timeIdx, selection, cacheKey)
+      if (this.chunksLoading) {
+        const step = this.stepKey(timeIdx, selection)
+        if (this.renderEpisode?.step !== step) {
+          this.renderEpisode = { step, keys: new Set() }
+        }
+        this.renderEpisode.keys.add(cacheKey)
+      }
     }
   }
 
@@ -780,6 +838,7 @@ export class ZarrLayer {
         keys: new Set(),
         measuredKeys: null,
         measuredSeq: 0,
+        completeKeys: null,
       }
       this.timestepKeys.set(key, entry)
     }
@@ -810,8 +869,11 @@ export class ZarrLayer {
   /**
    * Get cache status for multiple time step indices, for the current values
    * of the other selector dims (e.g. the selected ensemble member).
-   * Returns 'cached' (all recorded chunks resident), 'partial' (some
-   * resident), or 'missing' (none resident or never fetched).
+   * Returns 'cached' when a fetch of the step completed (a prefetch, or a
+   * render of it while displayed) and all of that fetch's chunks are still
+   * resident; 'partial' when some of the step's recorded chunks are resident
+   * but it is not 'cached' (e.g. a prefetch aborted partway, or an evicted
+   * chunk); 'missing' when none are resident or it was never fetched.
    */
   getCacheStatus(
     timeIndices: number[]
@@ -820,23 +882,36 @@ export class ZarrLayer {
     const cachingStore = this.zarrStore?.cachingStore ?? null
     const selection = this.currentSelection()
     for (const idx of timeIndices) {
-      const keys = this.timestepKeys.get(this.stepKey(idx, selection))?.keys
-      if (!keys || keys.size === 0) {
+      const entry = this.timestepKeys.get(this.stepKey(idx, selection))
+      const keys = entry?.keys
+      if (!entry || !keys || keys.size === 0) {
         result[idx] = 'missing'
         continue
       }
+      const complete = entry.completeKeys
       if (!cachingStore) {
         // No byte cache configured — recorded keys are our only signal.
-        result[idx] = 'cached'
+        result[idx] = complete ? 'cached' : 'partial'
         continue
+      }
+      if (complete) {
+        let all = true
+        for (const key of complete) {
+          if (!cachingStore.has(key)) {
+            all = false
+            break
+          }
+        }
+        if (all) {
+          result[idx] = 'cached'
+          continue
+        }
       }
       let hits = 0
       for (const key of keys) {
         if (cachingStore.has(key)) hits++
       }
-      if (hits === keys.size) result[idx] = 'cached'
-      else if (hits === 0) result[idx] = 'missing'
-      else result[idx] = 'partial'
+      result[idx] = hits === 0 ? 'missing' : 'partial'
     }
     return result
   }

@@ -177,10 +177,12 @@ test('a render access during an in-flight prefetch is recorded under the display
   await tick()
   assert.equal(fetches.length, 1)
   // The map renders the displayed step (time 0) with its own request signal
+  layer.handleChunkLoadingChange({ loading: true, chunks: true })
   resident.add('m0/t0')
   layer.attributeChunkAccess('m0/t0', { signal: new AbortController().signal })
   // ...and an access without options (e.g. a metadata read)
   layer.attributeChunkAccess('m0/t0')
+  layer.handleChunkLoadingChange({ loading: false, chunks: false })
   fetches[0].release()
   await tick()
   assert.equal(layer.isTimeStepCached(0), true, 'displayed step recorded')

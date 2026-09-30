@@ -98,8 +98,9 @@ test('no estimate from coordinates and a partial displayed step; then the prefet
   await renderRead('/time/c/0')
   await renderRead('/lat/c/0')
   await renderRead('/v/c/0/0')
-  // All of step 0's recorded keys are resident, but its render isn't done
-  assert.equal(layer.isTimeStepCached(0), true)
+  // All of step 0's recorded keys are resident, but no fetch of it completed
+  assert.equal(layer.isTimeStepCached(0), false)
+  assert.equal(layer.getCacheStatus([0])[0], 'partial')
   assert.equal(layer.getEstimatedTimestepBytes(), null)
   assert.equal(layer.getRecommendedPrefetchCount(), null)
 
@@ -147,13 +148,12 @@ test('an aborted prefetch step does not count', async () => {
     keysFor: (m, t) => [`/v/c/${t}/0`, `/v/c/${t}/1`],
   })
   await fetchStep(1, { abortAfter: 1 })
-  assert.equal(layer.getCacheStatus([1])[1], 'cached', 'partial key set')
+  // Its recorded keys are all resident, but the step is incomplete
+  assert.equal(layer.getCacheStatus([1])[1], 'partial')
   assert.equal(layer.getEstimatedTimestepBytes(), null)
-  // Fetched again to completion (after an eviction, since the queue skips a
-  // step whose recorded keys are all resident): counts, with all its keys
-  store.setMaxBytes(0)
-  store.setMaxBytes(100_000)
+  // Fetched again to completion: counts, with all its keys
   await fetchStep(1)
+  assert.equal(layer.getCacheStatus([1])[1], 'cached')
   assert.equal(layer.getEstimatedTimestepBytes(), 2000)
 })
 
