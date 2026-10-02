@@ -316,6 +316,17 @@ export class CachingStore implements AsyncReadable {
   }
 
   /**
+   * Leave range mode for good: from now on getRange reads whole objects,
+   * as in full-object mode. Range entries already cached stay usable until
+   * the whole object is cached (see `store`). Reads in flight finish as
+   * range reads. For a caller that wanted range reads only for a while
+   * (`ZarrLayerOptions.firstFrameRangeRequests`); no warning.
+   */
+  stopRangeRequests(): void {
+    this._rangeRequests = false
+  }
+
+  /**
    * Change the byte budget of a live cache. Fractional values are floored;
    * an invalid value (non-finite or negative, see `validCacheBytes`) is
    * ignored with a warning and the current budget is kept.
