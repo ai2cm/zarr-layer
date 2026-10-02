@@ -3117,6 +3117,53 @@ export class UntiledMode implements ZarrMode {
   }
 
   /**
+   * Column offset from the query (display) frame to the array for 0-360 data.
+   * Queries map lon to columns against mercatorBounds, which is [-180, 180]
+   * for 0-360 data (mirroring the render shift), so display column c holds
+   * array column (c + shift) mod width. Zero for all other data.
+   */
+  private lon360ColumnShift(): number {
+    if (!this.lon360Wrap || !this.xyLimits || this.width <= 0) return 0
+    const { xMin, xMax } = this.xyLimits
+    const shift = Math.round(((-180 - xMin) / (xMax - xMin)) * this.width)
+    return ((shift % this.width) + this.width) % this.width
+  }
+
+  /**
+   * Split a display-frame pixel span where its shifted columns wrap past the
+   * array edge, so each part maps to one contiguous array slice.
+   */
+  private splitAtArrayEdge(
+    pixelBounds: PixelRect
+  ): [PixelRect] | [PixelRect, PixelRect] {
+    const shift = this.lon360ColumnShift()
+    if (shift === 0) return [pixelBounds]
+    const edge = this.width - shift
+    if (pixelBounds.minX >= edge || pixelBounds.maxX <= edge) {
+      return [pixelBounds]
+    }
+    return [
+      { ...pixelBounds, maxX: edge },
+      { ...pixelBounds, minX: edge },
+    ]
+  }
+
+  /**
+   * Map a display-frame pixel span (one that does not wrap, see
+   * splitAtArrayEdge) to array columns.
+   */
+  private toArrayPixelBounds(pixelBounds: PixelRect): PixelRect {
+    const shift = this.lon360ColumnShift()
+    if (shift === 0) return pixelBounds
+    const minX = (pixelBounds.minX + shift) % this.width
+    return {
+      ...pixelBounds,
+      minX,
+      maxX: minX + (pixelBounds.maxX - pixelBounds.minX),
+    }
+  }
+
+  /**
    * Compute subset bounds from pixel bounds against the full mercator bounds.
    */
   private computeSubsetBounds(pixelBounds: PixelRect): MercatorBounds {
@@ -3195,7 +3242,7 @@ export class UntiledMode implements ZarrMode {
     ): Promise<QueryResult | null> => {
       const fetched = await this.fetchQueryData(
         normalizedSelector,
-        pixelBounds,
+        this.toArrayPixelBounds(pixelBounds),
         opts?.signal
       )
       if (!fetched) return null
@@ -3252,6 +3299,33 @@ export class UntiledMode implements ZarrMode {
       )
     }
 
+    const { yDim, xDim } = findSpatialDimNames(
+      desc.dimensions,
+      false,
+      desc.dimIndices
+    )
+
+    // Run a display-frame pixel span. For 0-360 data a span that crosses the
+    // array's lon-0 edge after the 180° shift is fetched as two strips.
+    const runSpan = async (
+      geom: QueryGeometry,
+      pixelBounds: PixelRect,
+      opts?: QueryOptions
+    ): Promise<QueryResult | null> => {
+      const [first, second] = this.splitAtArrayEdge(pixelBounds)
+      const firstResult = await runStrip(geom, first, opts)
+      if (!second || !firstResult) return firstResult
+      const secondResult = await runStrip(geom, second, opts)
+      if (!secondResult) return null
+      return mergeQueryResults(
+        firstResult,
+        secondResult,
+        this.variable,
+        yDim,
+        xDim
+      )
+    }
+
     // Helper for the single-fetch path shared by proj4 and non-crossing cases
     const singleFetch = async (geom: QueryGeometry): Promise<QueryResult> => {
       const pixelBounds = computePixelBoundsFromGeometry(
@@ -3266,7 +3340,7 @@ export class UntiledMode implements ZarrMode {
         this.cachedWGS84Transformer ?? undefined
       )
       if (!pixelBounds) return emptyResult()
-      const result = await runStrip(geom, pixelBounds, options)
+      const result = await runSpan(geom, pixelBounds, options)
       return result ?? emptyResult()
     }
 
@@ -3296,8 +3370,10 @@ export class UntiledMode implements ZarrMode {
       return singleFetch(processedGeometry)
     }
 
-    // Crossing: raster extent guard (EPSG:4326 only — 3857 xyLimits are in meters)
+    // Crossing: raster extent guard (EPSG:4326 only — 3857 xyLimits are in meters).
+    // 0-360 data is queried in the shifted [-180, 180] frame, so it is exempt.
     if (
+      !this.lon360Wrap &&
       rasterExtentCrossesAntimeridian(this.crs ?? 'EPSG:4326', this.xyLimits)
     ) {
       if (!this._antimeridianWarnings.has('raster-extent-crossing')) {
@@ -3320,10 +3396,10 @@ export class UntiledMode implements ZarrMode {
     )
 
     const westResult = spans.west
-      ? await runStrip(processedGeometry, spans.west, options)
+      ? await runSpan(processedGeometry, spans.west, options)
       : null
     const eastResult = spans.east
-      ? await runStrip(processedGeometry, spans.east, options)
+      ? await runSpan(processedGeometry, spans.east, options)
       : null
 
     // If either requested strip failed, return empty rather than partial data
@@ -3333,11 +3409,6 @@ export class UntiledMode implements ZarrMode {
     if (!westResult && !eastResult) return emptyResult()
     if (!westResult || !eastResult) return (westResult ?? eastResult)!
 
-    const { yDim, xDim } = findSpatialDimNames(
-      desc.dimensions,
-      false,
-      desc.dimIndices
-    )
     return mergeQueryResults(westResult, eastResult, this.variable, yDim, xDim)
   }
 }
