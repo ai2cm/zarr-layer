@@ -1,5 +1,10 @@
 import * as zarr from 'zarrita'
-import type { AbsolutePath, Readable, AsyncReadable } from '@zarrita/storage'
+import type {
+  AbsolutePath,
+  Readable,
+  AsyncReadable,
+  GetOptions,
+} from '@zarrita/storage'
 import {
   CachingStore,
   DEFAULT_CHUNK_CACHE_BYTES,
@@ -95,6 +100,13 @@ interface ZarrStoreOptions {
    * Default false.
    */
   rangeRequests?: boolean
+  /**
+   * Background classifier for the CachingStore (see
+   * `CachingStore.setBackgroundClassifier`), installed as soon as it is
+   * created, so metadata and coordinate reads made during initialization
+   * are classified too.
+   */
+  backgroundClassifier?: (opts?: GetOptions) => boolean
 }
 
 interface StoreDescription {
@@ -292,6 +304,7 @@ export class ZarrStore {
   private maxChunkCacheBytes: number = DEFAULT_CHUNK_CACHE_BYTES
   private chunkCacheEnabled: boolean
   private rangeRequests: boolean
+  private backgroundClassifier: ((opts?: GetOptions) => boolean) | null
   /** The caching store wrapper, if chunk caching is enabled. */
   cachingStore: CachingStore | null = null
 
@@ -331,6 +344,7 @@ export class ZarrStore {
     maxChunkCacheBytes,
     chunkCacheEnabled,
     rangeRequests = false,
+    backgroundClassifier,
   }: ZarrStoreOptions) {
     if (!source && !customStore) {
       throw new Error('source is required when customStore is not provided')
@@ -378,6 +392,7 @@ export class ZarrStore {
     // Range mode lives in the chunk cache; without one, zarrita already
     // reads ranges straight from the base store
     this.rangeRequests = rangeRequests && this.chunkCacheEnabled
+    this.backgroundClassifier = backgroundClassifier ?? null
 
     this.initialized = this._initialize()
   }
@@ -452,6 +467,7 @@ export class ZarrStore {
           markBackground: !this.customStore,
         }
       )
+      this.cachingStore.setBackgroundClassifier(this.backgroundClassifier)
       this.store = this.cachingStore as unknown as ZarrStoreType
     }
 

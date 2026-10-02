@@ -220,6 +220,11 @@ export interface ZarrLayerOptions {
    * until it fits. `1` turns batching off. Default: 4.
    */
   prefetchBatchSteps?: number
+  /**
+   * Start with every read in the request gate's background lane, render
+   * reads included (see `ZarrLayer.setBackgroundReads`). Default: `false`.
+   */
+  backgroundReads?: boolean
 }
 
 export type CRS = 'EPSG:4326' | 'EPSG:3857'
