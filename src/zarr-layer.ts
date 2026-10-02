@@ -142,6 +142,12 @@ interface StepKeys {
    * incomplete) reads 'partial' and is fetched again.
    */
   completeKeys: Set<string> | null
+  /**
+   * The step's latest prefetch had a failed chunk read. The prefetch queue
+   * retries such a step itself, with backoff (task 44), so the window refill
+   * leaves it alone (see refillWindow). Cleared by a fetch that completes.
+   */
+  lastFetchFailed: boolean
 }
 
 /** Largest shard batch (time steps) the prefetch queue starts together. */
@@ -321,7 +327,7 @@ export class ZarrLayer {
    * lazily (on the next eviction) after anything they depend on changes.
    */
   private protectedKeys: {
-    window: Set<string>
+    window: Map<string, number>
     displayed: Set<string>
   } | null = null
   private mapboxDirectGlobePathAvailable: boolean = false
@@ -618,6 +624,7 @@ export class ZarrLayer {
       for (const key of this.displayedReads.keys) complete.add(key)
     }
     entry.completeKeys = complete
+    entry.lastFetchFailed = false
     this.protectedKeys = null
   }
 
@@ -802,24 +809,45 @@ export class ZarrLayer {
    * CachingStore eviction tier of a key (see `CachingStore.setEvictionPolicy`):
    * keys of the displayed step are kept longest, then keys of the prefetch
    * window's steps, and everything else (steps behind the playhead, an old
-   * window, metadata) is evicted first. Within a tier eviction stays LRU,
-   * so a window that doesn't fit the budget still evicts inside itself.
+   * window, metadata) is evicted first, LRU. Window keys get a priority in
+   * [EVICTION_TIER_WINDOW, EVICTION_TIER_DISPLAYED) by their step's window
+   * position (see getProtectedKeys), so a window that doesn't fit the
+   * budget evicts inside itself from its far end.
    */
   private evictionPriority(cacheKey: string): number {
     const keys = this.getProtectedKeys()
     if (keys.displayed.has(cacheKey)) return EVICTION_TIER_DISPLAYED
-    if (keys.window.has(cacheKey)) return EVICTION_TIER_WINDOW
-    return EVICTION_TIER_OTHER
+    return keys.window.get(cacheKey) ?? EVICTION_TIER_OTHER
   }
 
-  private getProtectedKeys(): { window: Set<string>; displayed: Set<string> } {
+  /**
+   * Window keys map to a priority inside the window tier by the step's
+   * position (the window is in priority order): from just under
+   * EVICTION_TIER_DISPLAYED for the first step down to EVICTION_TIER_WINDOW
+   * for the last. So a window over the budget (an estimate that was low)
+   * evicts its farthest steps first, not the least recently used ones,
+   * which are the steps nearest the playhead (fetched first). A key shared
+   * by several steps takes the nearest one's.
+   */
+  private getProtectedKeys(): {
+    window: Map<string, number>
+    displayed: Set<string>
+  } {
     if (this.protectedKeys) return this.protectedKeys
     const selection = this.currentSelection()
-    const window = new Set<string>()
-    for (const idx of this.prefetchWindow?.indices ?? []) {
+    const window = new Map<string, number>()
+    const indices = this.prefetchWindow?.indices ?? []
+    const n = indices.length
+    indices.forEach((idx, pos) => {
       const entry = this.timestepKeys.get(this.stepKey(idx, selection))
-      if (entry) for (const key of entry.keys) window.add(key)
-    }
+      if (!entry) return
+      const priority =
+        EVICTION_TIER_WINDOW +
+        ((n - 1 - pos) / n) * (EVICTION_TIER_DISPLAYED - EVICTION_TIER_WINDOW)
+      for (const key of entry.keys) {
+        if (!window.has(key)) window.set(key, priority)
+      }
+    })
     const displayed = new Set<string>()
     const timeIdx = this.getCurrentTimeIdx()
     if (timeIdx !== null) {
@@ -876,9 +904,13 @@ export class ZarrLayer {
   }
 
   /**
-   * Resubmit the last prefetch window when the queue is idle and a step in
-   * it is no longer cached (evicted, or a chunk fetch failed), so holes refill
-   * without waiting for the caller's next move. Skipped when the window
+   * Refetch the holes of the last prefetch window when the queue is idle:
+   * steps that read chunks which are no longer all resident (evicted, or a
+   * fetch cut short), so they refill without waiting for the caller's next
+   * move. A step whose latest fetch failed is not a hole: the prefetch
+   * queue already retried it with backoff (task 44), and retrying it here
+   * too would multiply its attempts against the request budget. Skipped
+   * when the window
    * doesn't fit the cache budget (refilling would only evict another of its
    * steps), and at most MAX_WINDOW_REFILLS times per window.
    */
@@ -890,25 +922,25 @@ export class ZarrLayer {
     }
     if (window.dim !== this.prefetchTimeDimName) return
     if (this.windowRefills >= MAX_WINDOW_REFILLS) return
-    // A hole is a step that read chunks which are no longer all resident.
-    // A step with no recorded keys is left to the caller's next window: its
-    // fetch read nothing (every chunk absent, e.g. a sparse store, or it
-    // failed before any read), and refetching it would only repeat that.
+    // A hole is a step that read chunks which are no longer all resident,
+    // and whose latest fetch didn't fail. A step with no recorded keys is
+    // left to the caller's next window: its fetch read nothing (every chunk
+    // absent, e.g. a sparse store, or it failed before any read), and
+    // refetching it would only repeat that.
     const selection = this.currentSelection()
     const status = this.getCacheStatus(window.indices)
-    const holes = window.indices.filter(
-      (idx) =>
-        status[idx] !== 'cached' &&
-        (this.timestepKeys.get(this.stepKey(idx, selection))?.keys.size ?? 0) >
-          0
-    )
+    const holes = window.indices.filter((idx) => {
+      if (status[idx] === 'cached') return false
+      const entry = this.timestepKeys.get(this.stepKey(idx, selection))
+      return !!entry && entry.keys.size > 0 && !entry.lastFetchFailed
+    })
     if (holes.length === 0) return
     if (!this.windowFitsBudget(window.indices)) return
     this.windowRefills++
-    // Only the holes: the queue is idle, so nothing else is queued or in
-    // flight, and the other uncached steps (no recorded keys) would only
-    // repeat a fetch that read nothing.
-    this.prefetchQueue.set(holes, window.dim)
+    // Only the holes, at their positions in the window (requeue keeps the
+    // queue's window, so the near rule and shard batching apply as for the
+    // window itself)
+    this.prefetchQueue.requeue(holes, window.dim)
   }
 
   /**
@@ -1039,6 +1071,8 @@ export class ZarrLayer {
         }
       }
       if (done === false) return false
+      const entry = this.timestepKeys.get(this.stepKey(timeIdx, selection))
+      if (!signal.aborted && entry) entry.lastFetchFailed = failed
       // A failed read: the queue retries the step with backoff (task 44)
       return failed && !signal.aborted ? 'failed' : true
     } finally {
@@ -1096,6 +1130,7 @@ export class ZarrLayer {
         measuredKeys: null,
         measuredSeq: 0,
         completeKeys: null,
+        lastFetchFailed: false,
       }
       this.timestepKeys.set(key, entry)
     }

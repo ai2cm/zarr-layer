@@ -252,6 +252,33 @@ export class PrefetchQueue {
     this.fill()
   }
 
+  /**
+   * Queue `timeIndices` of the latest window again, keeping that window
+   * (its positions and appended steps), so the near rule and shard
+   * batching treat them as they would in the window: unlike set(), which
+   * would make them a window of their own, every one of them in the near
+   * positions and none batched. Steps the window doesn't list, cached
+   * steps and steps in flight are skipped; pending steps are kept, and
+   * everything pending runs in window order. A different time dim is a
+   * no-op.
+   */
+  requeue(timeIndices: number[], timeDimName: string = 'time'): void {
+    if (timeDimName !== this.dim) return
+    const inFlight = new Set(this.inFlightIndices)
+    const queued = new Set(this.pending)
+    for (const idx of timeIndices) {
+      if (!this.windowPos.has(idx) || queued.has(idx) || inFlight.has(idx)) {
+        continue
+      }
+      if (this.isCached(idx)) continue
+      queued.add(idx)
+      this.pending.push(idx)
+    }
+    const pos = (idx: number) => this.windowPos.get(idx) ?? Infinity
+    this.pending.sort((x, y) => pos(x) - pos(y))
+    this.fill()
+  }
+
   /** Drop all pending steps and abort every step in flight. */
   clear(): void {
     this.pending = []

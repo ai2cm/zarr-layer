@@ -236,19 +236,23 @@ layer.prefetchTimeSteps([12, 10, 13, 9])
 - The call is a no-op until the layer has initialized (after `onAdd` finishes
   loading metadata).
 - **Eviction order.** The latest window also steers chunk-cache eviction. When
-  the cache is over budget it evicts, least recently used first within each
-  tier: first entries outside the window (steps behind a forward window, an
-  old window, metadata), then the window's steps' recorded keys, and last the
-  displayed step (its complete view plus what it has read since it became
-  displayed). If the protected tiers alone exceed the budget, eviction falls
-  back to LRU inside them.
+  the cache is over budget it evicts in this order: first entries outside the
+  window (steps behind a forward window, an old window, metadata; least
+  recently used first), then the window's steps' recorded keys, farthest step
+  in the window first, and last the displayed step (its complete view plus
+  what it has read since it became displayed). So a window that turns out not
+  to fit (an estimate that was low) gives up its far end, not the steps next
+  to the playhead.
 - **Window refill.** 500 ms after the queue goes idle, or after an in-window
-  entry is evicted while it is idle, the layer checks the latest window. If a
-  step that read chunks is no longer `cached` (evicted, or a chunk fetch
-  failed), it resubmits the window. This happens at most twice per
-  `prefetchTimeSteps` call, and only while the window's known sizes fit the
-  budget, so a window that doesn't fit can't loop. A step that read no chunks
-  (every chunk absent) is not refilled.
+  entry is evicted while it is idle, the layer checks the latest window. It
+  refetches only the holes: steps that read chunks which are no longer all
+  resident (evicted, or cut short), at their positions in the window, so the
+  queue batches them as it would the window. A step whose latest fetch failed
+  is not a hole: the queue already retried it with backoff, and the refill
+  doesn't add retries against the request budget. A refill happens at most
+  twice per `prefetchTimeSteps` call, and only while the window's known sizes
+  fit the budget, so a window that doesn't fit can't loop. A step that read no
+  chunks (every chunk absent) is not refilled.
 
 ## selectors
 
