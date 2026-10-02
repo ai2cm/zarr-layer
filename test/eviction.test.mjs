@@ -510,3 +510,36 @@ test('requeue keeps the window positions: refilled far steps still batch', () =>
     return queue.whenIdle()
   })
 })
+
+test('requeue keeps the appended flags: an appended hole at position 0-1 starts alone, later ones batch', async () => {
+  const started = []
+  const cached = new Set()
+  const queue = new PrefetchQueue({
+    fetchStep: async (idx, _dim, _signal, info) => {
+      started.push({ idx, batch: info.batch })
+      cached.add(idx)
+      return true
+    },
+    isCached: (i) => cached.has(i),
+    maxConcurrentSteps: 1,
+    batchSize: () => 4,
+    batchNearSteps: 8,
+  })
+  queue.set([0, 1])
+  await queue.whenIdle()
+  // Playback extends the window: 1 kept (position 0), 2-5 appended
+  // (positions 1-4)
+  queue.set([1, 2, 3, 4, 5])
+  await queue.whenIdle()
+  // Holes: 2 (appended, position 1), 4 and 5 (appended, positions 3-4,
+  // batch 1)
+  for (const i of [2, 4, 5]) cached.delete(i)
+  started.length = 0
+  queue.requeue([2, 4, 5])
+  await queue.whenIdle()
+  assert.deepEqual(started, [
+    { idx: 2, batch: undefined },
+    { idx: 4, batch: 1 },
+    { idx: 5, batch: 1 },
+  ])
+})

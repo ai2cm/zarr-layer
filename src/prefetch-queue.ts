@@ -261,6 +261,11 @@ export class PrefetchQueue {
    * steps and steps in flight are skipped; pending steps are kept, and
    * everything pending runs in window order. A different time dim is a
    * no-op.
+   *
+   * The appended flags are left as they are: a requeued step the window
+   * appended keeps its batch exemption (and, pending again, carries it into
+   * the next set()), one it didn't is not given one, and the first
+   * APPENDED_NEAR_STEPS positions start alone either way (see isNear).
    */
   requeue(timeIndices: number[], timeDimName: string = 'time'): void {
     if (timeDimName !== this.dim) return
