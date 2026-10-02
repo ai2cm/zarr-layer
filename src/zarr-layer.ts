@@ -640,13 +640,23 @@ export class ZarrLayer {
    * `RENDER_RESERVE` tokens. Off (the default): only prefetch reads are
    * background.
    *
+   * Covers every read through the layer's chunk cache: chunk reads, the
+   * metadata and coordinate reads of initialization and `setVariable`, and
+   * `queryData`. Not the consolidated-metadata read made when a source is
+   * first opened, which the page's layers on that source share.
+   *
    * Applies to requests issued after the call; requests already in flight
    * or waiting at the gate keep their lane. A read that joins a fetch
-   * already in flight (same key) shares that fetch and its lane, and a
-   * coalesced range request is background only if every member is (so a
-   * visible layer's read merged with this layer's makes it a render
-   * request). Can be called before the layer is added. No effect without
-   * the chunk cache (`maxChunkCacheBytes: 0`) or with a custom `store`.
+   * already in flight (same key) shares that fetch and its lane, so right
+   * after a flip to `false` such a read can still wait in the background
+   * lane. With a rate cap that wait is bounded by demand, not time (render
+   * reads go first, including this layer's other reads), so the worst case
+   * is a few chunks of the flipped-to frame arriving last while other
+   * visible layers keep the render lane busy. A coalesced range request is
+   * background only if every member is (so a visible layer's read merged
+   * with this layer's makes it a render request). Can be called before the
+   * layer is added. No effect without the chunk cache
+   * (`maxChunkCacheBytes: 0`) or with a custom `store`.
    */
   setBackgroundReads(on: boolean): void {
     this.backgroundReads = !!on
@@ -905,12 +915,13 @@ export class ZarrLayer {
       }
     )
     this.installEvictionPolicy(cachingStore)
-    cachingStore.setBackgroundClassifier(
-      (opts) =>
-        this.backgroundReads ||
-        (!!opts?.signal && this.prefetchSignals.has(opts.signal))
-    )
+    cachingStore.setBackgroundClassifier(this.isBackgroundRead)
   }
+
+  /** The background classifier (see attachCachingStore). */
+  private readonly isBackgroundRead = (opts?: GetOptions): boolean =>
+    this.backgroundReads ||
+    (!!opts?.signal && this.prefetchSignals.has(opts.signal))
 
   /** Make `cachingStore` evict by this layer's tiers (evictionPriority). */
   private installEvictionPolicy(cachingStore: CachingStore): void {
@@ -1572,6 +1583,9 @@ export class ZarrLayer {
         maxChunkCacheBytes: this.maxChunkCacheBytes,
         chunkCacheEnabled: this.chunkCacheEnabled,
         rangeRequests: this.rangeRequests,
+        // Before metadata loads, so a background-reads layer's metadata and
+        // coordinate reads are background too
+        backgroundClassifier: this.isBackgroundRead,
       })
 
       await this.zarrStore.initialized

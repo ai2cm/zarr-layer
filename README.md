@@ -259,7 +259,10 @@ request gate, and with a rate cap prefetch leaves `RENDER_RESERVE` (2) tokens
 for them. `setBackgroundReads(true)` (or the `backgroundReads: true`
 constructor option) puts _all_ of a layer's reads, render reads included, in
 the background lane: for a hidden layer (opacity 0) that keeps rendering so
-it can be shown instantly, whose reads nobody waits for. Call
+it can be shown instantly, whose reads nobody waits for. That covers chunk
+reads, metadata and coordinate reads (initialization, `setVariable`) and
+`queryData`; not the consolidated-metadata read when a source is first
+opened (shared by the layers on that source). Call
 `setBackgroundReads(false)` when it becomes visible; it applies to requests
 issued after the call (ones in flight keep their lane). A read that joins an
 in-flight fetch of the same key shares its lane, and a coalesced range

@@ -398,3 +398,50 @@ test("ZarrLayer: with a capped gate, a background-reads layer's render reads wai
   await Promise.all(reads)
   assert.deepEqual(sent.slice(5), ['/h/2', '/h/3'])
 })
+
+// Review (zarr-layer#13): the classifier is installed before metadata loads,
+// so a background-reads layer's init reads are background too. The
+// consolidated-metadata read happens below the CachingStore (shared by the
+// store cache) and stays in the render lane.
+test('ZarrStore: backgroundClassifier applies to metadata reads during initialization', async () => {
+  const { requestGateFor } = await loadSrc('src/request-gate.ts')
+  const { ZarrStore } = await loadSrc('src/zarr-store.ts')
+  const original = globalThis.fetch
+  const run = async (host, backgroundClassifier) => {
+    const seen = []
+    const gate = requestGateFor(`http://${host}/`)
+    const acquire = gate.acquire.bind(gate)
+    let lane = null
+    gate.acquire = (signal, opts) => {
+      lane = opts?.background ? 'bg' : 'render'
+      return acquire(signal, opts)
+    }
+    globalThis.fetch = async (request) => {
+      seen.push(`${new URL(request.url).pathname}:${lane}`)
+      return new Response('', { status: 404 })
+    }
+    try {
+      const zs = new ZarrStore({
+        source: `http://${host}/s.zarr`,
+        variable: 'v',
+        backgroundClassifier,
+      })
+      await zs.initialized.catch(() => {})
+    } finally {
+      globalThis.fetch = original
+    }
+    return seen
+  }
+  const bg = await run('bg-meta.invalid', () => true)
+  assert.deepEqual(bg.slice(0, 2), [
+    '/s.zarr/.zmetadata:render',
+    '/s.zarr/zarr.json:render',
+  ])
+  assert.ok(bg.length > 2)
+  assert.ok(
+    bg.slice(2).every((s) => s.endsWith(':bg')),
+    `reads through the CachingStore are background: ${bg}`
+  )
+  const render = await run('render-meta.invalid', undefined)
+  assert.ok(render.every((s) => s.endsWith(':render')))
+})
