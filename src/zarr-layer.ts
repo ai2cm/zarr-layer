@@ -729,8 +729,12 @@ export class ZarrLayer {
     // any await, so a prefetchTimeSteps call right after setSelector queues
     // steps for the new selection. Recorded step keys are kept: they are
     // per selection, so switching back reads as cached without a refetch.
+    // The window is forgotten too: its indices were sent for the old
+    // selection, so they must not protect or refill the new one's steps
+    // (the caller sends a window for the new selection).
     if (this.currentSelection() !== previousSelection) {
       this.prefetchQueue.clear()
+      this.resetPrefetchWindow()
     }
 
     this.bandNames = getBands(this.variable, this.normalizedSelector)

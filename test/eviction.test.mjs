@@ -7,9 +7,12 @@ import { loadSrc } from './load-src.mjs'
 
 const { CachingStore } = await loadSrc('src/caching-store.ts')
 const { ZarrLayer } = await loadSrc('src/zarr-layer.ts')
-const { WINDOW_REFILL_DELAY_MS, MAX_WINDOW_REFILLS } = await loadSrc(
-  'src/constants.ts'
-)
+const {
+  WINDOW_REFILL_DELAY_MS,
+  MAX_WINDOW_REFILLS,
+  EVICTION_TIER_OTHER,
+  EVICTION_TIER_WINDOW,
+} = await loadSrc('src/constants.ts')
 
 const tick = () => new Promise((r) => setTimeout(r, 0))
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -126,8 +129,13 @@ function evictionLayer({
     selector: { time: { selected: 0, type: 'index' } },
     prefetchConcurrency,
   })
-  const keysFor = (t) =>
-    Array.from({ length: chunks }, (_, i) => `/v/c/${t}/${i}`)
+  // Keys of step t for ensemble member m (a non-time selector dim); no
+  // member keeps the plain /v/c/<t>/<i> keys
+  const keysFor = (t, m) =>
+    Array.from({ length: chunks }, (_, i) =>
+      m === undefined ? `/v/c/${t}/${i}` : `/v/c/${t}/${m}/${i}`
+    )
+  const member = () => layer.selector?.member?.selected
   const baseGets = []
   const base = {
     async get(key) {
@@ -151,7 +159,7 @@ function evictionLayer({
     dispose() {},
     async prefetchTimeSteps(indices, dim, signal, options) {
       stepFetches.push(indices[0])
-      for (const key of keysFor(indices[0])) {
+      for (const key of keysFor(indices[0], member())) {
         try {
           await store.get(key, { signal })
         } catch {
@@ -348,4 +356,36 @@ test('no refill for a step that read nothing (every chunk absent)', async () => 
   assert.equal(layer.getCacheStatus([2])[2], 'missing')
   await sleep(2 * (WINDOW_REFILL_DELAY_MS + 100))
   assert.deepEqual(stepFetches, [1, 2, 3])
+})
+
+test('a non-time selector change forgets the window: no refill or protection for the new selection', async () => {
+  const sel = (m) => ({
+    time: { selected: 0, type: 'index' },
+    member: { selected: m, type: 'index' },
+  })
+  // Member 1's steps 1-3 recorded first; then window 1-3 for member 0, with
+  // a failed chunk so a refill is pending
+  const failing = new Map([['/v/c/2/0/1', 1]])
+  const { layer, prefetch, keysFor, stepFetches } = evictionLayer({
+    maxBytes: 100_000,
+    failing,
+  })
+  await layer.setSelector(sel(1))
+  await prefetch([1, 2, 3])
+  await sleep(WINDOW_REFILL_DELAY_MS + 100)
+  await layer.setSelector(sel(0))
+  await prefetch([1, 2, 3])
+  assert.equal(layer.evictionPriority(keysFor(1, 0)[0]), EVICTION_TIER_WINDOW)
+  // Back to member 1 before the refill check runs
+  await layer.setSelector(sel(1))
+  assert.equal(layer.prefetchWindow, null)
+  // Member 1's keys for the old window's indices are not protected
+  for (const t of [1, 2, 3]) {
+    assert.equal(layer.evictionPriority(keysFor(t, 1)[0]), EVICTION_TIER_OTHER)
+  }
+  const fetchesBefore = stepFetches.length
+  await sleep(WINDOW_REFILL_DELAY_MS + 100)
+  await tick()
+  // No refill of the old window (member 0's partial step 2, or member 1)
+  assert.equal(stepFetches.length, fetchesBefore)
 })
