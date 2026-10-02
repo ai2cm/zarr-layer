@@ -300,6 +300,7 @@ export class ZarrLayer {
    */
   /** All reads in the gate's background lane (see setBackgroundReads). */
   private backgroundReads: boolean
+  private preloadedObjects: ZarrLayerOptions['preloadedObjects']
   private prefetchSignals: WeakMap<
     AbortSignal,
     { timeIndex: number; selection: string; keys: Set<string> }
@@ -456,6 +457,7 @@ export class ZarrLayer {
     requestBurst,
     prefetchBatchSteps,
     backgroundReads = false,
+    preloadedObjects,
   }: ZarrLayerOptions) {
     if (!id) {
       throw new Error('[ZarrLayer] id is required')
@@ -522,6 +524,7 @@ export class ZarrLayer {
     this.proj4 = proj4
     this.transformRequest = transformRequest
     this.backgroundReads = !!backgroundReads
+    this.preloadedObjects = preloadedObjects
     this.customStore = store
     this.renderPoles = renderPoles
     // An invalid budget behaves exactly like an unset one (100 MB chunk
@@ -1586,9 +1589,22 @@ export class ZarrLayer {
         // Before metadata loads, so a background-reads layer's metadata and
         // coordinate reads are background too
         backgroundClassifier: this.isBackgroundRead,
+        preloadedObjects: this.preloadedObjects,
       })
+      const initialized = this.zarrStore.initialized
+      // Reported by the await below (metadataReady rejects with it first)
+      initialized.catch(() => {})
 
-      await this.zarrStore.initialized
+      // With the array metadata in, the displayed step's shard index and the
+      // non-spatial dimension values are read concurrently with the bounds
+      // coordinates rather than after them (ace-viz task 52)
+      await this.zarrStore.metadataReady
+      this.prefetchInitialShardIndexes()
+      const early = this.zarrStore.describe()
+      this.levelInfos = early.levels
+      this.dimIndices = early.dimIndices
+      this.normalizedSelector = normalizeSelector(this.selector)
+      await Promise.all([initialized, this.loadInitialDimensionValues()])
 
       // Install a continuous access listener so chunks fetched during render
       // frames (which happen asynchronously, not inside setSelector) are
@@ -1613,9 +1629,6 @@ export class ZarrLayer {
         this._fillValue = desc.fill_value
       }
 
-      this.normalizedSelector = normalizeSelector(this.selector)
-      await this.loadInitialDimensionValues()
-
       this.bandNames = getBands(this.variable, this.normalizedSelector)
       if (this.bandNames.length > 1 || this.customFrag) {
         this.customShaderConfig = {
@@ -1637,7 +1650,9 @@ export class ZarrLayer {
   }
 
   private async loadInitialDimensionValues(): Promise<void> {
-    if (!this.zarrStore?.root) return
+    const zarrStore = this.zarrStore
+    if (!zarrStore?.root) return
+    const root = zarrStore.root
 
     const multiscaleLevel =
       this.levelInfos.length > 0 ? this.levelInfos[0] : null
@@ -1645,16 +1660,20 @@ export class ZarrLayer {
     for (const [dimName, value] of Object.entries(this.selector)) {
       this.normalizedSelector[dimName] = toSelectorProps(value)
     }
-    for (const dimName of Object.keys(this.dimIndices)) {
-      // Skip spatial dimensions - don't load coordinate arrays for these
-      if (!SPATIAL_DIM_NAMES.has(dimName.toLowerCase())) {
+    // Spatial dimensions are skipped: their coordinate arrays aren't loaded
+    // here. The others are read concurrently.
+    const dimNames = Object.keys(this.dimIndices).filter(
+      (dimName) => !SPATIAL_DIM_NAMES.has(dimName.toLowerCase())
+    )
+    await Promise.all(
+      dimNames.map(async (dimName) => {
         try {
           this.dimensionValues[dimName] = await loadDimensionValues(
             this.dimensionValues,
             multiscaleLevel,
             this.dimIndices[dimName],
-            this.zarrStore.root,
-            this.zarrStore.version
+            root,
+            zarrStore.version
           )
 
           if (!this.normalizedSelector[dimName]) {
@@ -1663,8 +1682,24 @@ export class ZarrLayer {
         } catch (err) {
           console.warn(`Failed to load dimension values for ${dimName}:`, err)
         }
-      }
+      })
+    )
+  }
+
+  /**
+   * Start reading the shard indexes of the step the selector shows (see
+   * `ZarrStore.prefetchShardIndexes`), when every non-spatial dimension is
+   * selected by index. Fire and forget.
+   */
+  private prefetchInitialShardIndexes(): void {
+    if (!this.zarrStore) return
+    const selection: Record<string, number> = {}
+    for (const [dimName, props] of Object.entries(this.normalizedSelector)) {
+      const selected = props?.selected
+      if (props?.type !== 'index' || typeof selected !== 'number') return
+      selection[dimName] = selected
     }
+    void this.zarrStore.prefetchShardIndexes(selection)
   }
 
   private isZoomInRange(): boolean {

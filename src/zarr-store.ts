@@ -107,6 +107,84 @@ interface ZarrStoreOptions {
    * are classified too.
    */
   backgroundClassifier?: (opts?: GetOptions) => boolean
+  /**
+   * Store objects the caller already read (or is reading), by key relative
+   * to the store root: e.g. the root `zarr.json` and coordinate chunks such
+   * as `time/c/0`. Reads of these keys use them instead of the network (see
+   * `withPreloadedObjects`). A root `zarr.json` with `zarr_format: 3` also
+   * sets `version` to 3 when it is not given, so no v2 key is probed.
+   */
+  preloadedObjects?: PreloadedObjects
+}
+
+/**
+ * Store objects by key relative to the store root (`zarr.json`,
+ * `time/c/0`): their bytes, `undefined` for an object known to be missing,
+ * or a promise of either (a read still in flight).
+ */
+export type PreloadedObjects = Record<
+  string,
+  Uint8Array | undefined | Promise<Uint8Array | undefined>
+>
+
+/** `zarr.json` -> `/zarr.json` (store keys are absolute paths). */
+const absoluteKey = (key: string): AbsolutePath =>
+  `/${key.replace(/^\/+/, '')}` as AbsolutePath
+
+/**
+ * Wrap a store so reads of preloaded keys are served from `preloaded`
+ * (absolute keys) instead of the base store. A preloaded read that rejects
+ * falls back to the base store. Ranges of a preloaded object are sliced
+ * from it. The map is live: keys added later are used too.
+ */
+export function withPreloadedObjects<S extends AsyncReadable>(
+  store: S,
+  preloaded: Map<
+    AbsolutePath,
+    Uint8Array | undefined | Promise<Uint8Array | undefined>
+  >
+): AsyncReadable {
+  const preloadedBytes = async (
+    key: AbsolutePath
+  ): Promise<{ hit: boolean; bytes?: Uint8Array }> => {
+    if (!preloaded.has(key)) return { hit: false }
+    try {
+      return { hit: true, bytes: await preloaded.get(key) }
+    } catch {
+      // The caller's read failed: read it ourselves
+      preloaded.delete(key)
+      return { hit: false }
+    }
+  }
+  const wrapped: AsyncReadable = {
+    async get(key, opts) {
+      const { hit, bytes } = await preloadedBytes(key)
+      return hit ? bytes : store.get(key, opts)
+    },
+  }
+  if (typeof store.getRange === 'function') {
+    wrapped.getRange = async (key, range, opts) => {
+      const { hit, bytes } = await preloadedBytes(key)
+      if (!hit) return store.getRange!(key, range, opts)
+      if (!bytes) return undefined
+      return 'suffixLength' in range
+        ? bytes.slice(Math.max(0, bytes.length - range.suffixLength))
+        : bytes.slice(range.offset, range.offset + range.length)
+    }
+  }
+  return wrapped
+}
+
+/** The `zarr_format` of a preloaded root `zarr.json`, if it is readable now. */
+function preloadedZarrFormat(preloaded?: PreloadedObjects): number | null {
+  const bytes = preloaded?.['zarr.json'] ?? preloaded?.['/zarr.json']
+  if (!(bytes instanceof Uint8Array)) return null
+  try {
+    const format = JSON.parse(new TextDecoder().decode(bytes))?.zarr_format
+    return typeof format === 'number' ? format : null
+  } catch {
+    return null
+  }
 }
 
 interface StoreDescription {
@@ -262,8 +340,17 @@ export async function readShardShape(
   }
 }
 
+interface CachedStore {
+  store: Promise<ZarrStoreType>
+  /** The preloaded objects its base store serves (see withPreloadedObjects). */
+  preloaded: Map<
+    AbsolutePath,
+    Uint8Array | undefined | Promise<Uint8Array | undefined>
+  >
+}
+
 export class ZarrStore {
-  private static _storeCache = new Map<string, Promise<ZarrStoreType>>()
+  private static _storeCache = new Map<string, CachedStore>()
 
   source: string
   version: 2 | 3 | null
@@ -328,6 +415,16 @@ export class ZarrStore {
   >()
 
   initialized: Promise<this>
+  /**
+   * Resolves once the root group and the variable's array metadata are read
+   * (dimensions, shape, chunks, levels), before the coordinate reads that
+   * `initialized` also waits for; rejects if initialization fails first.
+   * Lets a caller start reads that only need the array metadata (e.g.
+   * `prefetchShardIndexes`) concurrently with the coordinates.
+   */
+  metadataReady: Promise<this>
+  private _resolveMetadata!: (store: this) => void
+  private preloadedObjects?: PreloadedObjects
 
   constructor({
     source,
@@ -345,6 +442,7 @@ export class ZarrStore {
     chunkCacheEnabled,
     rangeRequests = false,
     backgroundClassifier,
+    preloadedObjects,
   }: ZarrStoreOptions) {
     if (!source && !customStore) {
       throw new Error('source is required when customStore is not provided')
@@ -353,7 +451,12 @@ export class ZarrStore {
       throw new Error('variable is a required parameter')
     }
     this.source = source ?? 'custom-store'
-    this.version = version
+    // A preloaded root zarr.json tells the format: open only that one
+    // (zarrita's auto-detection probes v2 keys first on a fresh store)
+    const preloadedFormat = preloadedZarrFormat(preloadedObjects)
+    this.version =
+      version ?? (preloadedFormat === 3 ? 3 : preloadedFormat === 2 ? 2 : null)
+    this.preloadedObjects = preloadedObjects
     this.variable = variable
     this.spatialDimensions = spatialDimensions
     this.explicitBounds = bounds ?? null
@@ -394,7 +497,15 @@ export class ZarrStore {
     this.rangeRequests = rangeRequests && this.chunkCacheEnabled
     this.backgroundClassifier = backgroundClassifier ?? null
 
+    let rejectMetadata!: (err: unknown) => void
+    this.metadataReady = new Promise<this>((resolve, reject) => {
+      this._resolveMetadata = resolve
+      rejectMetadata = reject
+    })
+    // Not every caller waits on it; `initialized` reports the same error
+    this.metadataReady.catch(() => {})
     this.initialized = this._initialize()
+    this.initialized.catch(rejectMetadata)
   }
 
   private async _initialize(): Promise<this> {
@@ -414,15 +525,33 @@ export class ZarrStore {
       this.store = this.customStore as ZarrStoreType
     } else {
       const bypassCache = !!this.transformRequest
-      let storePromise = bypassCache
+      let cached = bypassCache
         ? undefined
         : ZarrStore._storeCache.get(storeCacheKey)
 
-      if (!storePromise) {
-        const baseStore = createFetchStore(
-          this.source,
-          this.transformRequest,
-          this.rangeRequests
+      if (cached) {
+        // A store opened by an earlier layer: its base store serves this
+        // layer's preloaded objects too (those it doesn't have yet)
+        for (const [key, value] of Object.entries(
+          this.preloadedObjects ?? {}
+        )) {
+          const abs = absoluteKey(key)
+          if (!cached.preloaded.has(abs)) cached.preloaded.set(abs, value)
+        }
+      } else {
+        const preloaded: CachedStore['preloaded'] = new Map()
+        for (const [key, value] of Object.entries(
+          this.preloadedObjects ?? {}
+        )) {
+          preloaded.set(absoluteKey(key), value)
+        }
+        const baseStore = withPreloadedObjects(
+          createFetchStore(
+            this.source,
+            this.transformRequest,
+            this.rangeRequests
+          ),
+          preloaded
         )
         // When the version is known, tell the consolidated-metadata wrapper
         // to only try that format — avoids a wasted .zmetadata fetch on v3
@@ -439,7 +568,7 @@ export class ZarrStore {
         // round-trips, reducing latency when fetching many tiles in parallel.
         // Our own copy of zarrita's: a group is aborted only when all of its
         // requests are, so one caller's abort never fails another's range.
-        storePromise = zarr.extendStore(
+        const storePromise = zarr.extendStore(
           baseStore,
           (store) =>
             zarr
@@ -447,12 +576,13 @@ export class ZarrStore {
               .catch(() => store),
           (store) => withRangeCoalescing(store)
         ) as Promise<ZarrStoreType>
+        cached = { store: storePromise, preloaded }
         if (!bypassCache) {
-          ZarrStore._storeCache.set(storeCacheKey, storePromise)
+          ZarrStore._storeCache.set(storeCacheKey, cached)
         }
       }
 
-      this.store = await storePromise
+      this.store = await cached.store
     }
 
     // Wrap with CachingStore for chunk-level caching (unless disabled)
@@ -473,11 +603,118 @@ export class ZarrStore {
 
     this.root = zarr.root(this.store)
     await this._loadMetadata()
+    this._resolveMetadata(this)
 
-    await this._loadSpatialMetadata()
-    await this._loadCoordinates()
+    // Independent reads (bounds from lat/lon, selector coordinates): issue
+    // them together rather than one round trip after another
+    await Promise.all([this._loadSpatialMetadata(), this._loadCoordinates()])
 
     return this
+  }
+
+  /**
+   * Start reading the shard indexes of one step of a sharded v3 array into
+   * the chunk cache, so the first render's index reads are cache hits (or
+   * join these in flight) instead of waiting for initialization to finish.
+   * `selection` gives the index of every non-spatial dimension (a dimension
+   * of length 1 may be left out); the lat/lon extent is covered whole, so
+   * this only runs when that is at most `maxShards` shards. Range mode only
+   * (an index read is a small suffix request there; in whole-object mode it
+   * would download whole shards), single-level stores only. Errors are
+   * swallowed: the render reads the index again and reports them.
+   * Resolves to the number of shard indexes requested.
+   */
+  async prefetchShardIndexes(
+    selection: Record<string, number>,
+    { maxShards = 4 }: { maxShards?: number } = {}
+  ): Promise<number> {
+    const store = this.cachingStore
+    if (!store?.rangeRequests || this.levels.length > 0) return 0
+    try {
+      const keys = await this._shardKeys(selection, maxShards)
+      if (!keys) return 0
+      await Promise.all(
+        keys.paths.map((path) =>
+          store
+            .getRange(path, { suffixLength: keys.indexBytes })
+            .catch(() => undefined)
+        )
+      )
+      return keys.paths.length
+    } catch {
+      return 0
+    }
+  }
+
+  /**
+   * The shard keys (absolute paths) of one step of the variable, and the
+   * size of the suffix zarrita reads as a shard index; null when the array
+   * is not sharded with an index at the end, uses a chunk key encoding
+   * other than the defaults, or the step is not fully selected.
+   */
+  private async _shardKeys(
+    selection: Record<string, number>,
+    maxShards: number
+  ): Promise<{ paths: AbsolutePath[]; indexBytes: number } | null> {
+    if (!this.store) return null
+    const bytes = await this.store.get(`/${this.variable}/zarr.json`)
+    if (!bytes) return null
+    const meta = JSON.parse(new TextDecoder().decode(bytes))
+    const sharding = (Array.isArray(meta?.codecs) ? meta.codecs : []).find(
+      (c: { name?: string }) => c?.name === 'sharding_indexed'
+    )
+    const shardShape: unknown = meta?.chunk_grid?.configuration?.chunk_shape
+    const innerShape: unknown = sharding?.configuration?.chunk_shape
+    const shape = this.shape
+    const ints = (a: unknown): a is number[] =>
+      Array.isArray(a) &&
+      a.length === shape.length &&
+      a.every((n) => Number.isInteger(n) && n > 0)
+    if (!sharding || !ints(shardShape) || !ints(innerShape)) return null
+    if ((sharding.configuration.index_location ?? 'end') !== 'end') return null
+
+    const encoding = meta.chunk_key_encoding ?? { name: 'default' }
+    const isDefault = encoding.name === 'default'
+    if (!isDefault && encoding.name !== 'v2') return null
+    const separator: string =
+      encoding.configuration?.separator ?? (isDefault ? '/' : '.')
+
+    const spatial = new Set(
+      [this.dimIndices.lat?.index, this.dimIndices.lon?.index].filter(
+        (i): i is number => typeof i === 'number'
+      )
+    )
+    let coords: number[][] = [[]]
+    for (let i = 0; i < shape.length; i++) {
+      let options: number[]
+      if (spatial.has(i)) {
+        const n = Math.ceil(shape[i] / shardShape[i])
+        options = Array.from({ length: n }, (_, k) => k)
+      } else {
+        const name = this.dimensions[i]
+        const idx = selection[name] ?? (shape[i] === 1 ? 0 : undefined)
+        if (!Number.isInteger(idx) || idx! < 0 || idx! >= shape[i]) return null
+        options = [Math.floor(idx! / shardShape[i])]
+      }
+      coords = coords.flatMap((c) => options.map((o) => [...c, o]))
+      if (coords.length > maxShards) return null
+    }
+    const base = this.variable.replace(/^\/+/, '')
+    const paths = coords.map((c) => {
+      const key = isDefault
+        ? ['c', ...c].join(separator)
+        : c.length
+        ? c.join(separator)
+        : '0'
+      return `/${base}/${key}` as AbsolutePath
+    })
+    const innerCount = shardShape.reduce(
+      (n, s, i) => n * (s / innerShape[i]),
+      1
+    )
+    // As zarrita's sharded chunk getter: 16 bytes per inner chunk plus a
+    // 4-byte checksum
+    return { paths, indexBytes: 16 * innerCount + 4 }
   }
 
   private async _loadCoordinates(): Promise<void> {

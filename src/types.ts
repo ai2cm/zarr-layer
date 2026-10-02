@@ -225,6 +225,19 @@ export interface ZarrLayerOptions {
    * reads included (see `ZarrLayer.setBackgroundReads`). Default: `false`.
    */
   backgroundReads?: boolean
+  /**
+   * Store objects the app already read (or is reading), by key relative to
+   * the store root, so the layer doesn't read them again: e.g. the root
+   * `zarr.json` and coordinate chunks such as `time/c/0`. Each value is the
+   * object's bytes, `undefined` for a missing object, or a promise of either
+   * (a read still in flight; if it rejects, the layer reads the key itself).
+   * A root `zarr.json` with `zarr_format: 3` also stands for
+   * `zarrVersion: 3`. Read at construction only.
+   */
+  preloadedObjects?: Record<
+    string,
+    Uint8Array | undefined | Promise<Uint8Array | undefined>
+  >
 }
 
 export type CRS = 'EPSG:4326' | 'EPSG:3857'
