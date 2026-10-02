@@ -136,6 +136,11 @@ interface InFlight {
 export const DEFAULT_PREFETCH_CONCURRENCY = 4
 /** Default `batchNearSteps`. */
 export const DEFAULT_BATCH_NEAR_STEPS = 8
+/**
+ * Window positions that start alone even for appended steps (see isNear),
+ * capped at `batchNearSteps`.
+ */
+export const APPENDED_NEAR_STEPS = 2
 
 /** A positive integer, or `fallback` for undefined / invalid input. */
 export function normalizeConcurrency(
@@ -224,17 +229,26 @@ export class PrefetchQueue {
       }
     }
 
+    const sameDim = this.dim === timeDimName
+    const previous = sameDim ? this.windowPos : new Map<number, number>()
+    const wasAppended = sameDim ? this.appended : new Set<number>()
+    this.dim = timeDimName
+    this.windowPos = new Map(wanted.map((idx, pos) => [idx, pos]))
+    this.pending = wanted.filter((idx) => !kept.has(idx) && !this.isCached(idx))
     // An extension of the previous window: steps after the last step it
-    // kept are new lookahead, not the step about to be shown
-    const previous = this.dim === timeDimName ? this.windowPos : new Map()
+    // kept are new lookahead, not the step about to be shown. Steps
+    // appended earlier and still pending keep the flag (with the shard cut,
+    // the ticks between shard boundaries append nothing, and a shard that
+    // waited for a slot would otherwise start step by step)
     let lastKept = -1
     wanted.forEach((idx, pos) => {
       if (previous.has(idx)) lastKept = pos
     })
-    this.appended = new Set(lastKept < 0 ? [] : wanted.slice(lastKept + 1))
-    this.dim = timeDimName
-    this.windowPos = new Map(wanted.map((idx, pos) => [idx, pos]))
-    this.pending = wanted.filter((idx) => !kept.has(idx) && !this.isCached(idx))
+    const appended = new Set(lastKept < 0 ? [] : wanted.slice(lastKept + 1))
+    for (const idx of this.pending) {
+      if (wasAppended.has(idx)) appended.add(idx)
+    }
+    this.appended = appended
     this.fill()
   }
 
@@ -300,13 +314,18 @@ export class PrefetchQueue {
    * In the first `nearSteps` positions of the window: fetched on its own,
    * never batched, so the step about to be shown doesn't wait for a whole
    * shard's coalesced response (task 44 review: head-of-line blocking).
-   * Steps a window appended to the previous one's are exempt: a small
+   * Steps a window appended to the previous one's (and still pending since)
+   * are exempt past the first `APPENDED_NEAR_STEPS` positions: a small
    * playback window (cap under nearSteps + batch) adds each new shard
    * inside the near positions, and would otherwise never batch.
    */
   private isNear(index: number): boolean {
+    const pos = this.windowPos.get(index) ?? Infinity
+    // The next steps to be shown start alone even when appended (a window
+    // that overlaps the previous one by a step or two)
+    if (pos < Math.min(APPENDED_NEAR_STEPS, this.nearSteps)) return true
     if (this.appended.has(index)) return false
-    return (this.windowPos.get(index) ?? Infinity) < this.nearSteps
+    return pos < this.nearSteps
   }
 
   /** Current batch size (1 = no batching). */

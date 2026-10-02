@@ -915,3 +915,37 @@ test('RequestGate: reconfiguring a capped gate credits the refill while it sat i
   gate.configure({ maxRequestsPerSecond: 5, burst: 10 })
   assert.equal(await take(10), 10, 'the full burst goes out at once')
 })
+
+// ---- Review round 5 --------------------------------------------------------
+
+test('queue: an appended shard that waited for a slot still starts as one batch on a later tick', async () => {
+  const h = batchQueue({ maxConcurrentSteps: 4, near: 8 })
+  h.queue.set(range(12, 15)) // stalled: they hold all 4 slots
+  h.queue.set(range(12, 19)) // appends 16-19; no free slot
+  assert.deepEqual(h.queue.pendingIndices, [16, 17, 18, 19])
+  h.queue.set(range(13, 19)) // next tick appends nothing; 12 is dropped
+  await tick() // 12's slot frees
+  const batchOf = (idx) => h.started.find((s) => s.idx === idx)?.batch
+  assert.deepEqual(
+    range(16, 19).map(batchOf),
+    [4, 4, 4, 4],
+    'one batch, not 4 steps alone'
+  )
+})
+
+test('queue: appended steps in the first 2 window positions still start alone', async () => {
+  const h = batchQueue({ maxConcurrentSteps: 4, near: 8 })
+  h.queue.set(range(11, 15))
+  await tick()
+  for (const done of h.open.values()) done()
+  await tick()
+  // Overlaps the previous window by one step (15): 16-19 are appended
+  h.queue.set(range(15, 19))
+  const batchOf = (idx) => h.started.find((s) => s.idx === idx)?.batch
+  assert.equal(
+    batchOf(16),
+    undefined,
+    'the next step to be shown does not wait for its shard'
+  )
+  assert.deepEqual(range(17, 19).map(batchOf), [4, 4, 4])
+})
