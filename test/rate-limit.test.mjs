@@ -840,3 +840,78 @@ test('RequestGate: a new cap starts with a full bucket of `burst`; reconfiguring
     'already capped: the 5 tokens left, not a refill'
   )
 })
+
+// ---- Review round 4 --------------------------------------------------------
+
+const range = (a, b) => Array.from({ length: b - a + 1 }, (_, i) => a + i)
+
+test('queue: a small playback window (cap 10) batches each shard it appends, though inside the near positions', async () => {
+  const h = batchQueue({ maxConcurrentSteps: 4, near: 8 })
+  // The webapp's windows for cap 10, batch 4, playhead 0..5 (cut back to a shard boundary)
+  const windows = [
+    range(1, 7),
+    range(2, 11),
+    range(3, 11),
+    range(4, 11),
+    range(5, 11),
+    range(6, 15),
+  ]
+  for (const w of windows) {
+    h.queue.set(w)
+    await tick()
+    for (const [idx, done] of [...h.open]) {
+      h.open.delete(idx)
+      done()
+    }
+    await tick()
+  }
+  const batchOf = (idx) => h.started.find((s) => s.idx === idx)?.batch
+  assert.deepEqual(
+    range(8, 11).map(batchOf),
+    [2, 2, 2, 2],
+    'shard 8-11 (window positions 6-9)'
+  )
+  assert.deepEqual(
+    range(12, 15).map(batchOf),
+    [3, 3, 3, 3],
+    'shard 12-15 (positions 6-9)'
+  )
+})
+
+test('queue: a jump (no overlap) or a cleared queue keeps the near rule', async () => {
+  const h = batchQueue({ maxConcurrentSteps: 8, near: 8 })
+  h.queue.set(range(1, 7))
+  h.queue.set(range(40, 47)) // jump: nothing kept
+  assert.ok(
+    h.started.filter((s) => s.idx >= 40).every((s) => s.batch === undefined),
+    'all near: alone'
+  )
+  const g = batchQueue({ maxConcurrentSteps: 8, near: 8 })
+  g.queue.set(range(1, 7))
+  await tick()
+  for (const done of g.open.values()) done()
+  await tick()
+  g.queue.clear()
+  g.queue.set(range(2, 11))
+  const late = g.started.filter((s) => s.idx >= 8 && s.idx <= 9)
+  assert.ok(
+    late.length === 2 && late.every((s) => s.batch === undefined),
+    'positions 6-7 after a clear: near'
+  )
+})
+
+test('RequestGate: reconfiguring a capped gate credits the refill while it sat idle', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const gate = new RequestGate({ maxRequestsPerSecond: 5, burst: 10 })
+  const take = async (n) => {
+    let got = 0
+    for (let i = 0; i < n; i++) gate.acquire().then(() => got++)
+    await flush()
+    return got
+  }
+  assert.equal(await take(10), 10, 'page load drains the bucket')
+  t.mock.timers.tick(60_000) // a minute idle: nothing queued, no pump
+  // A new layer (variable switch) configures the same origin again
+  gate.configure({ maxRequestsPerSecond: 5, burst: 10 })
+  assert.equal(await take(10), 10, 'the full burst goes out at once')
+})

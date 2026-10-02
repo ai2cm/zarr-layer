@@ -111,6 +111,12 @@ export class RequestGate {
   /** Change the rate cap / burst / network-error rule. */
   configure(options: RequestGateOptions): void {
     const wasCapped = this.rate > 0
+    const now = this.now()
+    // Credit the refill since the last pump at the old rate first: tokens
+    // only refill in pump(), so an idle gate would otherwise lose it
+    if (wasCapped) {
+      this.tokens += ((now - this.refilledAt) / 1000) * this.rate
+    }
     const rate = options.maxRequestsPerSecond
     this.rate =
       typeof rate === 'number' && Number.isFinite(rate) && rate > 0 ? rate : 0
@@ -120,12 +126,13 @@ export class RequestGate {
         ? Math.floor(burst)
         : DEFAULT_REQUEST_BURST
     // A new cap (fresh or previously uncapped gate) starts with a full
-    // bucket; reconfiguring a capped gate keeps its tokens (up to the burst)
+    // bucket; reconfiguring a capped gate keeps its (refilled) tokens, up
+    // to the burst
     this.tokens =
       this.rate > 0 && !wasCapped
         ? this.burst
         : Math.min(this.tokens, this.burst)
-    this.refilledAt = this.now()
+    this.refilledAt = now
     if (options.networkErrorsBackOff !== undefined) {
       this.networkErrorsBackOff = options.networkErrorsBackOff
     }

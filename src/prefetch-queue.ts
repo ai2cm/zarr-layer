@@ -157,6 +157,12 @@ export class PrefetchQueue {
   private readonly nearSteps: number
   /** Position of each step in the latest window. */
   private windowPos = new Map<number, number>()
+  /**
+   * Steps the latest window appended past every step it kept from the
+   * previous one (playback extending its lookahead): exempt from the near
+   * rule, see isNear.
+   */
+  private appended = new Set<number>()
   private readonly failureRetryDelayMs: number
   private readonly maxFailureRetryDelayMs: number
   private readonly maxFailureRetries: number
@@ -218,6 +224,14 @@ export class PrefetchQueue {
       }
     }
 
+    // An extension of the previous window: steps after the last step it
+    // kept are new lookahead, not the step about to be shown
+    const previous = this.dim === timeDimName ? this.windowPos : new Map()
+    let lastKept = -1
+    wanted.forEach((idx, pos) => {
+      if (previous.has(idx)) lastKept = pos
+    })
+    this.appended = new Set(lastKept < 0 ? [] : wanted.slice(lastKept + 1))
     this.dim = timeDimName
     this.windowPos = new Map(wanted.map((idx, pos) => [idx, pos]))
     this.pending = wanted.filter((idx) => !kept.has(idx) && !this.isCached(idx))
@@ -227,6 +241,9 @@ export class PrefetchQueue {
   /** Drop all pending steps and abort every step in flight. */
   clear(): void {
     this.pending = []
+    // The next window starts fresh (the near rule applies again)
+    this.windowPos = new Map()
+    this.appended = new Set()
     for (const step of this.inFlight) {
       if (step.controller.signal.aborted) continue
       step.controller.abort()
@@ -283,8 +300,12 @@ export class PrefetchQueue {
    * In the first `nearSteps` positions of the window: fetched on its own,
    * never batched, so the step about to be shown doesn't wait for a whole
    * shard's coalesced response (task 44 review: head-of-line blocking).
+   * Steps a window appended to the previous one's are exempt: a small
+   * playback window (cap under nearSteps + batch) adds each new shard
+   * inside the near positions, and would otherwise never batch.
    */
   private isNear(index: number): boolean {
+    if (this.appended.has(index)) return false
     return (this.windowPos.get(index) ?? Infinity) < this.nearSteps
   }
 
