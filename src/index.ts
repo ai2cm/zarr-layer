@@ -6,6 +6,8 @@ export {
   gatedFetch,
 } from './request-gate'
 export type { RequestGateOptions } from './request-gate'
+// Marks a request for the gate's background lane (gatedFetch strips it)
+export { BACKGROUND_REQUEST_HEADER } from './caching-store'
 export type {
   ZarrLayerOptions,
   ColormapArray,
