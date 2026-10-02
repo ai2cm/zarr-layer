@@ -185,6 +185,17 @@ export interface ZarrLayerOptions {
    */
   rangeRequests?: boolean
   /**
+   * With `rangeRequests` off: read the first displayed step by range anyway
+   * (its shard index and the inner chunks in view, as `rangeRequests`
+   * does), then whole objects from then on. The switch happens when the
+   * displayed step's view first completes or the first non-empty
+   * `prefetchTimeSteps` window arrives, whichever is first. For stores whose
+   * shards hold many small steps: a whole shard is the right prefetch unit,
+   * but the first image should not wait for one. Same requirements as
+   * `rangeRequests`. Default: `false`. Ignored when `rangeRequests` is on.
+   */
+  firstFrameRangeRequests?: boolean
+  /**
    * Prefetch time steps (`prefetchTimeSteps`) in flight at once. Default: 4
    * (one day of 6-hourly data). Steps start in window order; `1` restores
    * strictly sequential prefetch. Fractional values are floored; an invalid
@@ -241,6 +252,17 @@ export interface ZarrLayerOptions {
     string,
     Uint8Array | undefined | Promise<Uint8Array | undefined>
   >
+  /**
+   * Shard indexes the app already has (e.g. from a build-time manifest), by
+   * shard key relative to the store root (`v/c/0/0/0/0`): the last bytes of
+   * the shard object, i.e. a sharded array's index with `index_location`
+   * `end`. A suffix range read of exactly that many bytes is served from
+   * them instead of the network, so in range mode the first read of a step
+   * needs no index request. Any other read of the shard goes to the
+   * network. Read at construction only; layers on one source share them,
+   * as they share `preloadedObjects`.
+   */
+  preloadedShardIndexes?: Record<string, Uint8Array>
 }
 
 export type CRS = 'EPSG:4326' | 'EPSG:3857'

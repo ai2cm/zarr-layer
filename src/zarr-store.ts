@@ -115,6 +115,12 @@ interface ZarrStoreOptions {
    * sets `version` to 3 when it is not given, so no v2 key is probed.
    */
   preloadedObjects?: PreloadedObjects
+  /**
+   * Shard indexes (the last bytes of shard objects) by shard key relative to
+   * the store root, served for suffix reads of exactly their length (see
+   * `withPreloadedObjects` and `ZarrLayerOptions.preloadedShardIndexes`).
+   */
+  preloadedShardIndexes?: Record<string, Uint8Array>
 }
 
 /**
@@ -135,14 +141,18 @@ const absoluteKey = (key: string): AbsolutePath =>
  * Wrap a store so reads of preloaded keys are served from `preloaded`
  * (absolute keys) instead of the base store. A preloaded read that rejects
  * falls back to the base store. Ranges of a preloaded object are sliced
- * from it. The map is live: keys added later are used too.
+ * from it. `suffixes` holds the last bytes of objects (shard indexes): a
+ * suffix range read of exactly that length is served from it, any other
+ * read of the object goes to the base store. The maps are live: keys added
+ * later are used too.
  */
 export function withPreloadedObjects<S extends AsyncReadable>(
   store: S,
   preloaded: Map<
     AbsolutePath,
     Uint8Array | undefined | Promise<Uint8Array | undefined>
-  >
+  >,
+  suffixes: Map<AbsolutePath, Uint8Array> = new Map()
 ): AsyncReadable {
   const preloadedBytes = async (
     key: AbsolutePath
@@ -164,6 +174,14 @@ export function withPreloadedObjects<S extends AsyncReadable>(
   }
   if (typeof store.getRange === 'function') {
     wrapped.getRange = async (key, range, opts) => {
+      const suffix = suffixes.get(key)
+      if (
+        suffix &&
+        'suffixLength' in range &&
+        range.suffixLength === suffix.byteLength
+      ) {
+        return suffix.slice()
+      }
       const { hit, bytes } = await preloadedBytes(key)
       if (!hit) return store.getRange!(key, range, opts)
       if (!bytes) return undefined
@@ -347,6 +365,8 @@ interface CachedStore {
     AbsolutePath,
     Uint8Array | undefined | Promise<Uint8Array | undefined>
   >
+  /** The preloaded shard indexes it serves (see withPreloadedObjects). */
+  suffixes: Map<AbsolutePath, Uint8Array>
 }
 
 export class ZarrStore {
@@ -425,6 +445,7 @@ export class ZarrStore {
   metadataReady: Promise<this>
   private _resolveMetadata!: (store: this) => void
   private preloadedObjects?: PreloadedObjects
+  private preloadedShardIndexes?: Record<string, Uint8Array>
 
   constructor({
     source,
@@ -443,6 +464,7 @@ export class ZarrStore {
     rangeRequests = false,
     backgroundClassifier,
     preloadedObjects,
+    preloadedShardIndexes,
   }: ZarrStoreOptions) {
     if (!source && !customStore) {
       throw new Error('source is required when customStore is not provided')
@@ -457,6 +479,7 @@ export class ZarrStore {
     this.version =
       version ?? (preloadedFormat === 3 ? 3 : preloadedFormat === 2 ? 2 : null)
     this.preloadedObjects = preloadedObjects
+    this.preloadedShardIndexes = preloadedShardIndexes
     this.variable = variable
     this.spatialDimensions = spatialDimensions
     this.explicitBounds = bounds ?? null
@@ -540,6 +563,11 @@ export class ZarrStore {
         )) {
           cached.preloaded.set(absoluteKey(key), value)
         }
+        for (const [key, value] of Object.entries(
+          this.preloadedShardIndexes ?? {}
+        )) {
+          cached.suffixes.set(absoluteKey(key), value)
+        }
       } else {
         const preloaded: CachedStore['preloaded'] = new Map()
         for (const [key, value] of Object.entries(
@@ -547,13 +575,20 @@ export class ZarrStore {
         )) {
           preloaded.set(absoluteKey(key), value)
         }
+        const suffixes: CachedStore['suffixes'] = new Map()
+        for (const [key, value] of Object.entries(
+          this.preloadedShardIndexes ?? {}
+        )) {
+          suffixes.set(absoluteKey(key), value)
+        }
         const baseStore = withPreloadedObjects(
           createFetchStore(
             this.source,
             this.transformRequest,
             this.rangeRequests
           ),
-          preloaded
+          preloaded,
+          suffixes
         )
         // When the version is known, tell the consolidated-metadata wrapper
         // to only try that format — avoids a wasted .zmetadata fetch on v3
@@ -578,7 +613,7 @@ export class ZarrStore {
               .catch(() => store),
           (store) => withRangeCoalescing(store)
         ) as Promise<ZarrStoreType>
-        cached = { store: storePromise, preloaded }
+        cached = { store: storePromise, preloaded, suffixes }
         if (!bypassCache) {
           ZarrStore._storeCache.set(storeCacheKey, cached)
         }
