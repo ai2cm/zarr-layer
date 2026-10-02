@@ -225,7 +225,7 @@ export class TiledMode implements ZarrMode {
       .join(';')}`
     if (retryViewKey !== this.lastRetryViewKey) {
       this.lastRetryViewKey = retryViewKey
-      errorRetryViewChanged(this.errorRetry)
+      this.errorRetryViewChanged()
     }
 
     for (const tileTuple of this.visibleTiles) {
@@ -425,6 +425,16 @@ export class TiledMode implements ZarrMode {
   }
 
   /**
+   * A new view: failed tiles get fresh retries, and the old view's pending
+   * retry is cancelled, so it no longer counts as loading.
+   */
+  private errorRetryViewChanged(): void {
+    const retryPending = this.errorRetry.timer !== null
+    errorRetryViewChanged(this.errorRetry)
+    if (retryPending) this.emitLoadingState()
+  }
+
+  /**
    * A tile read failed (not aborted): refetch after a backoff (task 44), so
    * a paused map doesn't keep the tile blank until the next view change.
    * Reports chunks loading until the retry runs; after
@@ -432,6 +442,10 @@ export class TiledMode implements ZarrMode {
    */
   private scheduleRetryAfterError(tileKey: string): void {
     if (!this.tileCache) return
+    // Off-screen tile requests aren't cancelled: one from an older view that
+    // fails now must not join this view's retry state (it would never
+    // succeed, blocking the backoff reset and using up retry cycles)
+    if (!this.visibleTiles.some((t) => tileToKey(t) === tileKey)) return
     scheduleErrorRetry(this.errorRetry, tileKey, () => {
       if (!this.tileCache) return
       this.emitLoadingState()

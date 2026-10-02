@@ -1737,7 +1737,7 @@ export class UntiledMode implements ZarrMode {
       .join('|')}`
     const viewportChanged = viewportHash !== this.lastViewportHash
     // A new view (pan, zoom, time step): failed regions get fresh retries
-    if (viewportChanged) errorRetryViewChanged(this.errorRetry)
+    if (viewportChanged) this.errorRetryViewChanged()
     this.lastViewportHash = viewportHash
 
     // If we restored any regions from cache, trigger a repaint
@@ -2985,6 +2985,18 @@ export class UntiledMode implements ZarrMode {
       this.loadingManager.chunksLoading = true
     }
     emitLoadingStateUtil(this.loadingManager)
+  }
+
+  /**
+   * A new view: failed regions get fresh retries, and the old view's pending
+   * retry is cancelled, so it no longer counts as loading.
+   */
+  private errorRetryViewChanged(): void {
+    const retryPending = this.errorRetry.timer !== null
+    errorRetryViewChanged(this.errorRetry)
+    if (!retryPending) return
+    this.loadingManager.chunksLoading = hasActiveRequests(this.requestCanceller)
+    this.emitLoadingState()
   }
 
   /**

@@ -20,6 +20,7 @@ const {
 const { readShardShape } = await loadSrc('src/zarr-store.ts')
 const { ZarrLayer } = await loadSrc('src/zarr-layer.ts')
 const { UntiledMode } = await loadSrc('src/untiled-mode.ts')
+const { TiledMode } = await loadSrc('src/tiled-mode.ts')
 const modeUtils = await loadSrc('src/mode-utils.ts')
 
 const tick = () => new Promise((r) => setTimeout(r, 0))
@@ -730,4 +731,112 @@ test('errorRetrySucceeded: the last failed key loading cancels the pending retry
   }
   P.emitLoadingState.call(state)
   assert.equal(state.loadingManager.chunksLoading, false)
+})
+
+// ---- Review round 3 --------------------------------------------------------
+
+test('errorRetryViewChanged: cancels the old view retry; new-view failures start at the first backoff', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const st = modeUtils.createErrorRetryState()
+  let old = 0
+  let fresh = 0
+  // Five cycles in: the next retry would be 16-30 s away
+  for (let i = 0; i < 5; i++) {
+    modeUtils.scheduleErrorRetry(st, 'r', () => old++)
+    t.mock.timers.tick(40000)
+  }
+  modeUtils.scheduleErrorRetry(st, 'r', () => old++)
+  const before = old
+  modeUtils.errorRetryViewChanged(st)
+  assert.equal(
+    st.timer,
+    null,
+    'no timer left: the mode stops reporting loading'
+  )
+  modeUtils.scheduleErrorRetry(st, 'n', () => fresh++)
+  t.mock.timers.tick(1250)
+  assert.equal(fresh, 1, 'new view: retried within 1 s +- 25 %')
+  t.mock.timers.tick(60000)
+  assert.equal(old, before, 'the old view retry never ran')
+})
+
+test('UntiledMode / TiledMode: a view change with a retry pending refreshes the loading state', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const untiled = {
+    errorRetry: modeUtils.createErrorRetryState(),
+    throttleState: modeUtils.createThrottleState(),
+    loadingManager: { metadataLoading: false, chunksLoading: false },
+    requestCanceller: { controllers: new Map() },
+    isRemoved: false,
+    invalidate: () => {},
+    emitLoadingState: UntiledMode.prototype.emitLoadingState,
+  }
+  UntiledMode.prototype.scheduleRetryAfterError.call(untiled, '0:0,0')
+  assert.equal(untiled.loadingManager.chunksLoading, true)
+  UntiledMode.prototype.errorRetryViewChanged.call(untiled)
+  assert.equal(untiled.loadingManager.chunksLoading, false, 'untiled')
+
+  const tiled = {
+    errorRetry: modeUtils.createErrorRetryState(),
+    throttleState: modeUtils.createThrottleState(),
+    loadingManager: { metadataLoading: false, chunksLoading: false },
+    pendingChunks: new Set(),
+    tileCache: {},
+    visibleTiles: [[2, 1, 1]],
+    invalidate: () => {},
+    emitLoadingState: TiledMode.prototype.emitLoadingState,
+  }
+  TiledMode.prototype.scheduleRetryAfterError.call(tiled, '2,1,1')
+  assert.equal(tiled.loadingManager.chunksLoading, true)
+  TiledMode.prototype.errorRetryViewChanged.call(tiled)
+  assert.equal(tiled.loadingManager.chunksLoading, false, 'tiled')
+})
+
+test('TiledMode: a failed request for a tile no longer visible does not join the retry state', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let invalidations = 0
+  const tiled = {
+    errorRetry: modeUtils.createErrorRetryState(),
+    throttleState: modeUtils.createThrottleState(),
+    loadingManager: { metadataLoading: false, chunksLoading: false },
+    pendingChunks: new Set(),
+    tileCache: {},
+    visibleTiles: [[3, 4, 2]],
+    invalidate: () => invalidations++,
+    emitLoadingState: TiledMode.prototype.emitLoadingState,
+  }
+  TiledMode.prototype.scheduleRetryAfterError.call(tiled, '2,1,1') // off-screen now
+  assert.equal(tiled.errorRetry.failedKeys.size, 0)
+  assert.equal(tiled.errorRetry.timer, null)
+  assert.equal(tiled.loadingManager.chunksLoading, false)
+  TiledMode.prototype.scheduleRetryAfterError.call(tiled, '3,4,2') // visible
+  assert.deepEqual([...tiled.errorRetry.failedKeys], ['3,4,2'])
+  t.mock.timers.tick(1250)
+  assert.equal(invalidations, 1)
+})
+
+test('RequestGate: a new cap starts with a full bucket of `burst`; reconfiguring a capped gate keeps its tokens', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const take = async (gate, n) => {
+    let got = 0
+    for (let i = 0; i < n; i++) gate.acquire().then(() => got++)
+    await flush()
+    return got
+  }
+  assert.equal(
+    await take(new RequestGate({ maxRequestsPerSecond: 1, burst: 20 }), 25),
+    20,
+    'fresh gate'
+  )
+  const g = new RequestGate()
+  g.configure({ maxRequestsPerSecond: 1, burst: 20 })
+  assert.equal(await take(g, 25), 20, 'uncapped -> capped')
+  const h = new RequestGate({ maxRequestsPerSecond: 1, burst: 20 })
+  assert.equal(await take(h, 15), 15)
+  h.configure({ maxRequestsPerSecond: 2, burst: 20 })
+  assert.equal(
+    await take(h, 10),
+    5,
+    'already capped: the 5 tokens left, not a refill'
+  )
 })

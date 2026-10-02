@@ -98,8 +98,15 @@ export function errorRetrySucceeded(state: ErrorRetryState, key: string): void {
   }
 }
 
-/** The view or selector changed: start the retry cycles over. */
+/**
+ * The view or selector changed: start the retry cycles over. A pending
+ * retry belongs to the old view, so it is cancelled too (the caller then
+ * refreshes its loading state): new-view failures start again at the first
+ * backoff instead of joining the old timer.
+ */
 export function errorRetryViewChanged(state: ErrorRetryState): void {
+  if (state.timer !== null) clearTimeout(state.timer)
+  state.timer = null
   state.failures = 0
   state.failedKeys.clear()
 }

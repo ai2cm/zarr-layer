@@ -74,6 +74,7 @@ function untiled(overrides = {}) {
     // Task 44: delayed refetch after a failed read (no-op here)
     errorRetry: { timer: null, failures: 0, failedKeys: new Set() },
     scheduleRetryAfterError() {},
+    errorRetryViewChanged: P.errorRetryViewChanged,
     fetched: [],
     fetchRegions(regions) {
       this.fetched.push(...regions)
