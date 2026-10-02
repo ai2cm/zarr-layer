@@ -866,6 +866,25 @@ export class ZarrLayer {
     return this.protectedKeys
   }
 
+  /**
+   * Hook the layer into its chunk cache: step attribution of every access,
+   * the eviction tiers, and the request gate's background lane for prefetch
+   * reads (a registered step signal), so render reads go first (ace-viz
+   * task 49).
+   */
+  private attachCachingStore(cachingStore: CachingStore): void {
+    this.removeAccessListener?.()
+    this.removeAccessListener = cachingStore.addAccessListener(
+      (cacheKey, opts) => {
+        this.attributeChunkAccess(cacheKey, opts)
+      }
+    )
+    this.installEvictionPolicy(cachingStore)
+    cachingStore.setBackgroundClassifier(
+      (opts) => !!opts?.signal && this.prefetchSignals.has(opts.signal)
+    )
+  }
+
   /** Make `cachingStore` evict by this layer's tiers (evictionPriority). */
   private installEvictionPolicy(cachingStore: CachingStore): void {
     this.protectedKeys = null
@@ -1535,12 +1554,7 @@ export class ZarrLayer {
       // attributed to a time step. Prefetch iterations override the default
       // attribution per request (see prefetchSignals).
       if (this.zarrStore.cachingStore) {
-        this.removeAccessListener?.()
-        this.removeAccessListener =
-          this.zarrStore.cachingStore.addAccessListener((cacheKey, opts) => {
-            this.attributeChunkAccess(cacheKey, opts)
-          })
-        this.installEvictionPolicy(this.zarrStore.cachingStore)
+        this.attachCachingStore(this.zarrStore.cachingStore)
       }
 
       const desc = this.zarrStore.describe()

@@ -163,6 +163,19 @@ export class RangeRateLimitedError extends Error {
  */
 export const RANGE_NETWORK_FAILURES_BEFORE_ERROR = 6
 
+/**
+ * Request header marking a background (prefetch) read, so the request gate
+ * serves render reads first (ace-viz task 49; see `request-gate.ts`, whose
+ * `gatedFetch` removes it before the request leaves). Set by the
+ * CachingStore on base-store reads its background classifier picks, and
+ * only with `markBackground` (a base store whose requests go through
+ * `gatedFetch`): any other store would send it.
+ */
+export const BACKGROUND_REQUEST_HEADER = 'x-zarr-layer-background'
+
+/** GetOptions as passed down to a base store (FetchStore takes headers). */
+type BaseGetOptions = GetOptions & { headers?: Record<string, string> }
+
 export interface CachingStoreOptions {
   /**
    * Read byte ranges with range requests to the base store (its `getRange`)
@@ -176,6 +189,12 @@ export interface CachingStoreOptions {
    * `jitteredRetryDelayMs` (250–750 ms). Tests pass `() => 0`.
    */
   retryDelayMs?: () => number
+  /**
+   * The base store sends its requests through `gatedFetch`, so reads picked
+   * by `setBackgroundClassifier` may carry `BACKGROUND_REQUEST_HEADER`.
+   * Default false (the classifier is then ignored).
+   */
+  markBackground?: boolean
 }
 
 /** A base-store fetch shared by every concurrent miss on one cache key. */
@@ -242,6 +261,8 @@ export class CachingStore implements AsyncReadable {
   private reportedNetworkFailures: boolean = false
   /** Eviction tiers; null = plain LRU. */
   private evictionPolicy: EvictionPolicy | null = null
+  private readonly markBackground: boolean
+  private isBackground: ((opts?: GetOptions) => boolean) | null = null
 
   constructor(
     baseStore: AsyncReadable,
@@ -255,6 +276,29 @@ export class CachingStore implements AsyncReadable {
     this._rangeRequests =
       !!options.rangeRequests && typeof baseStore.getRange === 'function'
     this.retryDelayMs = options.retryDelayMs ?? jitteredRetryDelayMs
+    this.markBackground = !!options.markBackground
+  }
+
+  /**
+   * Tell background (prefetch) reads apart by the caller's options (e.g. its
+   * signal), so their base-store requests go in the request gate's
+   * low-priority lane (needs `markBackground`). A shared fetch takes the
+   * class of the caller that started it. `null` removes it.
+   */
+  setBackgroundClassifier(fn: ((opts?: GetOptions) => boolean) | null): void {
+    this.isBackground = fn
+  }
+
+  /** Options for a base-store read made for a caller with `opts`. */
+  private baseOpts(
+    opts: GetOptions | undefined,
+    signal: AbortSignal
+  ): BaseGetOptions & { signal: AbortSignal } {
+    const out: BaseGetOptions & { signal: AbortSignal } = { ...opts, signal }
+    if (this.markBackground && this.isBackground?.(opts)) {
+      out.headers = { ...out.headers, [BACKGROUND_REQUEST_HEADER]: '1' }
+    }
+    return out
   }
 
   /** Current byte budget. */
@@ -381,7 +425,7 @@ export class CachingStore implements AsyncReadable {
     opts?: GetOptions
   ): Promise<Uint8Array | undefined> {
     return this.shared(key, opts, async (signal) => {
-      const result = await this.baseStore.get(key, { ...opts, signal })
+      const result = await this.baseStore.get(key, this.baseOpts(opts, signal))
       if (result !== undefined) this.store(key, result)
       return result
     })
@@ -545,7 +589,7 @@ export class CachingStore implements AsyncReadable {
         ? { ...opts, signal: undefined }
         : opts
     const result = await this.shared(rangeKey, waitOpts, (signal) =>
-      this.fetchRange(key, range, rangeKey, { ...opts, signal })
+      this.fetchRange(key, range, rangeKey, this.baseOpts(opts, signal))
     )
     if (result === undefined) return undefined
     this.notifyAccess(result.cacheKey, opts)

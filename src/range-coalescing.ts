@@ -31,6 +31,7 @@
 
 import * as zarr from 'zarrita'
 import type { AbsolutePath, AsyncReadable, RangeQuery } from '@zarrita/storage'
+import { BACKGROUND_REQUEST_HEADER } from './caching-store'
 
 export const DEFAULT_COALESCE_SIZE = 32768
 /**
@@ -43,6 +44,8 @@ interface PendingRequest {
   offset: number
   length: number
   signal?: AbortSignal
+  /** Carries the background marker (see `BACKGROUND_REQUEST_HEADER`). */
+  background: boolean
   resolve: (data: Uint8Array | undefined) => void
   reject: (err: unknown) => void
   settled: boolean
@@ -174,11 +177,19 @@ export const withRangeCoalescing = zarr.defineStoreExtension(
 
     async function fetchGroup(path: AbsolutePath, group: Group) {
       const signal = groupSignal(group.requests)
+      // Background (task 49) only when every member is: a render read in
+      // the group makes the merged request a render read
+      const headers = group.requests.every((r) => r.background)
+        ? { [BACKGROUND_REQUEST_HEADER]: '1' }
+        : undefined
       try {
         const data = await baseGetRange(
           path,
           { offset: group.offset, length: group.length },
-          { signal }
+          // FetchStore passes headers on into the Request
+          (headers ? { signal, headers } : { signal }) as {
+            signal?: AbortSignal
+          }
         )
         if (data && data.length < group.length) {
           throw new Error(
@@ -231,7 +242,7 @@ export const withRangeCoalescing = zarr.defineStoreExtension(
       getRange(
         key: AbsolutePath,
         range: RangeQuery,
-        options?: { signal?: AbortSignal }
+        options?: { signal?: AbortSignal; headers?: Record<string, string> }
       ): Promise<Uint8Array | undefined> {
         // Suffix reads (shard indexes): size unknown, pass through
         if ('suffixLength' in range) return baseGetRange(key, range, options)
@@ -246,6 +257,7 @@ export const withRangeCoalescing = zarr.defineStoreExtension(
             offset: range.offset,
             length: range.length,
             signal: options?.signal,
+            background: !!options?.headers?.[BACKGROUND_REQUEST_HEADER],
             resolve,
             reject,
             settled: false,
