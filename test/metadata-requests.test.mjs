@@ -201,3 +201,56 @@ test('two layers on one store read zarr.json once (the opened store is shared)',
     server.requests.map(describe).join(', ')
   )
 })
+
+test('a later layer on the same source uses its own (newer) preloaded objects', async (t) => {
+  const store = buildFakeV3Store()
+  const { objects } = store
+  const { layer, server } = openLayer(
+    t,
+    {
+      zarrVersion: 3,
+      preloadedObjects: {
+        'zarr.json': objects.get('zarr.json'),
+        'time/c/0': objects.get('time/c/0'),
+      },
+    },
+    store
+  )
+  await server.runUntil(layer.initialize())
+  assert.deepEqual(layer.dimensionValues.time, [0, 6, 12, 18, 24, 30, 36, 42])
+  // The app re-read the store (a rescan) and the time axis changed
+  const fresh = new Uint8Array(
+    Float64Array.from([1, 2, 3, 4, 5, 6, 7, 8]).buffer
+  )
+  const later = new ZarrLayer({
+    id: 'later',
+    source: store.base,
+    variable: 'v',
+    clim: [0, 1],
+    colormap: ['#000000', '#ffffff'],
+    selector: { time: { selected: 5, type: 'index' } },
+    zarrVersion: 3,
+    rangeRequests: true,
+    preloadedObjects: { 'time/c/0': fresh },
+  })
+  const before = server.requests.length
+  await server.runUntil(later.initialize())
+  assert.deepEqual(later.dimensionValues.time, [1, 2, 3, 4, 5, 6, 7, 8])
+  assert.ok(
+    !server.requests.slice(before).some((r) => r.key === 'time/c/0'),
+    'time read from the new preload, not the network'
+  )
+})
+
+test('a preloaded undefined reads as a missing object (no network read)', async (t) => {
+  const store = buildFakeV3Store()
+  const { layer, server } = openLayer(
+    t,
+    { zarrVersion: 3, preloadedObjects: { 'ensemble/c/0': undefined } },
+    store
+  )
+  await server.runUntil(layer.initialize())
+  assert.ok(!server.requests.some((r) => r.key === 'ensemble/c/0'))
+  // Missing chunk: zarrita's fill value (0)
+  assert.deepEqual(layer.dimensionValues.ensemble, [0])
+})

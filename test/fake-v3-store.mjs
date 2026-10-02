@@ -44,7 +44,7 @@ export function buildFakeV3Store({
   const objects = new Map()
   const coords = {
     time: Float64Array.from({ length: steps }, (_, i) => i * 6),
-    ensemble: Float64Array.from([0]),
+    ensemble: Float64Array.from([7]),
     latitude: Float64Array.from({ length: nLat }, (_, i) => -45 + i * 30),
     longitude: Float64Array.from({ length: nLon }, (_, i) => -157.5 + i * 45),
   }

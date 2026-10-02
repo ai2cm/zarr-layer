@@ -232,7 +232,10 @@ export interface ZarrLayerOptions {
    * object's bytes, `undefined` for a missing object, or a promise of either
    * (a read still in flight; if it rejects, the layer reads the key itself).
    * A root `zarr.json` with `zarr_format: 3` also stands for
-   * `zarrVersion: 3`. Read at construction only.
+   * `zarrVersion: 3`. Read at construction only. Layers on one source
+   * share its opened store: a later layer's objects replace an earlier
+   * one's, except the root `zarr.json`, whose consolidated metadata is
+   * parsed once when the store is first opened.
    */
   preloadedObjects?: Record<
     string,

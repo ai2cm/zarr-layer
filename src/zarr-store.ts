@@ -531,12 +531,14 @@ export class ZarrStore {
 
       if (cached) {
         // A store opened by an earlier layer: its base store serves this
-        // layer's preloaded objects too (those it doesn't have yet)
+        // layer's preloaded objects too. Newer ones replace older ones (the
+        // app may have re-read the store), so this layer's chunk cache,
+        // empty so far, reads the fresh bytes. The root zarr.json is the
+        // exception: the opened store parsed its consolidated metadata once.
         for (const [key, value] of Object.entries(
           this.preloadedObjects ?? {}
         )) {
-          const abs = absoluteKey(key)
-          if (!cached.preloaded.has(abs)) cached.preloaded.set(abs, value)
+          cached.preloaded.set(absoluteKey(key), value)
         }
       } else {
         const preloaded: CachedStore['preloaded'] = new Map()
