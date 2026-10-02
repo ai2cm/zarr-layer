@@ -28,6 +28,29 @@ export const WEB_MERCATOR_EXTENT = 20037508.342789244
  */
 export const ESTIMATE_RECENT_STEPS = 16
 
+/**
+ * Window refill (ZarrLayer): how long after the prefetch queue goes idle, or
+ * after an in-window cache entry is evicted while it is idle, the layer
+ * checks the last prefetch window for steps that are no longer cached.
+ */
+export const WINDOW_REFILL_DELAY_MS = 500
+
+/**
+ * Most refills of one prefetch window (per `prefetchTimeSteps` call), so a
+ * window whose steps keep getting evicted (an estimate that was off) can't
+ * loop. Failed steps are never refilled: the prefetch queue retries them.
+ */
+export const MAX_WINDOW_REFILLS = 2
+
+/**
+ * Eviction tiers ZarrLayer gives its CachingStore (higher = kept longer).
+ * Window keys use [EVICTION_TIER_WINDOW, EVICTION_TIER_DISPLAYED), nearer
+ * steps higher.
+ */
+export const EVICTION_TIER_OTHER = 0
+export const EVICTION_TIER_WINDOW = 1
+export const EVICTION_TIER_DISPLAYED = 2
+
 /** Common names for spatial dimensions. These are matched case-insensitively. */
 export const SPATIAL_DIMENSION_ALIASES: Record<'lat' | 'lon', string[]> = {
   lat: ['lat', 'latitude', 'y'],

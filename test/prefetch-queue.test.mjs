@@ -93,6 +93,7 @@ test('fetches the window sequentially in priority order', async () => {
     started: 3,
     completed: 3,
     aborted: 0,
+    failureRetries: 0,
   })
 })
 
@@ -162,6 +163,7 @@ test('repeated identical windows do not restart anything', async () => {
     started: 3,
     completed: 3,
     aborted: 0,
+    failureRetries: 0,
   })
 })
 
@@ -260,7 +262,12 @@ test('a still-wanted step that is not ready is retried until it is fetched (no c
   await h.finish(1)
   await h.queue.whenIdle()
   assert.ok(h.cached.has(1))
-  assert.deepEqual(h.queue.stats, { started: 1, completed: 1, aborted: 0 })
+  assert.deepEqual(h.queue.stats, {
+    started: 1,
+    completed: 1,
+    aborted: 0,
+    failureRetries: 0,
+  })
 })
 
 test('a not-ready step stops retrying once a new window drops it', async () => {
@@ -338,7 +345,12 @@ test('default: up to 4 steps run concurrently, never more', async () => {
   }
   await h.queue.whenIdle()
   assert.equal(h.live.peak, 4)
-  assert.deepEqual(h.queue.stats, { started: 9, completed: 9, aborted: 0 })
+  assert.deepEqual(h.queue.stats, {
+    started: 9,
+    completed: 9,
+    aborted: 0,
+    failureRetries: 0,
+  })
 })
 
 test('maxConcurrentSteps option: invalid values use the default, fractions floor', () => {
@@ -371,7 +383,12 @@ test('a window change aborts only the unwanted in-flight steps and keeps the wan
   assert.ok(!h.log.includes('start 5') && !h.log.includes('start 6'))
   for (const idx of [2, 4, 7, 8]) await h.finish(idx)
   await h.queue.whenIdle()
-  assert.deepEqual(h.queue.stats, { started: 6, completed: 4, aborted: 2 })
+  assert.deepEqual(h.queue.stats, {
+    started: 6,
+    completed: 4,
+    aborted: 2,
+    failureRetries: 0,
+  })
   // An aborted step is never "kept": re-wanting 1 starts it again
   h.queue.set([1])
   await h.finish(1)
@@ -479,7 +496,12 @@ test('retries under concurrency: a not-ready step keeps retrying in its slot whi
   assert.equal(h.queue.busy, true)
   await h.finish(1)
   await h.queue.whenIdle()
-  assert.deepEqual(h.queue.stats, { started: 3, completed: 3, aborted: 0 })
+  assert.deepEqual(h.queue.stats, {
+    started: 3,
+    completed: 3,
+    aborted: 0,
+    failureRetries: 0,
+  })
 })
 
 test('retries under concurrency: a dropped not-ready step stops retrying, wanted ones continue', async () => {

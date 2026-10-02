@@ -1,7 +1,8 @@
 /**
  * @module caching-store
  *
- * LRU byte-level cache that wraps a zarrita AsyncReadable store.
+ * Byte-level cache that wraps a zarrita AsyncReadable store. Evicts in LRU
+ * order, optionally by priority tier first (see `setEvictionPolicy`).
  * Intercepts store.get() / getRange() calls to cache raw bytes (Uint8Array),
  * so all zarr operations (zarr.get slicing, array.getChunk, queries)
  * benefit from caching transparently.
@@ -31,6 +32,23 @@ interface CacheEntry {
  * object's key.
  */
 export type AccessListener = (cacheKey: string, opts?: GetOptions) => void
+
+/**
+ * Eviction priorities (see `CachingStore.setEvictionPolicy`). When the cache
+ * is over budget, entries of the lowest tier go first, least recently used
+ * first within a tier; a higher tier is only touched once every lower one is
+ * empty.
+ */
+export interface EvictionPolicy {
+  /**
+   * Tier of a cache key. Higher = kept longer. Called for every entry each
+   * time an eviction is needed, so it must be cheap (a Set lookup). A
+   * non-finite result counts as 0.
+   */
+  priority(cacheKey: string): number
+  /** Called for each entry evicted to make room, with its tier and size. */
+  onEvict?(cacheKey: string, priority: number, byteSize: number): void
+}
 
 /** Default chunk-cache budget (100 MB), used when no valid budget is given. */
 export const DEFAULT_CHUNK_CACHE_BYTES = 100 * 1024 * 1024
@@ -222,6 +240,8 @@ export class CachingStore implements AsyncReadable {
   /** Failed range attempts with a TypeError since the last success. */
   private networkFailures: number = 0
   private reportedNetworkFailures: boolean = false
+  /** Eviction tiers; null = plain LRU. */
+  private evictionPolicy: EvictionPolicy | null = null
 
   constructor(
     baseStore: AsyncReadable,
@@ -256,8 +276,8 @@ export class CachingStore implements AsyncReadable {
    * an invalid value (non-finite or negative, see `validCacheBytes`) is
    * ignored with a warning and the current budget is kept.
    *
-   * - Shrinking evicts least-recently-used entries immediately until the
-   *   cache fits the new budget.
+   * - Shrinking evicts immediately until the cache fits the new budget
+   *   (least recently used first, by tier when an eviction policy is set).
    * - Growing never evicts; the extra room is filled by subsequent fetches.
    * - `0` evicts everything. The store keeps wrapping the base store, and (as
    *   with any entry larger than the budget) the single most recent fetch is
@@ -280,6 +300,20 @@ export class CachingStore implements AsyncReadable {
     // An explicit 0 always empties, including an entry retained while the
     // budget was already 0.
     if (shrinking || next === 0) this.evictUntilFits(0)
+  }
+
+  /**
+   * Set (or, with null, clear) the eviction policy. Without one, eviction is
+   * plain LRU. With one, the entries of the lowest `priority` tier are
+   * evicted first (LRU within the tier), so a caller can protect keys it
+   * will need soon (ZarrLayer: the prefetch window and the displayed step)
+   * without changing how entries are stored or looked up. If the protected
+   * tiers alone exceed the budget, eviction falls back to LRU inside them,
+   * tier by tier. Takes effect at the next eviction; it never evicts by
+   * itself.
+   */
+  setEvictionPolicy(policy: EvictionPolicy | null): void {
+    this.evictionPolicy = policy
   }
 
   /**
@@ -685,12 +719,43 @@ export class CachingStore implements AsyncReadable {
   }
 
   private evictUntilFits(newBytes: number): void {
-    while (this.totalBytes + newBytes > this._maxBytes && this.cache.size > 0) {
-      const oldest = this.cache.keys().next().value
-      if (!oldest) break
-      const entry = this.cache.get(oldest)!
-      this.totalBytes -= entry.byteSize
-      this.cache.delete(oldest)
+    if (this.totalBytes + newBytes <= this._maxBytes) return
+    const policy = this.evictionPolicy
+    if (!policy) {
+      while (
+        this.totalBytes + newBytes > this._maxBytes &&
+        this.cache.size > 0
+      ) {
+        const oldest = this.cache.keys().next().value
+        if (oldest === undefined) break
+        this.evict(oldest)
+      }
+      return
     }
+    // One pass in LRU order, grouped by tier; then evict tier by tier
+    const tiers = new Map<number, string[]>()
+    for (const key of this.cache.keys()) {
+      const p = policy.priority(key)
+      const tier = Number.isFinite(p) ? p : 0
+      let list = tiers.get(tier)
+      if (!list) tiers.set(tier, (list = []))
+      list.push(key)
+    }
+    for (const tier of [...tiers.keys()].sort((a, b) => a - b)) {
+      for (const key of tiers.get(tier)!) {
+        if (this.totalBytes + newBytes <= this._maxBytes) return
+        const byteSize = this.evict(key)
+        policy.onEvict?.(key, tier, byteSize)
+      }
+    }
+  }
+
+  /** Remove an entry; returns its size (0 if it wasn't cached). */
+  private evict(key: string): number {
+    const entry = this.cache.get(key)
+    if (!entry) return 0
+    this.totalBytes -= entry.byteSize
+    this.cache.delete(key)
+    return entry.byteSize
   }
 }

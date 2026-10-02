@@ -1,4 +1,11 @@
 export { ZarrLayer } from './zarr-layer'
+export {
+  RequestGate,
+  requestGateFor,
+  configureRequestGate,
+  gatedFetch,
+} from './request-gate'
+export type { RequestGateOptions } from './request-gate'
 export type {
   ZarrLayerOptions,
   ColormapArray,

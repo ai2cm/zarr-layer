@@ -104,6 +104,7 @@ test('checkRangeResponses passes requests without Range through untouched', asyn
 
 const { createFetchStore } = await loadSrc('src/zarr-store.ts')
 const { withRangeCoalescing } = await loadSrc('src/range-coalescing.ts')
+const { resetRequestGates } = await loadSrc('src/request-gate.ts')
 
 // globalThis.fetch answering ranges of `body` after `delayMs`, honouring
 // the request's signal. `statusFor(n)` can force a status for request n.
@@ -266,16 +267,41 @@ test('real stack: a 503 is retried once, then thrown; no whole-object GET', asyn
   }
 })
 
-test('real stack: a 429 is thrown at once, not retried', async () => {
+test('real stack: a 429 waits out the gate backoff and is retried (task 44), no error', async () => {
+  resetRequestGates()
+  const net = stubGlobalFetch({ statusFor: (n) => (n === 0 ? 429 : null) })
+  try {
+    const store = await realStack()
+    const t0 = Date.now()
+    const data = await store.getRange('/v/c/0', { offset: 0, length: 100 })
+    assert.deepEqual(data, body.slice(0, 100))
+    // 2 s ± 25 % cooldown, then one retry
+    assert.ok(Date.now() - t0 >= 1400, `retried after ${Date.now() - t0} ms`)
+    assert.equal(net.requests.length, 2)
+    assert.equal(store.rangeRequests, true)
+  } finally {
+    net.restore()
+    resetRequestGates()
+  }
+})
+
+test('real stack: a read waiting out a 429 backoff ends with an AbortError when aborted', async () => {
+  resetRequestGates()
   const net = stubGlobalFetch({ statusFor: () => 429 })
   try {
     const store = await realStack()
-    await assert.rejects(store.getRange('/v/c/0', { offset: 0, length: 100 }), {
-      name: 'RangeRateLimitedError',
-    })
+    const controller = new AbortController()
+    const read = store.getRange(
+      '/v/c/0',
+      { offset: 0, length: 100 },
+      { signal: controller.signal }
+    )
+    setTimeout(() => controller.abort(), 100)
+    await assert.rejects(read, { name: 'AbortError' })
     assert.equal(net.requests.length, 1)
   } finally {
     net.restore()
+    resetRequestGates()
   }
 })
 

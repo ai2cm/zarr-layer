@@ -32,6 +32,12 @@ import {
   cancelAllRequests,
   setLoadingCallback as setLoadingCallbackUtil,
   emitLoadingState as emitLoadingStateUtil,
+  type ErrorRetryState,
+  createErrorRetryState,
+  scheduleErrorRetry,
+  errorRetrySucceeded,
+  errorRetryViewChanged,
+  clearErrorRetry,
 } from './mode-utils'
 import { ZarrStore } from './zarr-store'
 import { Tiles } from './tiles'
@@ -128,6 +134,9 @@ export class TiledMode implements ZarrMode {
 
   // Shared state managers
   private throttleState: ThrottleState = createThrottleState()
+  /** Delayed refetch after a failed tile read (task 44; mode-utils). */
+  private errorRetry: ErrorRetryState = createErrorRetryState()
+  private lastRetryViewKey = ''
   private requestCanceller: RequestCanceller = createRequestCanceller()
   private loadingManager: LoadingManager = createLoadingManager()
 
@@ -171,6 +180,7 @@ export class TiledMode implements ZarrMode {
         bandNames,
         crs: this.crs,
         fixedDataScale: this.fixedDataScale,
+        onFetchError: (tileKey) => this.scheduleRetryAfterError(tileKey),
       })
 
       this.updateGeometryForProjection(false)
@@ -209,6 +219,14 @@ export class TiledMode implements ZarrMode {
 
     const currentHash = JSON.stringify(this.selector)
     const tilesToFetch: TileTuple[] = []
+    // A new view (tiles or selector): failed tiles get fresh retries
+    const retryViewKey = `${currentHash}|${this.visibleTiles
+      .map(tileToKey)
+      .join(';')}`
+    if (retryViewKey !== this.lastRetryViewKey) {
+      this.lastRetryViewKey = retryViewKey
+      this.errorRetryViewChanged()
+    }
 
     for (const tileTuple of this.visibleTiles) {
       const tileKey = tileToKey(tileTuple)
@@ -341,6 +359,7 @@ export class TiledMode implements ZarrMode {
 
   dispose(_gl: WebGL2RenderingContext | WebGLRenderingContext): void {
     clearThrottle(this.throttleState)
+    clearErrorRetry(this.errorRetry)
     cancelAllRequests(this.requestCanceller)
     this.tileCache?.clear()
     this.tileCache = null
@@ -399,8 +418,40 @@ export class TiledMode implements ZarrMode {
   private emitLoadingState(): void {
     // Update chunksLoading state based on pending chunks and throttle state
     this.loadingManager.chunksLoading =
-      this.pendingChunks.size > 0 || this.throttleState.throttledPending
+      this.pendingChunks.size > 0 ||
+      this.throttleState.throttledPending ||
+      this.errorRetry.timer !== null
     emitLoadingStateUtil(this.loadingManager)
+  }
+
+  /**
+   * A new view: failed tiles get fresh retries, and the old view's pending
+   * retry is cancelled, so it no longer counts as loading.
+   */
+  private errorRetryViewChanged(): void {
+    const retryPending = this.errorRetry.timer !== null
+    errorRetryViewChanged(this.errorRetry)
+    if (retryPending) this.emitLoadingState()
+  }
+
+  /**
+   * A tile read failed (not aborted): refetch after a backoff (task 44), so
+   * a paused map doesn't keep the tile blank until the next view change.
+   * Reports chunks loading until the retry runs; after
+   * ERROR_RETRY_MAX_CYCLES cycles in one view it stops (mode-utils).
+   */
+  private scheduleRetryAfterError(tileKey: string): void {
+    if (!this.tileCache) return
+    // Off-screen tile requests aren't cancelled: one from an older view that
+    // fails now must not join this view's retry state (it would never
+    // succeed, blocking the backoff reset and using up retry cycles)
+    if (!this.visibleTiles.some((t) => tileToKey(t) === tileKey)) return
+    scheduleErrorRetry(this.errorRetry, tileKey, () => {
+      if (!this.tileCache) return
+      this.emitLoadingState()
+      this.invalidate()
+    })
+    this.emitLoadingState()
   }
 
   async setSelector(selector: NormalizedSelector): Promise<void> {
@@ -574,6 +625,7 @@ export class TiledMode implements ZarrMode {
         return null
       }
 
+      errorRetrySucceeded(this.errorRetry, tileKey)
       // Cancel all older pending requests since a newer version has completed
       cancelOlderRequests(this.requestCanceller, version)
 

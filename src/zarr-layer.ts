@@ -32,7 +32,11 @@ import type {
 import type { ZarrMode, RenderContext } from './zarr-mode'
 import { TiledMode } from './tiled-mode'
 import { UntiledMode, normalizedCacheBytesFor } from './untiled-mode'
-import { DEFAULT_CHUNK_CACHE_BYTES, validCacheBytes } from './caching-store'
+import {
+  DEFAULT_CHUNK_CACHE_BYTES,
+  validCacheBytes,
+  type CachingStore,
+} from './caching-store'
 import {
   computeWorldOffsets,
   resolveProjectionParams,
@@ -40,7 +44,15 @@ import {
 } from './map-utils'
 import { MAPBOX_IDENTITY_MATRIX } from './mapbox-utils'
 import type { QueryGeometry, QueryOptions, QueryResult } from './query/types'
-import { ESTIMATE_RECENT_STEPS, SPATIAL_DIM_NAMES } from './constants'
+import {
+  ESTIMATE_RECENT_STEPS,
+  EVICTION_TIER_DISPLAYED,
+  EVICTION_TIER_OTHER,
+  EVICTION_TIER_WINDOW,
+  MAX_WINDOW_REFILLS,
+  SPATIAL_DIM_NAMES,
+  WINDOW_REFILL_DELAY_MS,
+} from './constants'
 import {
   DEFAULT_PREFETCH_CONCURRENCY,
   PrefetchQueue,
@@ -51,6 +63,7 @@ import {
   DEFAULT_PREFETCH_MAX_REQUESTS,
   RequestLimiter,
 } from './request-limiter'
+import { configureRequestGate } from './request-gate'
 
 type MapboxInternals = {
   transform?: {
@@ -129,7 +142,18 @@ interface StepKeys {
    * incomplete) reads 'partial' and is fetched again.
    */
   completeKeys: Set<string> | null
+  /**
+   * The step's latest prefetch had a failed chunk read. The prefetch queue
+   * retries such a step itself, with backoff (task 44), so the window refill
+   * leaves it alone (see refillWindow). Cleared by a fetch that completes.
+   */
+  lastFetchFailed: boolean
 }
+
+/** Largest shard batch (time steps) the prefetch queue starts together. */
+export const MAX_PREFETCH_BATCH = 16
+/** Default `prefetchBatchSteps`. */
+export const DEFAULT_PREFETCH_BATCH_STEPS = 4
 
 export class ZarrLayer {
   readonly type: 'custom' = 'custom'
@@ -242,6 +266,8 @@ export class ZarrLayer {
    * Earlier-started (higher-priority) steps get free slots first.
    */
   private readonly prefetchLimiter: RequestLimiter
+  /** Most steps per prefetch batch (`prefetchBatchSteps`). */
+  private readonly prefetchBatchSteps: number
   /**
    * CachingStore cache keys per step, where a step is a time index *plus*
    * the values of the other non-spatial selector dims (the "selection", e.g.
@@ -286,6 +312,24 @@ export class ZarrLayer {
   private selectionCache: string | null = null
   /** Disposer for the continuous CachingStore access listener. */
   private removeAccessListener: (() => void) | null = null
+  /**
+   * The last prefetch window (deduped, in the caller's order) and its time
+   * dim, or null before the first `prefetchTimeSteps` call. Its steps' keys
+   * are protected from eviction (see evictionPriority), and it is refilled
+   * when it has holes while the queue is idle (see refillWindow).
+   */
+  private prefetchWindow: { indices: number[]; dim: string } | null = null
+  /** Refills of the current window so far (see MAX_WINDOW_REFILLS). */
+  private windowRefills: number = 0
+  private refillTimer: ReturnType<typeof setTimeout> | null = null
+  /**
+   * Keys of the prefetch window's steps and of the displayed step, rebuilt
+   * lazily (on the next eviction) after anything they depend on changes.
+   */
+  private protectedKeys: {
+    window: Map<string, number>
+    displayed: Set<string>
+  } | null = null
   private mapboxDirectGlobePathAvailable: boolean = false
 
   private canUseMapboxDirectGlobePath(): boolean {
@@ -406,6 +450,9 @@ export class ZarrLayer {
     rangeRequests = false,
     prefetchConcurrency,
     prefetchMaxRequests,
+    maxRequestsPerSecond,
+    requestBurst,
+    prefetchBatchSteps,
   }: ZarrLayerOptions) {
     if (!id) {
       throw new Error('[ZarrLayer] id is required')
@@ -506,13 +553,29 @@ export class ZarrLayer {
         console.warn(`[ZarrLayer] Invalid ${name} ${value}; using ${used}.`)
       }
     }
+    // The source origin's shared request gate (task 44): a layer that asks
+    // for a cap sets it for every layer reading from that origin
+    if (source && maxRequestsPerSecond !== undefined) {
+      configureRequestGate(source, {
+        maxRequestsPerSecond,
+        burst: requestBurst,
+      })
+    }
+    this.prefetchBatchSteps = normalizeConcurrency(
+      prefetchBatchSteps,
+      DEFAULT_PREFETCH_BATCH_STEPS
+    )
     this.prefetchLimiter = new RequestLimiter(requests)
     this.prefetchQueue = new PrefetchQueue({
       fetchStep: (timeIdx, timeDimName, signal, info) =>
         this.prefetchOneStep(timeIdx, timeDimName, signal, info),
       isCached: (timeIdx) => this.isTimeStepCached(timeIdx),
-      onBusyChange: () => this.emitLoadingState(),
+      onBusyChange: (busy) => {
+        this.emitLoadingState()
+        if (!busy) this.scheduleWindowRefill()
+      },
       maxConcurrentSteps: steps,
+      batchSize: () => this.getPrefetchBatchSize(),
     })
   }
 
@@ -561,6 +624,8 @@ export class ZarrLayer {
       for (const key of this.displayedReads.keys) complete.add(key)
     }
     entry.completeKeys = complete
+    entry.lastFetchFailed = false
+    this.protectedKeys = null
   }
 
   setOpacity(opacity: number) {
@@ -610,6 +675,7 @@ export class ZarrLayer {
       this.removeAccessListener?.()
       this.removeAccessListener = null
       this.prefetchQueue.clear()
+      this.resetPrefetchWindow()
       this.timestepKeys.clear()
       this.displayedReads = null
       this.keyBytes.clear()
@@ -639,6 +705,7 @@ export class ZarrLayer {
       this.removeAccessListener?.()
       this.removeAccessListener = null
       this.prefetchQueue.clear()
+      this.resetPrefetchWindow()
       this.timestepKeys.clear()
       this.displayedReads = null
       this.keyBytes.clear()
@@ -663,13 +730,18 @@ export class ZarrLayer {
     this.selector = selector
     this.normalizedSelector = normalized
     this.selectionCache = null
+    this.protectedKeys = null
     // A different selection (e.g. ensemble member): queued and in-flight
     // prefetch steps are for the old one, so drop them. Synchronous, before
     // any await, so a prefetchTimeSteps call right after setSelector queues
     // steps for the new selection. Recorded step keys are kept: they are
     // per selection, so switching back reads as cached without a refetch.
+    // The window is forgotten too: its indices were sent for the old
+    // selection, so they must not protect or refill the new one's steps
+    // (the caller sends a window for the new selection).
     if (this.currentSelection() !== previousSelection) {
       this.prefetchQueue.clear()
+      this.resetPrefetchWindow()
     }
 
     this.bandNames = getBands(this.variable, this.normalizedSelector)
@@ -711,7 +783,219 @@ export class ZarrLayer {
       this.prefetchTimeDimName = timeDimName
       this.selectionCache = null
     }
-    this.prefetchQueue.set(timeIndices, timeDimName)
+    const indices = [...new Set(timeIndices)].filter(
+      (idx) => Number.isInteger(idx) && idx >= 0
+    )
+    // Drop the previous window first, with its pending refill check: an armed
+    // timer would otherwise fire early for this window (its idle callback
+    // sees the timer and doesn't start its own WINDOW_REFILL_DELAY_MS).
+    this.resetPrefetchWindow()
+    this.prefetchWindow = { indices, dim: timeDimName }
+    this.prefetchQueue.set(indices, timeDimName)
+  }
+
+  /** Forget the prefetch window and cancel a pending refill check. */
+  private resetPrefetchWindow(): void {
+    this.prefetchWindow = null
+    this.windowRefills = 0
+    this.protectedKeys = null
+    if (this.refillTimer !== null) {
+      clearTimeout(this.refillTimer)
+      this.refillTimer = null
+    }
+  }
+
+  /**
+   * CachingStore eviction tier of a key (see `CachingStore.setEvictionPolicy`):
+   * keys of the displayed step are kept longest, then keys of the prefetch
+   * window's steps, and everything else (steps behind the playhead, an old
+   * window, metadata) is evicted first, LRU. Window keys get a priority in
+   * [EVICTION_TIER_WINDOW, EVICTION_TIER_DISPLAYED) by their step's window
+   * position (see getProtectedKeys), so a window that doesn't fit the
+   * budget evicts inside itself from its far end.
+   */
+  private evictionPriority(cacheKey: string): number {
+    const keys = this.getProtectedKeys()
+    if (keys.displayed.has(cacheKey)) return EVICTION_TIER_DISPLAYED
+    return keys.window.get(cacheKey) ?? EVICTION_TIER_OTHER
+  }
+
+  /**
+   * Window keys map to a priority inside the window tier by the step's
+   * position (the window is in priority order): from just under
+   * EVICTION_TIER_DISPLAYED for the first step down to EVICTION_TIER_WINDOW
+   * for the last. So a window over the budget (an estimate that was low)
+   * evicts its farthest steps first, not the least recently used ones,
+   * which are the steps nearest the playhead (fetched first). A key shared
+   * by several steps takes the nearest one's.
+   */
+  private getProtectedKeys(): {
+    window: Map<string, number>
+    displayed: Set<string>
+  } {
+    if (this.protectedKeys) return this.protectedKeys
+    const selection = this.currentSelection()
+    const window = new Map<string, number>()
+    const indices = this.prefetchWindow?.indices ?? []
+    const n = indices.length
+    indices.forEach((idx, pos) => {
+      const entry = this.timestepKeys.get(this.stepKey(idx, selection))
+      if (!entry) return
+      const priority =
+        EVICTION_TIER_WINDOW +
+        ((n - 1 - pos) / n) * (EVICTION_TIER_DISPLAYED - EVICTION_TIER_WINDOW)
+      for (const key of entry.keys) {
+        if (!window.has(key)) window.set(key, priority)
+      }
+    })
+    const displayed = new Set<string>()
+    const timeIdx = this.getCurrentTimeIdx()
+    if (timeIdx !== null) {
+      const step = this.stepKey(timeIdx, selection)
+      const entry = this.timestepKeys.get(step)
+      // The step's last complete view plus what it has read since it
+      // became displayed, not every key it ever read (other zoom levels)
+      for (const key of entry?.completeKeys ?? entry?.keys ?? []) {
+        displayed.add(key)
+      }
+      if (this.displayedReads?.step === step) {
+        for (const key of this.displayedReads.keys) displayed.add(key)
+      }
+    }
+    this.protectedKeys = { window, displayed }
+    return this.protectedKeys
+  }
+
+  /** Make `cachingStore` evict by this layer's tiers (evictionPriority). */
+  private installEvictionPolicy(cachingStore: CachingStore): void {
+    this.protectedKeys = null
+    cachingStore.setEvictionPolicy({
+      priority: (key) => this.evictionPriority(key),
+      onEvict: this.handleEviction,
+    })
+  }
+
+  /**
+   * An evicted protected key may leave a hole in the window. The size is
+   * remembered too: an entry evicted between being stored and its access
+   * being reported (an over-budget window, several steps in flight) would
+   * otherwise have no known size for the estimate and the refill's budget
+   * check.
+   */
+  private handleEviction = (
+    key: string,
+    tier: number,
+    byteSize: number
+  ): void => {
+    if (!this.keyBytes.has(key)) this.keyBytes.set(key, byteSize)
+    if (tier >= EVICTION_TIER_WINDOW && !this.prefetchQueue.busy) {
+      this.scheduleWindowRefill()
+    }
+  }
+
+  private scheduleWindowRefill(): void {
+    if (this.refillTimer !== null || !this.prefetchWindow || this.isRemoved) {
+      return
+    }
+    this.refillTimer = setTimeout(() => {
+      this.refillTimer = null
+      this.refillWindow()
+    }, WINDOW_REFILL_DELAY_MS)
+  }
+
+  /**
+   * Refetch the holes of the last prefetch window when the queue is idle:
+   * steps that read chunks which are no longer all resident (evicted, or a
+   * fetch cut short), so they refill without waiting for the caller's next
+   * move. A step whose latest fetch failed is not a hole: the prefetch
+   * queue already retried it with backoff (task 44), and retrying it here
+   * too would multiply its attempts against the request budget. Skipped
+   * when the window
+   * doesn't fit the cache budget (refilling would only evict another of its
+   * steps), and at most MAX_WINDOW_REFILLS times per window.
+   */
+  private refillWindow(): void {
+    const window = this.prefetchWindow
+    if (!window || window.indices.length === 0) return
+    if (this.prefetchQueue.busy || this.metadataLoading || this.isRemoved) {
+      return
+    }
+    if (window.dim !== this.prefetchTimeDimName) return
+    if (this.windowRefills >= MAX_WINDOW_REFILLS) return
+    // A hole is a step that read chunks which are no longer all resident,
+    // and whose latest fetch didn't fail. A step with no recorded keys is
+    // left to the caller's next window: its fetch read nothing (every chunk
+    // absent, e.g. a sparse store, or it failed before any read), and
+    // refetching it would only repeat that.
+    const selection = this.currentSelection()
+    const status = this.getCacheStatus(window.indices)
+    const holes = window.indices.filter((idx) => {
+      if (status[idx] === 'cached') return false
+      const entry = this.timestepKeys.get(this.stepKey(idx, selection))
+      return !!entry && entry.keys.size > 0 && !entry.lastFetchFailed
+    })
+    if (holes.length === 0) return
+    if (!this.windowFitsBudget(window.indices)) return
+    this.windowRefills++
+    // Only the holes, at their positions in the window (requeue keeps the
+    // queue's window, so the near rule and shard batching apply as for the
+    // window itself)
+    this.prefetchQueue.requeue(holes, window.dim)
+  }
+
+  /**
+   * Whether the window's steps (and the displayed step) fit the cache
+   * budget: the known sizes of their complete (else recorded) keys, each
+   * entry counted once, plus the per-step estimate for steps with no keys.
+   */
+  private windowFitsBudget(indices: number[]): boolean {
+    const cachingStore = this.zarrStore?.cachingStore
+    if (!cachingStore) return false
+    const selection = this.currentSelection()
+    const estimate = this.getEstimatedTimestepBytes() ?? 0
+    const seen = new Set<string>()
+    let bytes = 0
+    const steps = new Set(indices)
+    const current = this.getCurrentTimeIdx()
+    if (current !== null) steps.add(current)
+    for (const idx of steps) {
+      const entry = this.timestepKeys.get(this.stepKey(idx, selection))
+      const keys = entry?.completeKeys ?? entry?.keys
+      if (!keys || keys.size === 0) {
+        bytes += estimate
+        continue
+      }
+      for (const key of keys) {
+        if (seen.has(key)) continue
+        seen.add(key)
+        bytes += this.keyBytes.get(key) ?? 0
+      }
+    }
+    return bytes <= cachingStore.maxBytes
+  }
+
+  /**
+   * Time steps per prefetch batch: the shard extent along the time dim of a
+   * sharded v3 array read by range (ace-viz task 44), else 1. The prefetch
+   * queue starts the steps of one batch together so their inner-chunk
+   * ranges coalesce into few requests; a caller building windows can align
+   * a window's far end to a batch boundary (the ace-viz webapp does). Whole
+   * objects (`rangeRequests` off, or after a fallback) and batches above
+   * MAX_PREFETCH_BATCH steps (e.g. a 100 km shard of 400 steps) give 1.
+   */
+  getPrefetchBatchSize(): number {
+    const store = this.zarrStore
+    if (!store?.shards || !store.cachingStore?.rangeRequests) return 1
+    // Not in the bootstrap window: batch once a step has been measured
+    if (this.getEstimatedTimestepBytes() === null) return 1
+    const timeIdx = store.dimensions.indexOf(this.prefetchTimeDimName)
+    let size = timeIdx === -1 ? 1 : store.shards[timeIdx]
+    if (!Number.isInteger(size) || size > MAX_PREFETCH_BATCH) return 1
+    // At most prefetchBatchSteps: halve an even shard extent (Morton order
+    // keeps each aligned half of a shard's steps contiguous, e.g. steps 0-1
+    // and 2-3 of a 4-step shard)
+    while (size > this.prefetchBatchSteps && size % 2 === 0) size /= 2
+    return size >= 2 && size <= this.prefetchBatchSteps ? size : 1
   }
 
   /**
@@ -747,7 +1031,7 @@ export class ZarrLayer {
     timeDimName: string,
     signal: AbortSignal,
     info: PrefetchStepInfo
-  ): Promise<boolean> {
+  ): Promise<boolean | 'failed'> {
     if (this.metadataLoading) return false
     const mode = this.mode
     if (!mode?.prefetchTimeSteps) return true
@@ -757,7 +1041,9 @@ export class ZarrLayer {
     // Keys this fetch reads, for the per-step byte estimate
     const keys = new Set<string>()
     this.prefetchSignals.set(signal, { timeIndex: timeIdx, selection, keys })
-    const limiterOptions = { priority: info.seq, signal }
+    // Steps of one shard batch share a limiter group, so their chunk reads
+    // go out together and coalesce (task 44)
+    const limiterOptions = { priority: info.seq, signal, group: info.batch }
     let failed = false
     try {
       const done = await mode.prefetchTimeSteps(
@@ -781,9 +1067,14 @@ export class ZarrLayer {
           entry.measuredSeq = ++this.measureCount
           // Exactly the step's chunks for the regions in view
           entry.completeKeys = keys
+          this.protectedKeys = null
         }
       }
-      return done !== false
+      if (done === false) return false
+      const entry = this.timestepKeys.get(this.stepKey(timeIdx, selection))
+      if (!signal.aborted && entry) entry.lastFetchFailed = failed
+      // A failed read: the queue retries the step with backoff (task 44)
+      return failed && !signal.aborted ? 'failed' : true
     } finally {
       this.prefetchSignals.delete(signal)
     }
@@ -839,10 +1130,12 @@ export class ZarrLayer {
         measuredKeys: null,
         measuredSeq: 0,
         completeKeys: null,
+        lastFetchFailed: false,
       }
       this.timestepKeys.set(key, entry)
     }
     entry.keys.add(cacheKey)
+    this.protectedKeys = null
     // Listeners run after the entry is stored, so it is resident here
     const bytes = this.zarrStore?.cachingStore?.getEntryBytes(cacheKey)
     if (bytes !== undefined) this.keyBytes.set(cacheKey, bytes)
@@ -1247,6 +1540,7 @@ export class ZarrLayer {
           this.zarrStore.cachingStore.addAccessListener((cacheKey, opts) => {
             this.attributeChunkAccess(cacheKey, opts)
           })
+        this.installEvictionPolicy(this.zarrStore.cachingStore)
       }
 
       const desc = this.zarrStore.describe()
@@ -1502,6 +1796,7 @@ export class ZarrLayer {
     this.colormap.dispose(gl)
 
     this.prefetchQueue.clear()
+    this.resetPrefetchWindow()
     this.mode?.dispose(gl)
     this.mode = null
 

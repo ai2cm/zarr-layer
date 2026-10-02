@@ -92,6 +92,12 @@ import {
   hasActiveRequests,
   setLoadingCallback as setLoadingCallbackUtil,
   emitLoadingState as emitLoadingStateUtil,
+  type ErrorRetryState,
+  createErrorRetryState,
+  scheduleErrorRetry,
+  errorRetrySucceeded,
+  errorRetryViewChanged,
+  clearErrorRetry,
 } from './mode-utils'
 import { setupBandTextureUniforms, uploadDataTexture } from './render-helpers'
 import { renderRegion, type RenderableRegion } from './renderable-region'
@@ -364,6 +370,8 @@ export class UntiledMode implements ZarrMode {
 
   // Shared state managers
   private throttleState: ThrottleState = createThrottleState()
+  /** Delayed refetch after a failed render read (task 44; mode-utils). */
+  private errorRetry: ErrorRetryState = createErrorRetryState()
   private requestCanceller: RequestCanceller = createRequestCanceller()
   private loadingManager: LoadingManager = createLoadingManager()
 
@@ -1728,6 +1736,8 @@ export class UntiledMode implements ZarrMode {
       .map((r) => `${r.regionX},${r.regionY}`)
       .join('|')}`
     const viewportChanged = viewportHash !== this.lastViewportHash
+    // A new view (pan, zoom, time step): failed regions get fresh retries
+    if (viewportChanged) this.errorRetryViewChanged()
     this.lastViewportHash = viewportHash
 
     // If we restored any regions from cache, trigger a repaint
@@ -2138,11 +2148,13 @@ export class UntiledMode implements ZarrMode {
       // checkViewComplete does not count it (the guard above ran with no
       // await since, so no newer fetch can have landed in between)
       region.selectorVersion = fetchSelectorVersion
+      errorRetrySucceeded(this.errorRetry, key)
 
       this.invalidate()
     } catch (err) {
       if (!(err instanceof DOMException && err.name === 'AbortError')) {
         console.error(`[fetchRegion] Error fetching region ${key}:`, err)
+        this.scheduleRetryAfterError(key)
       }
     } finally {
       region.loading = false
@@ -2663,6 +2675,7 @@ export class UntiledMode implements ZarrMode {
   dispose(gl: WebGL2RenderingContext | WebGLRenderingContext): void {
     this.isRemoved = true
     clearThrottle(this.throttleState)
+    clearErrorRetry(this.errorRetry)
     cancelAllRequests(this.requestCanceller)
     // Clean up region caches
     this.clearRegionCache(gl)
@@ -2963,14 +2976,47 @@ export class UntiledMode implements ZarrMode {
   }
 
   private emitLoadingState(): void {
-    // Update chunksLoading to include throttle state
+    // Update chunksLoading to include throttle state and a pending retry
+    // after a failed read (the region is still wanted, just not loaded yet)
     if (
-      this.throttleState.throttledPending &&
+      (this.throttleState.throttledPending || this.errorRetry.timer !== null) &&
       !this.loadingManager.chunksLoading
     ) {
       this.loadingManager.chunksLoading = true
     }
     emitLoadingStateUtil(this.loadingManager)
+  }
+
+  /**
+   * A new view: failed regions get fresh retries, and the old view's pending
+   * retry is cancelled, so it no longer counts as loading.
+   */
+  private errorRetryViewChanged(): void {
+    const retryPending = this.errorRetry.timer !== null
+    errorRetryViewChanged(this.errorRetry)
+    if (!retryPending) return
+    this.loadingManager.chunksLoading = hasActiveRequests(this.requestCanceller)
+    this.emitLoadingState()
+  }
+
+  /**
+   * A render read failed (not aborted): refetch after a backoff (task 44).
+   * A paused map would otherwise keep the region blank until the next pan,
+   * zoom or time change. Reports chunks loading until the retry runs;
+   * after ERROR_RETRY_MAX_CYCLES cycles in one view it stops (mode-utils).
+   */
+  private scheduleRetryAfterError(key: string): void {
+    if (this.isRemoved) return
+    scheduleErrorRetry(this.errorRetry, key, () => {
+      if (this.isRemoved) return
+      this.loadingManager.chunksLoading = hasActiveRequests(
+        this.requestCanceller
+      )
+      this.emitLoadingState()
+      // Re-evaluates visible regions: failed ones have no current data
+      this.invalidate()
+    })
+    this.emitLoadingState()
   }
 
   private async resolveSelectionIndex(

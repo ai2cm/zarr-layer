@@ -71,6 +71,10 @@ function untiled(overrides = {}) {
     currentLevelCoversViewport: P.currentLevelCoversViewport,
     checkViewComplete: P.checkViewComplete,
     invalidate() {},
+    // Task 44: delayed refetch after a failed read (no-op here)
+    errorRetry: { timer: null, failures: 0, failedKeys: new Set() },
+    scheduleRetryAfterError() {},
+    errorRetryViewChanged: P.errorRetryViewChanged,
     fetched: [],
     fetchRegions(regions) {
       this.fetched.push(...regions)
@@ -255,6 +259,7 @@ test('TiledMode fetchTileData: reports once the last visible tile lands; a faile
     requestCanceller: { controllers: new Map() },
     emitLoadingState() {},
     invalidate() {},
+    errorRetry: { timer: null, failures: 0, failedKeys: new Set() },
     checkViewComplete: TiledMode.prototype.checkViewComplete,
     tileCache: {
       get: (k) => tiles.get(k),

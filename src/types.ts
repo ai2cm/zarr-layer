@@ -197,8 +197,29 @@ export interface ZarrLayerOptions {
    * apply to both: on HTTP/1.1 hosts, about 6 connections per host are
    * shared by render and prefetch requests (HTTP/2 hosts multiplex).
    * Default: 12. Validated like `prefetchConcurrency`.
+   * Chunk reads of one shard batch (see `ZarrLayer.getPrefetchBatchSize`)
+   * go out together past the cap, so they coalesce.
    */
   prefetchMaxRequests?: number
+  /**
+   * Cap on HTTP requests per second to the source's origin (a token bucket
+   * shared by every layer and request to that origin; see
+   * `request-gate.ts`). For hosts that limit request counts, such as a
+   * Hugging Face Bucket's `/resolve/` URLs (anonymous: 3,000 per 5 minutes
+   * per IP). Setting it also makes a network error back off like a 429,
+   * since such a host's 429 may arrive without CORS headers. Default: no
+   * cap. Whatever the cap, a 429 is retried after a jittered exponential
+   * backoff (2-30 s) instead of failing. Applies to `source` stores only.
+   */
+  maxRequestsPerSecond?: number
+  /** Bucket size for `maxRequestsPerSecond` (default 10). */
+  requestBurst?: number
+  /**
+   * Most time steps prefetched as one shard batch (see
+   * `ZarrLayer.getPrefetchBatchSize`); a larger even shard extent is halved
+   * until it fits. `1` turns batching off. Default: 4.
+   */
+  prefetchBatchSteps?: number
 }
 
 export type CRS = 'EPSG:4326' | 'EPSG:3857'
