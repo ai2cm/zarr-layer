@@ -298,6 +298,8 @@ export class ZarrLayer {
    * never credited to the prefetched step. The selection is captured when
    * the step starts.
    */
+  /** All reads in the gate's background lane (see setBackgroundReads). */
+  private backgroundReads: boolean
   private prefetchSignals: WeakMap<
     AbortSignal,
     { timeIndex: number; selection: string; keys: Set<string> }
@@ -453,6 +455,7 @@ export class ZarrLayer {
     maxRequestsPerSecond,
     requestBurst,
     prefetchBatchSteps,
+    backgroundReads = false,
   }: ZarrLayerOptions) {
     if (!id) {
       throw new Error('[ZarrLayer] id is required')
@@ -518,6 +521,7 @@ export class ZarrLayer {
     this.throttleMs = throttleMs
     this.proj4 = proj4
     this.transformRequest = transformRequest
+    this.backgroundReads = !!backgroundReads
     this.customStore = store
     this.renderPoles = renderPoles
     // An invalid budget behaves exactly like an unset one (100 MB chunk
@@ -626,6 +630,26 @@ export class ZarrLayer {
     entry.completeKeys = complete
     entry.lastFetchFailed = false
     this.protectedKeys = null
+  }
+
+  /**
+   * Put every read of this layer in the request gate's background lane
+   * (with prefetch reads), render reads included: for a layer that renders
+   * while nobody sees it (opacity 0, kept warm to flip to), whose reads
+   * should not compete with visible layers' render reads or their
+   * `RENDER_RESERVE` tokens. Off (the default): only prefetch reads are
+   * background.
+   *
+   * Applies to requests issued after the call; requests already in flight
+   * or waiting at the gate keep their lane. A read that joins a fetch
+   * already in flight (same key) shares that fetch and its lane, and a
+   * coalesced range request is background only if every member is (so a
+   * visible layer's read merged with this layer's makes it a render
+   * request). Can be called before the layer is added. No effect without
+   * the chunk cache (`maxChunkCacheBytes: 0`) or with a custom `store`.
+   */
+  setBackgroundReads(on: boolean): void {
+    this.backgroundReads = !!on
   }
 
   setOpacity(opacity: number) {
@@ -870,7 +894,8 @@ export class ZarrLayer {
    * Hook the layer into its chunk cache: step attribution of every access,
    * the eviction tiers, and the request gate's background lane for prefetch
    * reads (a registered step signal), so render reads go first (ace-viz
-   * task 49).
+   * task 49), or for every read while `backgroundReads` is on (read at each
+   * request, so setBackgroundReads applies to the next one).
    */
   private attachCachingStore(cachingStore: CachingStore): void {
     this.removeAccessListener?.()
@@ -881,7 +906,9 @@ export class ZarrLayer {
     )
     this.installEvictionPolicy(cachingStore)
     cachingStore.setBackgroundClassifier(
-      (opts) => !!opts?.signal && this.prefetchSignals.has(opts.signal)
+      (opts) =>
+        this.backgroundReads ||
+        (!!opts?.signal && this.prefetchSignals.has(opts.signal))
     )
   }
 

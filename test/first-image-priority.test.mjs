@@ -275,3 +275,126 @@ test("ZarrLayer: a prefetch step's reads carry the background marker; render rea
     { key: '/v/c/0/1', marked: false },
   ])
 })
+
+// setBackgroundReads (ace-viz task 35): a hidden "hot" layer puts its render
+// reads in the background lane too
+function makeLayer(ZarrLayer, extra = {}) {
+  return new ZarrLayer({
+    id: 'test',
+    source: 'http://example.invalid/store.zarr',
+    variable: 'v',
+    clim: [0, 1],
+    colormap: ['#000000', '#ffffff'],
+    selector: { time: { selected: 0, type: 'index' } },
+    ...extra,
+  })
+}
+
+test('ZarrLayer: backgroundReads marks render reads; turning it off unmarks them; prefetch stays background', async () => {
+  const { ZarrLayer } = await loadSrc('src/zarr-layer.ts')
+  const layer = makeLayer(ZarrLayer, { backgroundReads: true })
+  const seen = []
+  const base = {
+    async get(key, opts) {
+      seen.push(
+        `${key}:${opts?.headers?.[BACKGROUND_REQUEST_HEADER] ? 'bg' : 'render'}`
+      )
+      return new Uint8Array(100)
+    },
+  }
+  const store = new CachingStore(base, 1e6, { markBackground: true })
+  layer.zarrStore = { cachingStore: store }
+  layer.attachCachingStore(store)
+  let step = 0
+  layer.mode = {
+    setSelector: async () => {},
+    dispose() {},
+    async prefetchTimeSteps(indices, _dim, signal) {
+      await store.get(`/v/c/${indices[0]}/${step}`, { signal })
+      return true
+    },
+  }
+  const prefetchOnce = async (i) => {
+    layer.prefetchTimeSteps([i])
+    await new Promise((r) => setTimeout(r, 0))
+    await new Promise((r) => setTimeout(r, 0))
+  }
+  await prefetchOnce(3)
+  await store.get('/v/c/0/0', { signal: new AbortController().signal })
+  await store.get('/v/c/0/1') // no signal
+  layer.setBackgroundReads(false)
+  step = 1
+  await prefetchOnce(4)
+  await store.get('/v/c/0/2', { signal: new AbortController().signal })
+  await store.get('/v/c/0/3')
+  layer.setBackgroundReads(true)
+  await store.get('/v/c/0/4')
+  assert.deepEqual(seen, [
+    '/v/c/3/0:bg',
+    '/v/c/0/0:bg',
+    '/v/c/0/1:bg',
+    '/v/c/4/1:bg',
+    '/v/c/0/2:render',
+    '/v/c/0/3:render',
+    '/v/c/0/4:bg',
+  ])
+})
+
+test("ZarrLayer: with a capped gate, a background-reads layer's render reads wait behind a visible layer's and keep the reserve", async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const { ZarrLayer } = await loadSrc('src/zarr-layer.ts')
+  const gate = new RequestGate({ maxRequestsPerSecond: 5, burst: 4 })
+  const sent = []
+  const fetchStore = new zarr.FetchStore('http://h.invalid/s.zarr', {
+    fetch: gatedFetch(
+      async (request) => {
+        sent.push(new URL(request.url).pathname.replace('/s.zarr', ''))
+        const m = /bytes=(\d+)-(\d+)/.exec(request.headers.get('Range') ?? '')
+        return new Response(new Uint8Array(+m[2] - +m[1] + 1), { status: 206 })
+      },
+      () => gate
+    ),
+  })
+  // One shared fetch store (as the store cache gives two layers on one
+  // source), one CachingStore per layer
+  const base = withRangeCoalescing(fetchStore)
+  const stack = (backgroundReads) => {
+    const layer = makeLayer(ZarrLayer, { backgroundReads })
+    const store = new CachingStore(base, 1e6, {
+      rangeRequests: true,
+      markBackground: true,
+      retryDelayMs: () => 0,
+    })
+    layer.zarrStore = { cachingStore: store }
+    layer.attachCachingStore(store)
+    return store
+  }
+  const hidden = stack(true)
+  const visible = stack(false)
+  const range = { offset: 0, length: 4 }
+  const settle = async () => {
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r))
+  }
+  // Full bucket (4 tokens): the hidden layer's render reads leave 2 for
+  // render reads, so only 2 of its 4 go
+  const reads = []
+  for (let i = 0; i < 4; i++) reads.push(hidden.getRange(`/h/${i}`, range))
+  await settle()
+  assert.deepEqual(sent, ['/h/0', '/h/1'], 'the reserve is kept')
+  // The visible layer's render reads take the reserve at once and queue
+  // ahead of the hidden layer's
+  for (let i = 0; i < 3; i++) reads.push(visible.getRange(`/v/${i}`, range))
+  await settle()
+  assert.deepEqual(sent, ['/h/0', '/h/1', '/v/0', '/v/1'])
+  // Next token (200 ms) goes to the visible read; the hidden ones then need
+  // 1 + RENDER_RESERVE tokens
+  t.mock.timers.tick(200)
+  await settle()
+  assert.deepEqual(sent.slice(4), ['/v/2'])
+  for (let i = 0; i < 10; i++) {
+    t.mock.timers.tick(100)
+    await settle()
+  }
+  await Promise.all(reads)
+  assert.deepEqual(sent.slice(5), ['/h/2', '/h/3'])
+})

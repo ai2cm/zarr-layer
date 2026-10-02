@@ -254,6 +254,18 @@ layer.prefetchTimeSteps([12, 10, 13, 9])
   fit the budget, so a window that doesn't fit can't loop. A step that read no
   chunks (every chunk absent) is not refilled.
 
+**Background reads.** Render reads go before prefetch reads at the per-origin
+request gate, and with a rate cap prefetch leaves `RENDER_RESERVE` (2) tokens
+for them. `setBackgroundReads(true)` (or the `backgroundReads: true`
+constructor option) puts _all_ of a layer's reads, render reads included, in
+the background lane: for a hidden layer (opacity 0) that keeps rendering so
+it can be shown instantly, whose reads nobody waits for. Call
+`setBackgroundReads(false)` when it becomes visible; it applies to requests
+issued after the call (ones in flight keep their lane). A read that joins an
+in-flight fetch of the same key shares its lane, and a coalesced range
+request is background only if every member is. Needs the chunk cache and a
+`source` store (no effect with a custom `store`).
+
 ## selectors
 
 Selectors specify which slice of your multidimensional data to render. Dimensions not specified default to index 0.
