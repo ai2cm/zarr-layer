@@ -866,7 +866,6 @@ export class ZarrLayer {
     return this.protectedKeys
   }
 
-  /** Make `cachingStore` evict by this layer's tiers (evictionPriority). */
   /**
    * Hook the layer into its chunk cache: step attribution of every access,
    * the eviction tiers, and the request gate's background lane for prefetch
@@ -886,6 +885,7 @@ export class ZarrLayer {
     )
   }
 
+  /** Make `cachingStore` evict by this layer's tiers (evictionPriority). */
   private installEvictionPolicy(cachingStore: CachingStore): void {
     this.protectedKeys = null
     cachingStore.setEvictionPolicy({
