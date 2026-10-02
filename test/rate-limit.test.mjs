@@ -676,3 +676,58 @@ test('gatedFetch: still rate-limited after giveUpMs -> RangeRateLimitedError', a
   })
   assert.equal(calls, 1, 'no retry past the deadline')
 })
+
+// ---- Review round 2 --------------------------------------------------------
+
+test('gatedFetch: a 429 just before giveUpMs is not retried after the cooldown', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  const giveUpMs = 360_000
+  const gate = new RequestGate({}, { random: () => 0.5 })
+  let calls = 0
+  const f = gatedFetch(
+    async () => {
+      calls++
+      // Answers 1 ms before the deadline: the retry would wait a 2 s cooldown
+      t.mock.timers.tick(giveUpMs - 1)
+      return new Response(null, { status: 429 })
+    },
+    () => gate
+  )
+  const result = f(new Request('http://h.invalid/a')).then(
+    () => 'resolved',
+    (err) => err.name
+  )
+  await flush()
+  assert.equal(calls, 1)
+  t.mock.timers.tick(2000)
+  await flush()
+  assert.equal(await result, 'RangeRateLimitedError')
+  assert.equal(calls, 1, 'no request sent past the deadline')
+  // The released ticket was the probe: the next request can still go out
+  const next = await gate.acquire()
+  assert.equal(next.probe, true)
+})
+
+test('errorRetrySucceeded: the last failed key loading cancels the pending retry', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const st = modeUtils.createErrorRetryState()
+  let retries = 0
+  modeUtils.scheduleErrorRetry(st, 'a', () => retries++)
+  modeUtils.scheduleErrorRetry(st, 'b', () => retries++)
+  modeUtils.errorRetrySucceeded(st, 'a')
+  assert.notEqual(st.timer, null, "'b' still failed: the retry stays")
+  modeUtils.errorRetrySucceeded(st, 'b')
+  assert.equal(st.timer, null)
+  assert.equal(st.failures, 0)
+  t.mock.timers.tick(60000)
+  assert.equal(retries, 0, 'no invalidate once nothing failed is left')
+  // UntiledMode no longer forces "chunks loading"
+  const P = UntiledMode.prototype
+  const state = {
+    errorRetry: st,
+    throttleState: modeUtils.createThrottleState(),
+    loadingManager: { metadataLoading: false, chunksLoading: false },
+  }
+  P.emitLoadingState.call(state)
+  assert.equal(state.loadingManager.chunksLoading, false)
+})

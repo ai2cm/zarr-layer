@@ -305,8 +305,15 @@ export function gatedFetch(
   return async (request: Request) => {
     const gate = gateFor(request.url)
     const start = now()
-    for (;;) {
+    for (let attempt = 0; ; attempt++) {
       const ticket = await gate.acquire(request.signal)
+      // A retry whose cooldown ran past the deadline: give up without
+      // sending it (release the ticket; 'error' leaves the gate's limit
+      // state alone, and a probe ticket passes the probe on)
+      if (attempt > 0 && now() - start >= giveUpMs) {
+        gate.done(ticket, 'error')
+        throw new RangeRateLimitedError(request.url)
+      }
       let response: Response
       try {
         response = await inner(request)

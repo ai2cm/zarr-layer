@@ -83,10 +83,19 @@ export function scheduleErrorRetry(
   return true
 }
 
-/** `key`'s read succeeded; reset the backoff once nothing failed is left. */
+/**
+ * `key`'s read succeeded. Once nothing failed is left, reset the backoff and
+ * cancel a pending retry: it would only invalidate for nothing, and the
+ * modes report chunks loading while a retry timer is set.
+ */
 export function errorRetrySucceeded(state: ErrorRetryState, key: string): void {
   state.failedKeys.delete(key)
-  if (state.failedKeys.size === 0) state.failures = 0
+  if (state.failedKeys.size > 0) return
+  state.failures = 0
+  if (state.timer !== null) {
+    clearTimeout(state.timer)
+    state.timer = null
+  }
 }
 
 /** The view or selector changed: start the retry cycles over. */
