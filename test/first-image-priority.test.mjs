@@ -230,3 +230,48 @@ test('CachingStore: no marker without markBackground (a custom store would send 
   }
   assert.deepEqual(seen, [null, null, '1', null])
 })
+
+// Review round 1: the ZarrLayer wiring (attachCachingStore) tags a real
+// prefetch step's reads as background and leaves render reads alone
+test("ZarrLayer: a prefetch step's reads carry the background marker; render reads do not", async () => {
+  const { ZarrLayer } = await loadSrc('src/zarr-layer.ts')
+  const layer = new ZarrLayer({
+    id: 'test',
+    source: 'http://example.invalid/store.zarr',
+    variable: 'v',
+    clim: [0, 1],
+    colormap: ['#000000', '#ffffff'],
+    selector: { time: { selected: 0, type: 'index' } },
+  })
+  const seen = []
+  const base = {
+    async get(key, opts) {
+      seen.push({ key, marked: !!opts?.headers?.[BACKGROUND_REQUEST_HEADER] })
+      return new Uint8Array(100)
+    },
+  }
+  const store = new CachingStore(base, 1e6, { markBackground: true })
+  layer.zarrStore = { cachingStore: store }
+  layer.attachCachingStore(store)
+  layer.mode = {
+    setSelector: async () => {},
+    dispose() {},
+    // Like untiled mode: the step's reads go through the store with the
+    // step's signal
+    async prefetchTimeSteps(indices, _dim, signal) {
+      await store.get(`/v/c/${indices[0]}/0`, { signal })
+      return true
+    },
+  }
+  layer.prefetchTimeSteps([3])
+  await new Promise((r) => setTimeout(r, 0))
+  await new Promise((r) => setTimeout(r, 0))
+  // A render read of the displayed step: zarrita passes its own signal
+  await store.get('/v/c/0/0', { signal: new AbortController().signal })
+  await store.get('/v/c/0/1')
+  assert.deepEqual(seen, [
+    { key: '/v/c/3/0', marked: true },
+    { key: '/v/c/0/0', marked: false },
+    { key: '/v/c/0/1', marked: false },
+  ])
+})
