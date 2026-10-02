@@ -389,3 +389,44 @@ test('a non-time selector change forgets the window: no refill or protection for
   // No refill of the old window (member 0's partial step 2, or member 1)
   assert.equal(stepFetches.length, fetchesBefore)
 })
+
+test("a new window drops the previous window's pending refill timer", async () => {
+  // Window 1's failed step arms a refill check; window 2 replaces it before
+  // that fires and fails a step of its own
+  const failing = new Map([
+    ['/v/c/2/1', 1],
+    ['/v/c/6/1', 1],
+  ])
+  const { prefetch, stepFetches } = evictionLayer({
+    maxBytes: 100_000,
+    failing,
+  })
+  await prefetch([1, 2, 3])
+  await sleep(WINDOW_REFILL_DELAY_MS - 150)
+  await prefetch([5, 6])
+  assert.deepEqual(stepFetches, [1, 2, 3, 5, 6])
+  // Window 2's refill waits its own full delay, not window 1's remainder
+  await sleep(300)
+  assert.deepEqual(stepFetches, [1, 2, 3, 5, 6])
+  await sleep(WINDOW_REFILL_DELAY_MS)
+  await tick()
+  assert.deepEqual(stepFetches, [1, 2, 3, 5, 6, 6])
+})
+
+test('a refill fetches only the holes, not steps that read nothing', async () => {
+  // Step 2's chunks don't exist; step 3 has a failed chunk (a hole)
+  const failing = new Map([['/v/c/3/1', 1]])
+  const { layer, store, prefetch, status, stepFetches } = evictionLayer({
+    maxBytes: 100_000,
+    failing,
+  })
+  const get = store.baseStore.get.bind(store.baseStore)
+  store.baseStore.get = async (key, opts) =>
+    key.startsWith('/v/c/2/') ? undefined : get(key, opts)
+  await prefetch([1, 2, 3])
+  assert.deepEqual(status([1, 2, 3]), ['cached', 'missing', 'partial'])
+  await sleep(WINDOW_REFILL_DELAY_MS + 100)
+  await tick()
+  assert.deepEqual(stepFetches, [1, 2, 3, 3])
+  assert.equal(layer.getCacheStatus([3])[3], 'cached')
+})

@@ -779,9 +779,11 @@ export class ZarrLayer {
     const indices = [...new Set(timeIndices)].filter(
       (idx) => Number.isInteger(idx) && idx >= 0
     )
+    // Drop the previous window first, with its pending refill check: an armed
+    // timer would otherwise fire early for this window (its idle callback
+    // sees the timer and doesn't start its own WINDOW_REFILL_DELAY_MS).
+    this.resetPrefetchWindow()
     this.prefetchWindow = { indices, dim: timeDimName }
-    this.windowRefills = 0
-    this.protectedKeys = null
     this.prefetchQueue.set(indices, timeDimName)
   }
 
@@ -903,7 +905,10 @@ export class ZarrLayer {
     if (holes.length === 0) return
     if (!this.windowFitsBudget(window.indices)) return
     this.windowRefills++
-    this.prefetchQueue.set(window.indices, window.dim)
+    // Only the holes: the queue is idle, so nothing else is queued or in
+    // flight, and the other uncached steps (no recorded keys) would only
+    // repeat a fetch that read nothing.
+    this.prefetchQueue.set(holes, window.dim)
   }
 
   /**
