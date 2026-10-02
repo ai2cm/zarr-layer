@@ -445,7 +445,12 @@ export class ZarrStore {
       this.cachingStore = new CachingStore(
         this.store as AsyncReadable,
         this.maxChunkCacheBytes,
-        { rangeRequests: this.rangeRequests }
+        {
+          rangeRequests: this.rangeRequests,
+          // Our fetch stores go through gatedFetch, which strips the
+          // background marker; a custom store would send it
+          markBackground: !this.customStore,
+        }
       )
       this.store = this.cachingStore as unknown as ZarrStoreType
     }

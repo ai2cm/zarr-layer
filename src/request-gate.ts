@@ -27,11 +27,20 @@
  * the caller's own retry (CachingStore retries a range once) then waits for
  * it. Otherwise TypeErrors pass through untouched.
  *
- * Requests leave in arrival order (FIFO); render and prefetch reads are not
- * told apart at this level.
+ * Two lanes (ace-viz task 49): render reads go before background
+ * (prefetch) reads. A request is background when it carries the
+ * `BACKGROUND_REQUEST_HEADER` marker (set by the CachingStore for a prefetch
+ * read, stripped by `gatedFetch` before the request leaves). Waiting
+ * requests leave render-first, FIFO within a lane, and with a cap a
+ * background request leaves only while `RENDER_RESERVE` tokens stay in the
+ * bucket, so a render read after a busy prefetch need not wait for a refill.
+ * The long-run prefetch rate is the same; only who waits changes.
  */
 
-import { RangeRateLimitedError } from './caching-store'
+import {
+  BACKGROUND_REQUEST_HEADER,
+  RangeRateLimitedError,
+} from './caching-store'
 
 export interface RequestGateOptions {
   /** Token-bucket rate; undefined / invalid / <= 0: no cap. */
@@ -43,6 +52,12 @@ export interface RequestGateOptions {
 }
 
 export const DEFAULT_REQUEST_BURST = 10
+/**
+ * Tokens a background request leaves in the bucket for render reads (at
+ * most `burst - 1`). A first frame of a sharded 3 km store is a shard-index
+ * read plus a few inner-chunk reads.
+ */
+export const RENDER_RESERVE = 2
 export const RATE_LIMIT_BACKOFF_MS = 2000
 export const RATE_LIMIT_MAX_BACKOFF_MS = 30000
 /**
@@ -72,6 +87,12 @@ interface Waiter {
   reject: (err: unknown) => void
   signal?: AbortSignal
   onAbort?: () => void
+  background: boolean
+}
+
+export interface AcquireOptions {
+  /** Low-priority lane: prefetch (see the module comment). Default false. */
+  background?: boolean
 }
 
 function abortError(signal: AbortSignal): unknown {
@@ -156,12 +177,16 @@ export class RequestGate {
 
   /**
    * Wait for this request's turn. Resolves with a ticket to pass to done();
-   * rejects with an AbortError if `signal` aborts first.
+   * rejects with an AbortError if `signal` aborts first. Render requests
+   * (the default) go before `background` ones.
    */
-  acquire(signal?: AbortSignal): Promise<GateTicket> {
+  acquire(
+    signal?: AbortSignal,
+    { background = false }: AcquireOptions = {}
+  ): Promise<GateTicket> {
     if (signal?.aborted) return Promise.reject(abortError(signal))
     return new Promise<GateTicket>((resolve, reject) => {
-      const waiter: Waiter = { resolve, reject, signal }
+      const waiter: Waiter = { resolve, reject, signal, background }
       if (signal) {
         waiter.onAbort = () => {
           const i = this.queue.indexOf(waiter)
@@ -172,7 +197,11 @@ export class RequestGate {
         }
         signal.addEventListener('abort', waiter.onAbort, { once: true })
       }
-      this.queue.push(waiter)
+      // Render lane: ahead of every waiting background request
+      const at = background
+        ? this.queue.length
+        : this.queue.findIndex((w) => w.background)
+      this.queue.splice(at === -1 ? this.queue.length : at, 0, waiter)
       this.pump()
       if (this.queue.includes(waiter)) this.stats.waited++
     })
@@ -224,8 +253,12 @@ export class RequestGate {
           this.tokens + ((now - this.refilledAt) / 1000) * this.rate
         )
         this.refilledAt = now
-        if (this.tokens < 1) {
-          this.schedule(((1 - this.tokens) / this.rate) * 1000)
+        // The head is background only when no render request waits
+        const need = this.queue[0].background
+          ? 1 + Math.min(RENDER_RESERVE, this.burst - 1)
+          : 1
+        if (this.tokens < need) {
+          this.schedule(((need - this.tokens) / this.rate) * 1000)
           return
         }
         this.tokens -= 1
@@ -301,9 +334,16 @@ export function resetRequestGates(): void {
   gates.clear()
 }
 
+function withoutBackgroundMarker(request: Request): Request {
+  const headers = new Headers(request.headers)
+  headers.delete(BACKGROUND_REQUEST_HEADER)
+  return new Request(request, { headers })
+}
+
 /**
  * Wrap a fetch so every request goes through its origin's gate: waits for
- * its turn, and a 429 is retried after the cooldown (see the module
+ * its turn (in the background lane when it carries
+ * `BACKGROUND_REQUEST_HEADER`, which is removed before `inner` sees it), and a 429 is retried after the cooldown (see the module
  * comment) until it succeeds, the request's signal aborts, or `giveUpMs`
  * (default 6 min) has passed (then `RangeRateLimitedError`).
  */
@@ -315,11 +355,14 @@ export function gatedFetch(
     now = () => Date.now(),
   }: { giveUpMs?: number; now?: () => number } = {}
 ): (request: Request) => Promise<Response> {
-  return async (request: Request) => {
+  return async (input: Request) => {
+    // A prefetch read: the background lane, and the marker never leaves
+    const background = input.headers.has(BACKGROUND_REQUEST_HEADER)
+    const request = background ? withoutBackgroundMarker(input) : input
     const gate = gateFor(request.url)
     const start = now()
     for (let attempt = 0; ; attempt++) {
-      const ticket = await gate.acquire(request.signal)
+      const ticket = await gate.acquire(request.signal, { background })
       // A retry whose cooldown ran past the deadline: give up without
       // sending it (release the ticket; 'error' leaves the gate's limit
       // state alone, and a probe ticket passes the probe on)

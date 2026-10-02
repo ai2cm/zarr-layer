@@ -1541,6 +1541,11 @@ export class ZarrLayer {
             this.attributeChunkAccess(cacheKey, opts)
           })
         this.installEvictionPolicy(this.zarrStore.cachingStore)
+        // Prefetch reads (a registered step signal) take the request gate's
+        // background lane, so render reads go first (ace-viz task 49)
+        this.zarrStore.cachingStore.setBackgroundClassifier(
+          (opts) => !!opts?.signal && this.prefetchSignals.has(opts.signal)
+        )
       }
 
       const desc = this.zarrStore.describe()
