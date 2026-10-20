@@ -26,6 +26,7 @@ import type {
 import type { XYLimits } from './map-utils'
 import { DEFAULT_TILE_SIZE } from './constants'
 import { identifyDimensionIndices, resolveOpenFunc } from './zarr-utils'
+import { latEdgesAreUniform, latEdgesFromCenters } from './lat-axis'
 
 interface PyramidMetadata {
   levels: string[]
@@ -206,6 +207,7 @@ interface StoreDescription {
   coordinates: Record<string, (string | number)[]>
   latIsAscending: boolean
   lon360Wrap: boolean
+  latEdges: Float64Array | null
   proj4: string | null
 }
 
@@ -384,6 +386,11 @@ export class ZarrStore {
   coordinates: Record<string, (string | number)[]> = {}
   latIsAscending: boolean = true // Default: row 0 = south; overridden by detection
   lon360Wrap: boolean = false // True when data uses 0-360 longitude convention
+  /**
+   * Row-edge latitudes (array row order) when the lat coordinate's spacing is
+   * not uniform (see lat-axis.ts); null for uniform grids or explicit bounds.
+   */
+  latEdges: Float64Array | null = null
   private _latIsAscendingUserSet: boolean = false
   proj4: string | null = null
   private _crsFromMetadata: boolean = false // Track if CRS was explicitly set from metadata
@@ -792,6 +799,7 @@ export class ZarrStore {
       coordinates: this.coordinates,
       latIsAscending: this.latIsAscending,
       lon360Wrap: this.lon360Wrap,
+      latEdges: this.latEdges,
       proj4: this.proj4,
     }
   }
@@ -1136,20 +1144,21 @@ export class ZarrStore {
       const xLen = xarr.shape[0]
       const yLen = yarr.shape[0]
 
+      // The whole lat axis (one small array) to check that its spacing is
+      // uniform; only the ends of the lon axis.
       type ZarrResult = { data: ArrayLike<number> }
-      const [xFirstTwo, xLast, yFirstTwo, yLast] = (await Promise.all([
+      const [xFirstTwo, xLast, yAll] = (await Promise.all([
         zarr.get(xarr, [zarr.slice(0, 2)]),
         zarr.get(xarr, [zarr.slice(xLen - 1, xLen)]),
-        zarr.get(yarr, [zarr.slice(0, 2)]),
-        zarr.get(yarr, [zarr.slice(yLen - 1, yLen)]),
+        zarr.get(yarr, [null]),
       ])) as ZarrResult[]
 
       const x0 = xFirstTwo.data[0]
       const x1 = xFirstTwo.data[1] ?? x0
       const xN = xLast.data[0]
-      const y0 = yFirstTwo.data[0]
-      const y1 = yFirstTwo.data[1]
-      const yN = yLast.data[0]
+      const y0 = yAll.data[0]
+      const y1 = yAll.data[1]
+      const yN = yAll.data[yLen - 1]
 
       // Detect latIsAscending from first two y values
       const detectedLatAscending = y1 > y0
@@ -1171,8 +1180,31 @@ export class ZarrStore {
       // Apply half-pixel expansion (coords are pixel centers, we need edge bounds)
       let xMin = coordXMin - (Number.isFinite(dx) ? dx / 2 : 0)
       let xMax = coordXMax + (Number.isFinite(dx) ? dx / 2 : 0)
-      const yMin = coordYMin - (Number.isFinite(dy) ? dy / 2 : 0)
-      const yMax = coordYMax + (Number.isFinite(dy) ? dy / 2 : 0)
+      let yMin = coordYMin - (Number.isFinite(dy) ? dy / 2 : 0)
+      let yMax = coordYMax + (Number.isFinite(dy) ? dy / 2 : 0)
+
+      // Non-uniform lat spacing (e.g. wider polar rows): keep the row edges,
+      // and take the extent from them (each end half its own row's spacing).
+      // Only for single-level data whose rows match the lat axis, and not with
+      // explicit bounds.
+      const latEdges = latEdgesFromCenters(yAll.data)
+      if (
+        needsBounds &&
+        this.levels.length === 0 &&
+        !this.proj4 &&
+        this.crs !== 'EPSG:3857' &&
+        yLen > 2 &&
+        this.shape[this.dimIndices.lat.index] === yLen &&
+        !latEdgesAreUniform(latEdges)
+      ) {
+        this.latEdges = latEdges
+        yMin = Math.min(latEdges[0], latEdges[yLen])
+        yMax = Math.max(latEdges[0], latEdges[yLen])
+        console.warn(
+          `[zarr-layer] Latitude spacing of '${latName}' is not uniform; ` +
+            `mapping rows to latitudes through the coordinate array.`
+        )
+      }
 
       // Normalize 0–360° longitude convention to -180–180°.
       if (!this.proj4 && this.crs !== 'EPSG:3857') {
@@ -1216,6 +1248,7 @@ export class ZarrStore {
         dy,
         lon360Wrap: this.lon360Wrap,
         latIsAscending: this.latIsAscending,
+        nonUniformLat: this.latEdges !== null,
       })
 
       // Warn users to set explicit values to skip future coordinate fetches

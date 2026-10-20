@@ -77,6 +77,7 @@ import {
 } from './projection-utils'
 import { createHybridMesh } from './mesh-reprojector'
 import { geoToArrayIndex } from './map-utils'
+import { latToRow } from './lat-axis'
 import {
   type ThrottleState,
   type RequestCanceller,
@@ -343,6 +344,9 @@ export class UntiledMode implements ZarrMode {
   private zarrArray: zarr.Array<zarr.DataType> | null = null
   private latIsAscending: boolean = true
   private lon360Wrap: boolean = false
+  // Row-edge latitudes of a non-uniform lat axis (lat-axis.ts); null when
+  // rows map to latitudes linearly. Single-level data only.
+  private latEdges: Float64Array | null = null
 
   // Multi-level support
   private levels: UntiledLevel[] = []
@@ -508,6 +512,9 @@ export class UntiledMode implements ZarrMode {
         this.zarrArray = await this.zarrStore.getArray()
         this.width = this.zarrArray.shape[this.dimIndices.lon.index]
         this.height = this.zarrArray.shape[this.dimIndices.lat.index]
+        if (desc.latEdges && desc.latEdges.length === this.height + 1) {
+          this.latEdges = desc.latEdges
+        }
       }
 
       if (this.xyLimits) {
@@ -528,6 +535,9 @@ export class UntiledMode implements ZarrMode {
           )
         } else {
           this.mercatorBounds = boundsToMercatorNorm(this.xyLimits, this.crs)
+        }
+        if (this.latEdges && this.mercatorBounds.latMin !== undefined) {
+          this.mercatorBounds.latEdges = this.latEdges
         }
         console.log('[untiled] init:', {
           xyLimits: this.xyLimits,
@@ -832,9 +842,13 @@ export class UntiledMode implements ZarrMode {
     let ySouthIdx = geoToArrayIndex(south, yMin, yMax, this.height)
     let yNorthIdx = geoToArrayIndex(north, yMin, yMax, this.height)
 
-    // Only invert if we explicitly know latIsAscending is false
-    // If null/undefined, assume ascending (yMin at row 0) as default
-    if (this.latIsAscending === false) {
+    if (this.latEdges) {
+      // Non-uniform lat axis: edges are in array row order (no inversion)
+      const rowOf = (lat: number) =>
+        Math.min(this.height - 1, Math.floor(latToRow(this.latEdges!, lat)))
+      ySouthIdx = rowOf(south)
+      yNorthIdx = rowOf(north)
+    } else if (this.latIsAscending === false) {
       // Invert Y indices: row 0 = north (yMax), row height-1 = south (yMin)
       ySouthIdx = this.height - 1 - ySouthIdx
       yNorthIdx = this.height - 1 - yNorthIdx
@@ -1255,7 +1269,13 @@ export class UntiledMode implements ZarrMode {
     // Default (null/undefined) assumes ascending (row 0 = south = yMin)
     let geoYMin: number
     let geoYMax: number
-    if (this.latIsAscending === false) {
+    if (this.latEdges && this.latEdges.length === height + 1) {
+      // Non-uniform lat axis: the region's true row edges
+      const a = this.latEdges[pxYStart]
+      const b = this.latEdges[pxYEnd]
+      geoYMin = Math.min(a, b)
+      geoYMax = Math.max(a, b)
+    } else if (this.latIsAscending === false) {
       // Data has lat decreasing with array index: pixel 0 = north (yMax)
       geoYMax = yMax - (pxYStart / height) * (yMax - yMin)
       geoYMin = yMax - (pxYEnd / height) * (yMax - yMin)
@@ -3222,7 +3242,14 @@ export class UntiledMode implements ZarrMode {
       y0: this.mercatorBounds!.y0 + (minY / this.height) * yRange,
       y1: this.mercatorBounds!.y0 + (maxY / this.height) * yRange,
     }
-    if (
+    const latEdges = this.mercatorBounds!.latEdges
+    if (latEdges) {
+      // Non-uniform lat axis: the subset's own row edges
+      const edges = latEdges.subarray(minY, maxY + 1)
+      subsetBounds.latMin = Math.min(edges[0], edges[edges.length - 1])
+      subsetBounds.latMax = Math.max(edges[0], edges[edges.length - 1])
+      subsetBounds.latEdges = edges
+    } else if (
       this.mercatorBounds!.latMin !== undefined &&
       this.mercatorBounds!.latMax !== undefined
     ) {

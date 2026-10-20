@@ -31,13 +31,16 @@ function coordMeta(name, n, dtype = 'float64') {
  * @param {number} [opts.steps]  time steps (shards hold 4)
  * @param {string} [opts.base]  store URL (default: a new one per call, so
  *   zarr-layer's store cache, keyed by URL, never carries over)
+ * @param {number[]} [opts.latitude]  latitude centers (an even count;
+ *   default: 4 rows 30° apart)
  * @returns {{ base: string, objects: Map<string, Uint8Array>, rootMeta: object }}
  */
 export function buildFakeV3Store({
   steps = 8,
   base = `http://example.invalid/store-${++stores}.zarr`,
+  latitude = [-45, -15, 15, 45],
 } = {}) {
-  const nLat = 4
+  const nLat = latitude.length
   const nLon = 8
   const shard = [4, 1, nLat, nLon]
   const inner = [1, 1, 2, 4]
@@ -45,7 +48,7 @@ export function buildFakeV3Store({
   const coords = {
     time: Float64Array.from({ length: steps }, (_, i) => i * 6),
     ensemble: Float64Array.from([7]),
-    latitude: Float64Array.from({ length: nLat }, (_, i) => -45 + i * 30),
+    latitude: Float64Array.from(latitude),
     longitude: Float64Array.from({ length: nLon }, (_, i) => -157.5 + i * 45),
   }
   const consolidated = {}

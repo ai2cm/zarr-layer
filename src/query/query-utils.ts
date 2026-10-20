@@ -17,6 +17,7 @@ import {
   type MercatorBounds,
 } from '../map-utils'
 import type { Bounds, CRS } from '../types'
+import { latToYFrac, yFracToLat } from '../lat-axis'
 import type { BoundingBox, QueryGeometry, GeoJSONMultiPolygon } from './types'
 import {
   createWGS84ToSourceTransformer,
@@ -113,9 +114,13 @@ export function pixelToLatLon(
     crs === 'EPSG:4326' &&
     bounds.latMin !== undefined &&
     bounds.latMax !== undefined
-      ? latIsAscending
-        ? bounds.latMin + yNorm * (bounds.latMax - bounds.latMin)
-        : bounds.latMax - yNorm * (bounds.latMax - bounds.latMin)
+      ? yFracToLat(
+          yNorm,
+          bounds.latMin,
+          bounds.latMax,
+          latIsAscending,
+          bounds.latEdges
+        )
       : mercatorNormToLat(mercY)
 
   return { lat, lon }
@@ -276,9 +281,13 @@ function computeYPixelRange(
     const clampedNorth = Math.min(Math.max(north, bounds.latMin), bounds.latMax)
     const clampedSouth = Math.min(Math.max(south, bounds.latMin), bounds.latMax)
     const toFrac = (lat: number) =>
-      latIsAscending
-        ? (lat - bounds.latMin!) / latRange
-        : (bounds.latMax! - lat) / latRange
+      latToYFrac(
+        lat,
+        bounds.latMin!,
+        bounds.latMax!,
+        latIsAscending,
+        bounds.latEdges
+      )
     const yFracMin = Math.min(toFrac(clampedNorth), toFrac(clampedSouth))
     const yFracMax = Math.max(toFrac(clampedNorth), toFrac(clampedSouth))
     const yStart = Math.min(
@@ -565,13 +574,15 @@ export function transformGeometryToPixelSpace(
   }
 
   // Densify for any nonlinear CRS. EPSG:3857 uses latToMercatorNorm (nonlinear in Y).
-  // EPSG:4326 with lat bounds is linear and doesn't need densification.
+  // EPSG:4326 with lat bounds is linear and doesn't need densification,
+  // unless its lat spacing is non-uniform (latEdges).
   const isLinear4326 =
     crs === 'EPSG:4326' &&
     bounds.latMin !== undefined &&
-    bounds.latMax !== undefined
+    bounds.latMax !== undefined &&
+    !bounds.latEdges
   const needsDensification =
-    !!proj4def || (!isLinear4326 && crs !== 'EPSG:4326')
+    !!proj4def || !!bounds.latEdges || (!isLinear4326 && crs !== 'EPSG:4326')
 
   const transformRing = (ring: number[][]): number[][] => {
     if (needsDensification) {
@@ -730,9 +741,13 @@ function lonLatToPixel(
   ) {
     const latRange = bounds.latMax - bounds.latMin
     if (latRange === 0) return null
-    yFrac = latIsAscending
-      ? (lat - bounds.latMin) / latRange
-      : (bounds.latMax - lat) / latRange
+    yFrac = latToYFrac(
+      lat,
+      bounds.latMin,
+      bounds.latMax,
+      latIsAscending,
+      bounds.latEdges
+    )
   } else {
     const normY = latToMercatorNorm(lat)
     yFrac = (normY - bounds.y0) / (bounds.y1 - bounds.y0)
