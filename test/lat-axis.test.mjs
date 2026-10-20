@@ -18,6 +18,7 @@ const { boundsToMercatorNorm } = await loadSrc('src/map-utils.ts')
 beforeEach((t) => {
   t.mock.method(console, 'log', () => {})
   t.mock.method(console, 'warn', () => {})
+  t.mock.method(console, 'info', () => {})
 })
 
 // Global ascending centers: `cap` rows of `capStep` at each pole, the rest
@@ -70,11 +71,16 @@ test('latToRow inverts rowToLat, ascending and descending', () => {
   assert.equal(latToRow(desc, 95), 0)
 })
 
-async function describeStore(t, latitude) {
+async function describeStore(t, latitude, options = {}) {
   const { base, objects } = buildFakeV3Store({ latitude })
   const server = fakeFetch(base, objects)
   t.mock.method(globalThis, 'fetch', server.fetch)
-  const store = new ZarrStore({ source: base, variable: 'v', version: 3 })
+  const store = new ZarrStore({
+    source: base,
+    variable: 'v',
+    version: 3,
+    ...options,
+  })
   let done = false
   store.initialized.finally(() => (done = true))
   while (!done) {
@@ -238,4 +244,19 @@ test('without edges (old mapping) the same axis samples the wrong rows', async (
     if (result.v[0] !== lat[row]) wrong++
   }
   assert.ok(wrong > 0, 'the fixture should exercise non-uniform spacing')
+})
+
+test('store: explicit bounds keep the linear mapping', async (t) => {
+  const desc = await describeStore(t, [-80, -60, -20, 20, 60, 80], {
+    bounds: [-180, -90, 180, 90],
+  })
+  assert.equal(desc.latEdges, null)
+})
+
+test('store: no "set bounds" hint for a non-uniform axis (it would undo the mapping)', async (t) => {
+  await describeStore(t, [-80, -60, -20, 20, 60, 80])
+  const hints = console.warn.mock.calls
+    .map((c) => String(c.arguments[0]))
+    .filter((m) => m.includes('Set explicitly'))
+  for (const h of hints) assert.ok(!h.includes('bounds:'), h)
 })

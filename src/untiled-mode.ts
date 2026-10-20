@@ -512,7 +512,11 @@ export class UntiledMode implements ZarrMode {
         this.zarrArray = await this.zarrStore.getArray()
         this.width = this.zarrArray.shape[this.dimIndices.lon.index]
         this.height = this.zarrArray.shape[this.dimIndices.lat.index]
-        if (desc.latEdges && desc.latEdges.length === this.height + 1) {
+        if (
+          desc.latEdges &&
+          this.crs === 'EPSG:4326' &&
+          desc.latEdges.length === this.height + 1
+        ) {
           this.latEdges = desc.latEdges
         }
       }

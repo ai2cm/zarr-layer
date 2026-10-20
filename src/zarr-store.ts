@@ -1144,21 +1144,36 @@ export class ZarrStore {
       const xLen = xarr.shape[0]
       const yLen = yarr.shape[0]
 
-      // The whole lat axis (one small array) to check that its spacing is
-      // uniform; only the ends of the lon axis.
+      // Whether non-uniform lat spacing could be mapped (see latEdges below):
+      // single-level data whose rows match a 1-D lat axis, bounds detected
+      // here (not explicit), and not proj4 / EPSG:3857.
+      const latEdgesPossible =
+        needsBounds &&
+        this.levels.length === 0 &&
+        !this.proj4 &&
+        this.crs !== 'EPSG:3857' &&
+        yarr.shape.length === 1 &&
+        yLen > 2 &&
+        this.shape[this.dimIndices.lat.index] === yLen
+
+      // Then the whole lat axis, to check its spacing; otherwise (and for
+      // the lon axis) only its ends.
       type ZarrResult = { data: ArrayLike<number> }
-      const [xFirstTwo, xLast, yAll] = (await Promise.all([
+      const [xFirstTwo, xLast, yFirstTwo, yLast] = (await Promise.all([
         zarr.get(xarr, [zarr.slice(0, 2)]),
         zarr.get(xarr, [zarr.slice(xLen - 1, xLen)]),
-        zarr.get(yarr, [null]),
-      ])) as ZarrResult[]
+        latEdgesPossible
+          ? zarr.get(yarr, [null])
+          : zarr.get(yarr, [zarr.slice(0, 2)]),
+        latEdgesPossible ? null : zarr.get(yarr, [zarr.slice(yLen - 1, yLen)]),
+      ])) as (ZarrResult | null)[]
 
-      const x0 = xFirstTwo.data[0]
-      const x1 = xFirstTwo.data[1] ?? x0
-      const xN = xLast.data[0]
-      const y0 = yAll.data[0]
-      const y1 = yAll.data[1]
-      const yN = yAll.data[yLen - 1]
+      const x0 = xFirstTwo!.data[0]
+      const x1 = xFirstTwo!.data[1] ?? x0
+      const xN = xLast!.data[0]
+      const y0 = yFirstTwo!.data[0]
+      const y1 = yFirstTwo!.data[1]
+      const yN = latEdgesPossible ? yFirstTwo!.data[yLen - 1] : yLast!.data[0]
 
       // Detect latIsAscending from first two y values
       const detectedLatAscending = y1 > y0
@@ -1185,25 +1200,19 @@ export class ZarrStore {
 
       // Non-uniform lat spacing (e.g. wider polar rows): keep the row edges,
       // and take the extent from them (each end half its own row's spacing).
-      // Only for single-level data whose rows match the lat axis, and not with
-      // explicit bounds.
-      const latEdges = latEdgesFromCenters(yAll.data)
-      if (
-        needsBounds &&
-        this.levels.length === 0 &&
-        !this.proj4 &&
-        this.crs !== 'EPSG:3857' &&
-        yLen > 2 &&
-        this.shape[this.dimIndices.lat.index] === yLen &&
-        !latEdgesAreUniform(latEdges)
-      ) {
-        this.latEdges = latEdges
-        yMin = Math.min(latEdges[0], latEdges[yLen])
-        yMax = Math.max(latEdges[0], latEdges[yLen])
-        console.warn(
-          `[zarr-layer] Latitude spacing of '${latName}' is not uniform; ` +
-            `mapping rows to latitudes through the coordinate array.`
-        )
+      // Coordinates in degrees only: CRS inference (below) makes data whose
+      // x extent exceeds 360 EPSG:3857.
+      if (latEdgesPossible && Math.max(Math.abs(x0), Math.abs(xN)) <= 360) {
+        const latEdges = latEdgesFromCenters(yFirstTwo!.data)
+        if (!latEdgesAreUniform(latEdges)) {
+          this.latEdges = latEdges
+          yMin = Math.min(latEdges[0], latEdges[yLen])
+          yMax = Math.max(latEdges[0], latEdges[yLen])
+          console.info(
+            `[zarr-layer] Latitude spacing of '${latName}' is not uniform; ` +
+              `mapping rows to latitudes through the coordinate array.`
+          )
+        }
       }
 
       // Normalize 0–360° longitude convention to -180–180°.
@@ -1254,7 +1263,8 @@ export class ZarrStore {
       // Warn users to set explicit values to skip future coordinate fetches
       if (this.multiscaleType === 'untiled') {
         const hints: string[] = []
-        if (needsBounds)
+        // Explicit bounds would turn off the non-uniform lat mapping
+        if (needsBounds && !this.latEdges)
           hints.push(`bounds: [${xMin}, ${yMin}, ${xMax}, ${yMax}]`)
         if (needsLatAscending && !detectedLatAscending)
           hints.push('latIsAscending: false')

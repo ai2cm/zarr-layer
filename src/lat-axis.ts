@@ -9,6 +9,12 @@
  * Edges are kept in array row order: edges[i] is the edge between rows i-1
  * and i, so edges[0] and edges[height] are the outer edges. They ascend when
  * latIsAscending and descend otherwise.
+ *
+ * Rendering uses the edges only at region (chunk) boundaries: within a
+ * region the shader still maps latitude to rows linearly. That is exact where
+ * a region's rows are evenly spaced, so it helps only data chunked along lat;
+ * a single chunk spanning every row renders as before (queries still use the
+ * edges).
  */
 
 /**
