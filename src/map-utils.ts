@@ -52,6 +52,12 @@ export interface MercatorBounds {
   latMax?: number
   lonMin?: number
   lonMax?: number
+  /**
+   * Row-edge latitudes (array row order, rows + 1 values) of an EPSG:4326
+   * grid with non-uniform latitude spacing (see lat-axis.ts). When set,
+   * row <-> latitude mapping uses these instead of a linear latMin/latMax.
+   */
+  latEdges?: Float64Array
 }
 
 /**
