@@ -251,6 +251,12 @@ export class ZarrLayer {
   private readonly chunkCacheEnabled: boolean
   /** Range mode of the chunk cache (see `ZarrLayerOptions.rangeRequests`). */
   private readonly rangeRequests: boolean
+  /**
+   * Range reads until the first frame (see
+   * `ZarrLayerOptions.firstFrameRangeRequests`); turned off for good by
+   * `endFirstFrameRanges`.
+   */
+  private firstFrameRanges: boolean
   /** Time dim of the last prefetchTimeSteps call ('time' until then). */
   private prefetchTimeDimName: string = 'time'
   /**
@@ -301,6 +307,7 @@ export class ZarrLayer {
   /** All reads in the gate's background lane (see setBackgroundReads). */
   private backgroundReads: boolean
   private preloadedObjects: ZarrLayerOptions['preloadedObjects']
+  private preloadedShardIndexes: ZarrLayerOptions['preloadedShardIndexes']
   private prefetchSignals: WeakMap<
     AbortSignal,
     { timeIndex: number; selection: string; keys: Set<string> }
@@ -451,6 +458,7 @@ export class ZarrLayer {
     renderPoles = false,
     maxChunkCacheBytes,
     rangeRequests = false,
+    firstFrameRangeRequests = false,
     prefetchConcurrency,
     prefetchMaxRequests,
     maxRequestsPerSecond,
@@ -458,6 +466,7 @@ export class ZarrLayer {
     prefetchBatchSteps,
     backgroundReads = false,
     preloadedObjects,
+    preloadedShardIndexes,
   }: ZarrLayerOptions) {
     if (!id) {
       throw new Error('[ZarrLayer] id is required')
@@ -525,6 +534,7 @@ export class ZarrLayer {
     this.transformRequest = transformRequest
     this.backgroundReads = !!backgroundReads
     this.preloadedObjects = preloadedObjects
+    this.preloadedShardIndexes = preloadedShardIndexes
     this.customStore = store
     this.renderPoles = renderPoles
     // An invalid budget behaves exactly like an unset one (100 MB chunk
@@ -543,6 +553,7 @@ export class ZarrLayer {
     this.maxChunkCacheBytes = chunkBudget
     this.chunkCacheEnabled = chunkBudget === undefined || chunkBudget > 0
     this.rangeRequests = rangeRequests
+    this.firstFrameRanges = !rangeRequests && !!firstFrameRangeRequests
 
     const steps = normalizeConcurrency(
       prefetchConcurrency,
@@ -618,9 +629,11 @@ export class ZarrLayer {
    * becomes the earlier complete set (or, if none, every key recorded for
    * the step: a conservative stand-in, since a redisplay from the mode's
    * caches reads nothing) plus the reads made while it was displayed.
+   * Also ends first-frame range reads (`firstFrameRangeRequests`).
    */
   private handleViewComplete = (): void => {
     if (this.initError) return
+    this.endFirstFrameRanges()
     const timeIdx = this.getCurrentTimeIdx()
     if (timeIdx === null) return
     const step = this.stepKey(timeIdx, this.currentSelection())
@@ -633,6 +646,17 @@ export class ZarrLayer {
     entry.completeKeys = complete
     entry.lastFetchFailed = false
     this.protectedKeys = null
+  }
+
+  /**
+   * The first frame is in (or prefetch starts): read whole objects from now
+   * on (see `ZarrLayerOptions.firstFrameRangeRequests`). Stores opened
+   * later (`setVariable`) start in whole-object mode.
+   */
+  private endFirstFrameRanges(): void {
+    if (!this.firstFrameRanges) return
+    this.firstFrameRanges = false
+    this.zarrStore?.cachingStore?.stopRangeRequests()
   }
 
   /**
@@ -815,6 +839,8 @@ export class ZarrLayer {
    * @param timeDimName - Name of the time dimension (default: 'time')
    */
   prefetchTimeSteps(timeIndices: number[], timeDimName: string = 'time'): void {
+    // Prefetch reads whole objects (firstFrameRangeRequests)
+    if (timeIndices.length > 0) this.endFirstFrameRanges()
     if (!this.mode?.prefetchTimeSteps) return
     if (timeDimName !== this.prefetchTimeDimName) {
       this.prefetchTimeDimName = timeDimName
@@ -1585,11 +1611,12 @@ export class ZarrLayer {
         customStore: this.customStore,
         maxChunkCacheBytes: this.maxChunkCacheBytes,
         chunkCacheEnabled: this.chunkCacheEnabled,
-        rangeRequests: this.rangeRequests,
+        rangeRequests: this.rangeRequests || this.firstFrameRanges,
         // Before metadata loads, so a background-reads layer's metadata and
         // coordinate reads are background too
         backgroundClassifier: this.isBackgroundRead,
         preloadedObjects: this.preloadedObjects,
+        preloadedShardIndexes: this.preloadedShardIndexes,
       })
       const initialized = this.zarrStore.initialized
       // Reported by the await below (metadataReady rejects with it first)
